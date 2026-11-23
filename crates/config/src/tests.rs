@@ -1051,6 +1051,46 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
     assert_eq!(read.links[0].account_id, growth_account.account_id);
 }
 
+/// v31a, item 3 (the access audit's mismatch 1): a sidecar's configuration,
+/// secret settings opened, is answered for the instance whose credential
+/// asked -- the owner of the request's reply inbox -- and a request naming
+/// another instance as its sender is refused, nothing told.
+/// INTERIM(v32): deleted with the reply-inbox check.
+#[test]
+fn a_configuration_asked_as_another_instance_is_refused() {
+    use meridian_bus::inbox::within_asker;
+    let asked = |claimed: &str| meridian_bus::Envelope {
+        meta: Some(meridian_bus::MessageMeta {
+            publisher_instance_id: claimed.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let forged = within_asker(Some("custody-test-1".into()), || {
+        crate::service::asking_plugin(&asked("oms-1"))
+    });
+    let refused = forged.expect_err("a forged sender is refused");
+    assert!(
+        refused.contains("publisher_instance_id"),
+        "the refusal names the field: {refused}"
+    );
+    assert_eq!(
+        within_asker(Some("oms-1".into()), || crate::service::asking_plugin(
+            &asked("oms-1")
+        )),
+        Ok("oms-1".to_string())
+    );
+    assert!(within_asker(Some(String::new()), || {
+        crate::service::asking_plugin(&asked("oms-1"))
+    })
+    .is_err());
+    // In this process, not by the broker: as before.
+    assert_eq!(
+        within_asker(None, || crate::service::asking_plugin(&asked("oms-1"))),
+        Ok("oms-1".to_string())
+    );
+}
+
 #[tokio::test]
 async fn a_sidecar_is_told_the_accounts_its_links_name_and_when_one_is_renamed() {
     // W4.11: the plugin's links reach it with each account's name, so a
@@ -1131,6 +1171,29 @@ fn link_request(plugin: &str, account: &str, new_name: &str) -> LinkExternalAcco
     }
 }
 
+/// The review of v31a-core-2, F3: a link naming a new account is a deployment
+/// admin's, so ADA is made one -- by her login, and anybody who signed in in
+/// `meridian-admins` by that group -- as a claim code or the first run makes
+/// the first admin.
+fn ada_is_a_deployment_admin(h: &Harness) {
+    let group = UserGroup {
+        user_group_id: "ug-admins".into(),
+        name: "Deployment admins".into(),
+        directory_groups: vec!["meridian-admins".into()],
+        logins: vec![ADA.into()],
+    };
+    let permission = Permission {
+        permission_id: "perm-admins".into(),
+        user_group_id: group.user_group_id.clone(),
+        account_group_id: String::new(),
+        access_group_id: DEPLOYMENT_ADMIN.into(),
+    };
+    assert!(h
+        .store
+        .install_first_admin(&group, &[permission], &crate::Author::default(), 0)
+        .unwrap());
+}
+
 /// A link as a plugin's sidecar sends it: from the plugin, for `by`.
 async fn link_for(
     h: &Harness,
@@ -1155,6 +1218,7 @@ async fn link_for(
 #[tokio::test]
 async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
     let ghost = harness("ghost-1");
+    ada_is_a_deployment_admin(&ghost);
     let unknown = link_for(&ghost, link_request("ghost-1", "", "A new one"), ADA).await;
     assert!(unknown.unwrap_err().contains("plugin that has reported"));
 
@@ -1185,6 +1249,7 @@ async fn an_expected_link_refusal_carries_its_category_and_the_field() {
     // Contract v25 (the v24 tutorial walk): never a handler's failure with
     // no category, so the plugin reads a refusal naming the field.
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let detail = |failed: String| {
         let at = failed.find("[refusal-status").expect("a refusal's status");
         failed[at..].to_string()
@@ -1220,6 +1285,7 @@ async fn an_expected_link_refusal_carries_its_category_and_the_field() {
 async fn a_link_naming_a_new_account_creates_and_links_it_in_one_step() {
     // W6.4: from the plugin's own admin page, for the deployment admin.
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let mut announced = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let linked = link_for(&h, link_request("oms-1", "", "  Fidelity Brokerage "), ADA)
         .await
@@ -1278,6 +1344,7 @@ async fn a_new_account_made_by_a_link_carries_what_the_plugin_sent_of_it() {
     // W6.4: the plugin pre-fills the custodian and type from the venue, and
     // the admin may change them; held to W6.3's bounds.
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let linked = link_for(
         &h,
         LinkExternalAccountRequest {
@@ -1344,6 +1411,7 @@ async fn a_new_accounts_fields_are_ignored_when_the_link_names_an_existing_one()
 #[tokio::test]
 async fn a_link_naming_both_an_account_and_a_new_one_is_refused_and_changes_nothing() {
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let growth = account(&h, "Growth").await;
     let both = link_for(
         &h,
@@ -1359,6 +1427,81 @@ async fn a_link_naming_both_an_account_and_a_new_one_is_refused_and_changes_noth
     let read = records(&h).await;
     assert_eq!(read.accounts.len(), 1, "no account was made");
     assert!(read.links.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_naming_a_new_account_is_refused_for_anybody_but_a_deployment_admin() {
+    // The review of v31a-core-2, F3 (decision 47): a link naming a new account
+    // creates it and grants it to the plugin, an access change. Sent by a
+    // plugin's credential for a person who is not a deployment admin -- past
+    // the sidecar's own check, as a raw client may -- the conductor refuses
+    // it, and nothing is made, linked or granted.
+    let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
+    let failed = link_for(&h, link_request("oms-1", "", "Mine now"), "someone")
+        .await
+        .unwrap_err();
+    let at = failed.find("[refusal-status").expect("a refusal's status");
+    let (said, fields, words) = meridian_bus::read_refusal_status(&failed[at..]).expect("readable");
+    assert_eq!(
+        said,
+        meridian_bus::RefusalStatus::PermissionDenied,
+        "{failed}"
+    );
+    assert_eq!(fields, ["new_account_name"], "{failed}");
+    // The second review of v31a-core-2, finding 4: the conductor reads the
+    // directory groups of the person's latest stored sign-in, so a lost or
+    // late one refuses an admin by group, who is told to sign in again.
+    assert!(words.contains("sign in again"), "{words}");
+    let read = records(&h).await;
+    assert!(read.accounts.is_empty(), "no account was made");
+    assert!(read.links.is_empty(), "nothing was linked");
+    assert!(
+        h.store
+            .snapshot()
+            .unwrap()
+            .linkable
+            .get("oms-1")
+            .is_none_or(|granted| granted.account_ids.is_empty()),
+        "nothing was granted"
+    );
+
+    // A link naming an account that exists stays the plugin admin's (W4.9),
+    // which the sidecar checks.
+    let growth = account(&h, "Growth").await;
+    let linked = link_for(&h, link_request("oms-1", &growth.account_id, ""), "someone")
+        .await
+        .unwrap();
+    assert_eq!(linked.account_id, growth.account_id);
+}
+
+#[tokio::test]
+async fn a_new_account_link_passes_for_a_deployment_admin_by_login_or_directory_group_alone() {
+    // The review of v31a-core-2, F3: the conductor's check, for a call made
+    // by no delegation, passes a deployment admin by login and one by the
+    // directory groups their latest sign-in stored, and nobody else. Whether
+    // it holds them as the dashboard does is the runtime's
+    // `wiring::the_conductor_holds_a_deployment_admin_as_the_dashboard_does`
+    // (the second review, finding 5), where both crates are seen.
+    let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
+    for (subject, groups) in [
+        ("grace", vec!["meridian-admins".to_string()]),
+        ("someone", vec!["trading-desk".to_string()]),
+    ] {
+        h.store
+            .record_sign_in(&SignInRecord {
+                subject: subject.into(),
+                display_name: subject.into(),
+                directory_groups: groups,
+                signed_in_at_ns: 1,
+            })
+            .unwrap();
+    }
+    for (subject, admin) in [(ADA, true), ("grace", true), ("someone", false)] {
+        let linked = link_for(&h, link_request("oms-1", "", subject), subject).await;
+        assert_eq!(linked.is_ok(), admin, "{subject}: {linked:?}");
+    }
 }
 
 #[tokio::test]
@@ -3370,6 +3513,107 @@ async fn every_grant_change_is_its_own_record_naming_who_and_when() {
     assert_eq!(records[2].permission_id, permission.permission_id);
     assert!(records[2].became.contains(&growth.account_group_id));
     assert!(records[3].was.contains(&people.user_group_id) && records[3].became.is_empty());
+}
+
+/// Decision 47 (roadmap v31a item 13, decisions/031): each user-group and
+/// account-group change is its own record -- defined or changed, what it was
+/// and what it became, who, through which delegation, and when -- and saving
+/// one unchanged records nothing.
+#[tokio::test]
+async fn every_user_group_and_account_group_change_is_its_own_record() {
+    use crate::groups::{GroupChangeKind::*, GroupKind};
+    let h = harness("dashboard-1");
+    let traders = user_group(&h).await;
+    let mut renamed = traders.clone();
+    renamed.name = "Desk".into();
+    renamed.logins = vec!["local|grace".into()];
+    // Through a delegation: the record names it.
+    let stamp = meridian_bus::Stamp {
+        acting_for_subject: ADA.into(),
+        acting_through_delegation: "DLG-7".into(),
+        acting_through_client: "Claude".into(),
+        ..meridian_bus::Stamp::default()
+    };
+    for _ in 0..2 {
+        // The second time, saved unchanged: nothing more to record.
+        h.bus
+            .call_stamped(
+                DEFINE_USER_GROUP,
+                "meridian.v1.DefineUserGroupRequest",
+                DefineUserGroupRequest {
+                    user_group: Some(renamed.clone()),
+                }
+                .encode_to_vec(),
+                None,
+                None,
+                &stamp,
+            )
+            .await
+            .unwrap();
+    }
+    let records = h
+        .store
+        .group_changes(GroupKind::User, &traders.user_group_id)
+        .unwrap();
+    let kinds: Vec<_> = records.iter().map(|record| record.kind).collect();
+    assert_eq!(kinds, [Defined, Changed]);
+    assert!(records.iter().all(|record| record.by == ADA));
+    assert!(records
+        .iter()
+        .all(|record| record.at_ns == 1_790_380_800_000_000_000 && !record.backfilled));
+    assert_eq!(records[0].delegation, "");
+    assert_eq!(records[1].delegation, "DLG-7");
+    assert_eq!(records[0].was, "");
+    assert_eq!(
+        records[0].became,
+        "\"Traders\": directory groups trading-desk; logins none"
+    );
+    assert_eq!(records[1].was, records[0].became);
+    assert_eq!(
+        records[1].became,
+        "\"Desk\": directory groups trading-desk; logins local|grace"
+    );
+
+    let growth = account(&h, "Growth").await;
+    let value = account(&h, "Value").await;
+    let group = account_group(&h, &[&growth]).await;
+    let mut widened = group.clone();
+    widened.account_ids.push(value.account_id.clone());
+    let _: AccountGroup = ask(
+        &h,
+        DEFINE_ACCOUNT_GROUP,
+        "meridian.v1.DefineAccountGroupRequest",
+        DefineAccountGroupRequest {
+            account_group: Some(widened),
+        },
+    )
+    .await
+    .unwrap();
+    let records = h
+        .store
+        .group_changes(GroupKind::Account, &group.account_group_id)
+        .unwrap();
+    let kinds: Vec<_> = records.iter().map(|record| record.kind).collect();
+    assert_eq!(kinds, [Defined, Changed]);
+    assert!(records.iter().all(|record| record.by == ADA));
+    assert_eq!(
+        records[0].became,
+        format!("\"Growth\": accounts {}", growth.account_id)
+    );
+    assert_eq!(
+        records[1].became,
+        format!(
+            "\"Growth\": accounts {}, {}",
+            growth.account_id, value.account_id
+        )
+    );
+    assert!(
+        h.store
+            .group_changes(GroupKind::User, &group.account_group_id)
+            .unwrap()
+            .is_empty(),
+        "an account group's records are not a user group's"
+    );
 }
 
 /// Contract v16 (W6.25, W4.7, W6.11): a hold a deployment admin sets reaches

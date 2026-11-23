@@ -193,12 +193,9 @@ impl Groups {
         let mut assigned = assigned.write().expect("assignments poisoned");
         match group {
             Some(group) => {
-                if let Some(was) = assigned
-                    .by_partition
-                    .insert(partition.to_string(), group)
-                    .filter(|was| *was != group)
-                {
-                    let _ = was;
+                // Its first naming too (none before): it was its
+                // rendezvous owner's by no name, and a move named it.
+                if assigned.by_partition.insert(partition.to_string(), group) != Some(group) {
                     let dataset = dataset_of_range(partition).unwrap_or(partition).to_string();
                     *assigned.changed.entry(dataset).or_default() += 1;
                 }
@@ -366,6 +363,25 @@ mod tests {
         // One group assigns nothing.
         Groups::one().assign("P0", Some(0));
         assert_eq!(Groups::one().assigned("P0"), None);
+    }
+
+    #[test]
+    fn a_partitions_first_naming_is_counted_as_a_change_of_its_owner() {
+        let one = Groups::new(0, 2).unwrap();
+        assert_eq!(one.changes_of("P2"), 0);
+        // Named for the first time, whichever group: it may have been
+        // another's and back since it was last read, unnamed.
+        one.assign("P2", Some(owner("P2", 2)));
+        assert_eq!(one.changes_of("P2"), 1);
+        one.assign("P2", Some(owner("P2", 2)));
+        assert_eq!(one.changes_of("P2"), 1, "read again, the same: no change");
+        one.assign("P2", Some(1 - owner("P2", 2)));
+        assert_eq!(one.changes_of("P2"), 2);
+        one.assign("P2", None);
+        assert_eq!(one.changes_of("P2"), 3);
+        // A lake range's, counted on its dataset.
+        one.assign("a:b/0000-7fff", Some(1));
+        assert_eq!(one.changes_of("a:b"), 1);
     }
 
     #[test]

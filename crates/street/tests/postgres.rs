@@ -2416,3 +2416,86 @@ fn a_deposed_writers_commit_is_refused_after_a_takeover_and_takes_no_sequence() 
     assert_eq!(page.changes.last().map(|c| c.epoch), Some(2));
     assert_eq!(page.epoch, 2);
 }
+
+/// Review-core-3b E: on a store whose log the release before installed, a
+/// replay of the log from where it stood equals the captured tables once
+/// this release has migrated: every row a migration writes is in the log.
+/// Review-core-3c N5: the release's own migrations make no captured table
+/// after the log's, so two of the test's own follow: one makes a captured
+/// table (here street_cash_instrument, missing as the log was installed),
+/// the next fills it, through the store's own migration loop.
+#[test]
+fn a_migration_on_a_logged_store_leaves_its_rows_in_the_log() {
+    use meridian_street::migrations::{record, Migration, HISTORY, MIGRATIONS};
+    use meridian_street::postgres::{apply_each, CHANGES};
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let url = Scratch::schema(
+        &url,
+        &unique("street_logged").replace('-', "_").to_lowercase(),
+    );
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client.batch_execute(HISTORY).unwrap();
+    let last = MIGRATIONS.last().unwrap().version;
+    for migration in MIGRATIONS.iter().filter(|m| m.version < last) {
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute(migration.sql).unwrap();
+        record(&mut tx, migration, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    CHANGES.install(&mut client).unwrap();
+    let before = CHANGES.snapshot(&mut client).unwrap();
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&meridian_clock::SystemClock).unwrap();
+    CHANGES.check_follows(&mut client, &before).unwrap();
+
+    // A captured table missing as the log was installed, then made by one
+    // migration and filled by the next.
+    client
+        .batch_execute("DROP TABLE street_cash_instrument")
+        .unwrap();
+    CHANGES.install(&mut client).unwrap();
+    let before = CHANGES.snapshot(&mut client).unwrap();
+    let ours = [
+        Migration {
+            version: 1001,
+            name: "makes_a_captured_table",
+            sql: "CREATE TABLE IF NOT EXISTS street_cash_instrument (
+                      currency_code  text    PRIMARY KEY CHECK (currency_code ~ '^[A-Z]{3}$'),
+                      instrument_id  text    NOT NULL CHECK (instrument_id <> ''),
+                      resolved_at_ns bigint  NOT NULL,
+                      backfilled     boolean NOT NULL)",
+        },
+        Migration {
+            version: 1002,
+            name: "fills_it",
+            sql: "INSERT INTO street_cash_instrument
+                  VALUES ('USD', 'INS-01JAD000000000000000000001', 1, true)",
+        },
+    ];
+    apply_each(&mut client, &ours, Some(last), &meridian_clock::SystemClock).unwrap();
+    CHANGES.install(&mut client).unwrap();
+    CHANGES.check_follows(&mut client, &before).unwrap();
+}
+
+/// Review-core-3c N7: a follower's reload names the captured tables it
+/// read. One there then and gone now is found, even empty: the comparison
+/// would otherwise pass over it. One missing at both is passed over: a
+/// store a release before left, before the migration that makes it.
+#[test]
+fn a_captured_table_gone_since_the_reload_is_found() {
+    use meridian_street::postgres::CHANGES;
+    let (url, _store) = isolated();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let reloaded = CHANGES.snapshot(&mut client).unwrap();
+    client
+        .batch_execute("DROP TABLE street_cash_instrument")
+        .unwrap();
+    let failed = CHANGES
+        .check_follows(&mut client, &reloaded)
+        .expect_err("a captured table gone since the reload");
+    assert!(failed.contains("street_cash_instrument"), "{failed}");
+    let reloaded = CHANGES.snapshot(&mut client).unwrap();
+    CHANGES
+        .check_follows(&mut client, &reloaded)
+        .expect("missing at both: passed over");
+}

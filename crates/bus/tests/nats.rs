@@ -751,6 +751,544 @@ async fn the_runtimes_components_may_only_touch_their_own_topics() {
     );
 }
 
+// ── Each credential's own inboxes ───────────────────────────────────────────
+//
+// v31a, item 2 (the access audit's S1): with `_INBOX.>` on every credential,
+// any one of them heard every answer in the deployment and could answer in
+// another's place. Each now holds `_INBOX.<user>.` alone, and its client
+// makes its inboxes there.
+
+#[tokio::test]
+async fn a_credential_cannot_hear_another_credentials_inbox() {
+    let one = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let two = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO").await;
+    let sending = raw("MERIDIAN_TEST_BROKER_URL").await;
+
+    let theirs = "_INBOX.custody-test-2.probe";
+    let mut overheard = one.subscribe(theirs).await.unwrap();
+    let mut own = two.subscribe(theirs).await.unwrap();
+    one.flush().await.unwrap();
+    two.flush().await.unwrap();
+    settle().await;
+
+    let answer = mark("an-answer-for-custody-test-2");
+    sending
+        .publish(theirs, answer.clone().into())
+        .await
+        .unwrap();
+    sending.flush().await.unwrap();
+
+    assert!(
+        heard(&mut own, &answer).await,
+        "a credential did not hear its own inbox"
+    );
+    assert!(
+        !heard(&mut overheard, &answer).await,
+        "custody-test-1 heard custody-test-2's inbox"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_cannot_publish_into_another_credentials_inbox() {
+    let one = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let two = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO").await;
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+
+    let theirs = "_INBOX.custody-test-2.forged";
+    let mut inbox = listening.subscribe(theirs).await.unwrap();
+    listening.flush().await.unwrap();
+    settle().await;
+
+    let forged = mark("custody-test-1-answers-for-another");
+    one.publish(theirs, forged.clone().into()).await.unwrap();
+    one.flush().await.unwrap();
+    let own = mark("custody-test-2-on-its-own-inbox");
+    two.publish(theirs, own.clone().into()).await.unwrap();
+    two.flush().await.unwrap();
+
+    // One window for both: whatever arrives is read once.
+    use futures_util::StreamExt;
+    let mut arrived = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, inbox.next()).await {
+        arrived.push(String::from_utf8_lossy(&message.payload).to_string());
+    }
+    assert!(
+        !arrived.contains(&forged),
+        "custody-test-1 published into custody-test-2's inbox"
+    );
+    assert!(
+        arrived.contains(&own),
+        "custody-test-2 was refused its own inbox"
+    );
+}
+
+/// Every credential this file connects as, for the inbox matrices: the
+/// harness's plugins, its component instances, the own-credential
+/// components and the runtime.
+const CREDENTIALS: [(&str, &str); 8] = [
+    ("custody-test-1", "MERIDIAN_TEST_BROKER_URL_CUSTODY"),
+    ("custody-test-2", "MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO"),
+    ("reference-1", "MERIDIAN_TEST_BROKER_URL_REFERENCE"),
+    ("dashboard-1", "MERIDIAN_TEST_BROKER_URL_DASHBOARD"),
+    ("launcher-1", "MERIDIAN_TEST_BROKER_URL_LAUNCHER"),
+    ("instrument", "MERIDIAN_TEST_BROKER_URL_INSTRUMENT"),
+    ("analytics", "MERIDIAN_TEST_BROKER_URL_ANALYTICS"),
+    ("runtime", "MERIDIAN_TEST_BROKER_URL_RUNTIME"),
+];
+
+/// Into `owner`'s inbox, a message no request carried from each of
+/// `senders`: which of them the broker carried, read in one window.
+async fn carried_into(
+    listening: &async_nats::Client,
+    owner: &str,
+    senders: &[(&str, async_nats::Client)],
+) -> Vec<String> {
+    use futures_util::StreamExt;
+    let theirs = format!("_INBOX.{owner}.unasked");
+    let mut inbox = listening.subscribe(theirs.clone()).await.unwrap();
+    listening.flush().await.unwrap();
+    settle().await;
+    let mut sent = Vec::new();
+    for (name, client) in senders {
+        let said = mark(&format!("{name}-into-{owner}"));
+        client
+            .publish(theirs.clone(), said.clone().into())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        sent.push((*name, said));
+    }
+    let mut arrived = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, inbox.next()).await {
+        arrived.push(String::from_utf8_lossy(&message.payload).to_string());
+    }
+    sent.into_iter()
+        .filter(|(_, said)| arrived.contains(said))
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// v31a, item 2 as restated 2026-11-20 (the proposal on answers refused
+/// across a broker reload, option A, approved by consensus), as the broker
+/// carries it: into a credential's inbox, a message no request carried is
+/// carried from the runtime's, which answers every credential, and from
+/// each core credential serving a request the owner may send, by the
+/// contract's request rows -- and refused from every other. So:
+///
+/// - custody-test-2's: the dashboard's (every sidecar files a ticket), the
+///   instrument store's (custody computes a date) and the analytics
+///   component's (every sidecar renews its jobs);
+/// - the dashboard's: the instrument store's and the analytics component's,
+///   which it asks;
+/// - the instrument store's: the runtime's alone, as it asks only the
+///   runtime's components;
+/// - the runtime's: the instrument store's, the dashboard's and the
+///   launcher's, which its components ask -- and not the analytics
+///   component's, which holds the lake's change log as the lake does and
+///   answers no request of the runtime's.
+#[tokio::test]
+async fn a_core_credential_publishes_into_another_inbox_only_where_that_one_may_ask_it() {
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+    let mut clients = Vec::new();
+    for (name, variable) in CREDENTIALS {
+        clients.push((name, raw(variable).await));
+    }
+    let answering: [(&str, &[&str]); 4] = [
+        (
+            "custody-test-2",
+            &[
+                "custody-test-2",
+                "dashboard-1",
+                "instrument",
+                "analytics",
+                "runtime",
+            ],
+        ),
+        (
+            "dashboard-1",
+            &["dashboard-1", "instrument", "analytics", "runtime"],
+        ),
+        ("instrument", &["instrument", "runtime"]),
+        (
+            "runtime",
+            &["dashboard-1", "launcher-1", "instrument", "runtime"],
+        ),
+    ];
+    for (owner, expected) in answering {
+        let carried = carried_into(&listening, owner, &clients).await;
+        let mut expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
+        let order = |name: &String| CREDENTIALS.iter().position(|(n, _)| n == name);
+        expected.sort_by_key(order);
+        assert_eq!(carried, expected, "who published into {owner}'s inbox");
+    }
+}
+
+/// v31a, item 2: no plugin credential publishes into any other's inboxes,
+/// the runtime's and the components' among them: each is carried into its
+/// own alone.
+#[tokio::test]
+async fn no_plugin_credential_publishes_into_another_credentials_inbox() {
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+    let mut plugins = Vec::new();
+    for (name, variable) in &CREDENTIALS[..3] {
+        plugins.push((*name, raw(variable).await));
+    }
+    for (owner, _) in CREDENTIALS {
+        let carried = carried_into(&listening, owner, &plugins).await;
+        let expected: Vec<String> = plugins
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .filter(|name| name == owner)
+            .collect();
+        assert_eq!(
+            carried, expected,
+            "which plugins published into {owner}'s inbox"
+        );
+    }
+}
+
+/// One request in flight: asked by `asking` on `topic` with a reply subject
+/// in its own inbox, delivered to `answering`, and the subscription its
+/// answer will arrive on.
+struct InFlight {
+    answering: async_nats::Client,
+    request: async_nats::Message,
+    answers: async_nats::Subscriber,
+}
+
+async fn in_flight(
+    asking: &async_nats::Client,
+    asker: &str,
+    answering: async_nats::Client,
+    topic: &str,
+) -> InFlight {
+    use futures_util::StreamExt;
+    let mut asked = answering.subscribe(topic.to_string()).await.unwrap();
+    answering.flush().await.unwrap();
+    let reply = format!("_INBOX.{asker}.{}", mark("across-a-reload"));
+    let answers = asking.subscribe(reply.clone()).await.unwrap();
+    asking.flush().await.unwrap();
+    settle().await;
+    let question = mark("asked-before-the-reload");
+    asking
+        .publish_with_reply(topic.to_string(), reply, question.clone().into())
+        .await
+        .unwrap();
+    asking.flush().await.unwrap();
+    let request = loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), asked.next())
+            .await
+            .unwrap_or_else(|_| panic!("{topic} was not delivered"))
+            .unwrap();
+        if message.payload.as_ref() == question.as_bytes() {
+            break message;
+        }
+    };
+    InFlight {
+        answering,
+        request,
+        answers,
+    }
+}
+
+impl InFlight {
+    /// Answered now: whether the answer reached the asker.
+    async fn answered(mut self) -> bool {
+        let answer = mark("answered-after-the-reload");
+        self.answering
+            .publish(
+                self.request.reply.clone().expect("a reply subject"),
+                answer.clone().into(),
+            )
+            .await
+            .unwrap();
+        self.answering.flush().await.unwrap();
+        heard(&mut self.answers, &answer).await
+    }
+}
+
+/// v31a, item 2 as restated 2026-11-20 (the proposal on answers refused
+/// across a broker reload, option A, approved by consensus): a broker
+/// configuration reload -- every plugin launch, removal and entitlement
+/// change makes one -- registers each client's user again with its
+/// permissions, which empties the connection's reply entries, the
+/// `allow_responses` rights. An answer granted by name does not need one:
+///
+/// - the dashboard, delivered custody-test-1's ticket before the reload
+///   (every sidecar files one), answers it after;
+/// - the launcher, delivered the conductor's create-plugin before the
+///   reload -- the reload that launch itself makes, which the answer races
+///   -- answers it after, on the runtime's inbox;
+/// - and a plugin's answer is still refused, as documented and expected: no
+///   plugin publishes into another's inboxes, so custody-test-1, delivered
+///   a request of the runtime's on a subject it hears, has no right to
+///   answer it once the reload has emptied its reply entries. No plugin
+///   serves a request in the contract today.
+///
+/// Run by `make test-broker`, alone, with the reload made from outside while
+/// it waits: once the three requests are delivered it says `RELOAD-NOW` and
+/// waits for the broker's `config_load_time` to change, then answers. The
+/// configuration it reloads must change the users (a launch adds one); a
+/// reload of the same file registers nobody again.
+#[tokio::test]
+#[ignore = "run by make test-broker's reload step, which reloads the broker while it waits"]
+async fn answers_in_flight_across_a_configuration_reload() {
+    let runtime = raw("MERIDIAN_TEST_BROKER_URL_RUNTIME").await;
+    let custody = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let ticket = in_flight(
+        &custody,
+        "custody-test-1",
+        raw("MERIDIAN_TEST_BROKER_URL_DASHBOARD").await,
+        "platform.config.command.file-ticket",
+    )
+    .await;
+    let launch = in_flight(
+        &runtime,
+        "runtime",
+        raw("MERIDIAN_TEST_BROKER_URL_LAUNCHER").await,
+        "platform.deployment.command.create-plugin",
+    )
+    .await;
+    let plugins = in_flight(
+        &runtime,
+        "runtime",
+        custody.clone(),
+        "platform.config.event.plugin-configuration-changed",
+    )
+    .await;
+    let loaded = |varz: &str| said_text(varz, "config_load_time");
+    let before = loaded(&monitored("/varz").await).expect("config_load_time");
+    println!("RELOAD-NOW");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if loaded(&monitored("/varz").await).as_deref() != Some(before.as_str()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the broker did not reload within two minutes"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    settle().await;
+    let answered = [
+        ticket.answered().await,
+        launch.answered().await,
+        plugins.answered().await,
+    ];
+    assert_eq!(
+        answered,
+        [true, true, false],
+        "after a configuration reload: the dashboard's answer to custody-test-1, the \
+         launcher's create-plugin answer to the runtime, a plugin's answer to the runtime"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_reaches_its_caller_on_the_callers_own_inbox() {
+    // Asked as custody-test-1 on what every sidecar asks, answered by the
+    // runtime's credential: the caller's client makes its inbox under its
+    // own prefix, `_INBOX.custody-test-1`, and the runtime answers on it by
+    // name, its grant publishing into every credential's inboxes, not
+    // through the broker's allow_responses.
+    let asking = Bus::single(
+        "custody-test-1",
+        Arc::new(as_custody().await),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let runtime = NatsBackend::connect(
+        &std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+            .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`."),
+    )
+    .await
+    .expect("could not reach the test broker as the runtime");
+    let answering = Bus::single(
+        "conductor",
+        Arc::new(runtime),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let topic = "platform.config.query.plugin-configuration";
+    let tag = mark("inbox-answer");
+    let expected = tag.clone();
+    answering.serve(topic, move |envelope| {
+        Ok((
+            "meridian.test.Answer".to_string(),
+            [expected.as_bytes(), b":", &envelope.payload].concat(),
+        ))
+    });
+    settle().await;
+
+    let (_, payload) = asking
+        .call(
+            topic,
+            "meridian.test.Question",
+            b"mine".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("the call was answered on the caller's own inbox");
+    assert_eq!(payload, format!("{tag}:mine").into_bytes());
+}
+
+/// v31a, item 3 (INTERIM(v32)): a handler knows which credential asked, as
+/// the owner of the inbox its answer goes to -- whatever sender the request
+/// names, which its sidecar sets.
+#[tokio::test]
+async fn a_handler_knows_the_credential_that_asked_by_its_inbox() {
+    let asking = Bus::single(
+        "custody-test-2",
+        Arc::new(as_custody().await),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let runtime = NatsBackend::connect(
+        &std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+            .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`."),
+    )
+    .await
+    .expect("could not reach the test broker as the runtime");
+    let answering = Bus::single(
+        "conductor",
+        Arc::new(runtime),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    // Every sidecar asks it, and the conductor answers it; no other test
+    // here serves it.
+    let topic = "platform.config.query.plugin-access";
+    answering.serve(topic, |_| {
+        Ok((
+            "meridian.test.Asker".to_string(),
+            meridian_bus::inbox::asked_by()
+                .unwrap_or_else(|| "nobody".into())
+                .into_bytes(),
+        ))
+    });
+    settle().await;
+
+    // The bus names itself custody-test-2; its credential is custody-test-1's.
+    let (_, payload) = asking
+        .call(topic, "meridian.test.Question", Vec::new(), None, None)
+        .await
+        .expect("answered");
+    assert_eq!(String::from_utf8_lossy(&payload), "custody-test-1");
+}
+
+/// The review of v31a-core-2, F1(c), a known gap (INTERIM(v32)): the broker
+/// checks no publisher's right on a reply subject, so a credential that names
+/// another's inbox as its reply-to is read as that other. custody-test-1
+/// sends a take-shard naming custody-test-2, answered on custody-test-2's
+/// inbox, and is asked as custody-test-2: the lake would number a new epoch
+/// and fence custody-test-2's live holder, as often as it is sent. Ignored
+/// until v32 binds the sender at the broker (S2) and its ownership record
+/// replaces this take (v32.8); it then passes, and the ignore is removed.
+#[tokio::test]
+#[ignore = "INTERIM(v32): a known gap, the asker read from the reply inbox; v32.8 turns it green"]
+async fn a_take_shard_sent_on_another_credentials_inbox_is_not_asked_as_it() {
+    let forging = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let runtime = NatsBackend::connect(
+        &std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+            .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`."),
+    )
+    .await
+    .expect("could not reach the test broker as the runtime");
+    let answering = Bus::single(
+        "lake",
+        Arc::new(runtime),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    // Every sidecar may send it, and the lake answers it; no other test here
+    // serves it.
+    let topic = "platform.lake.command.take-shard";
+    let (told, mut asked) = tokio::sync::mpsc::unbounded_channel();
+    answering.serve(topic, move |_| {
+        let _ = told.send(meridian_bus::inbox::asked_by());
+        Ok(("meridian.test.Taken".to_string(), Vec::new()))
+    });
+    settle().await;
+
+    let take = Envelope {
+        meta: Some(MessageMeta {
+            message_id: mark("forged-take"),
+            publisher_instance_id: "custody-test-2".into(),
+            ..Default::default()
+        }),
+        payload_type: "meridian.v1.TakeShardRequest".into(),
+        payload: b"instance: custody-test-2".to_vec(),
+    };
+    forging
+        .publish_with_reply(
+            topic,
+            "_INBOX.custody-test-2.x",
+            prost::Message::encode_to_vec(&take).into(),
+        )
+        .await
+        .unwrap();
+    forging.flush().await.unwrap();
+
+    let asker = tokio::time::timeout(Duration::from_secs(5), asked.recv())
+        .await
+        .expect("the take reached the lake")
+        .expect("its handler said who asked");
+    assert_ne!(
+        asker.as_deref(),
+        Some("custody-test-2"),
+        "custody-test-1's take was asked as custody-test-2"
+    );
+}
+
+/// v31a, item 14 (decision 47), the triage on a real broker: an access
+/// change sent by every credential this broker admits but the dashboard's is
+/// refused; the dashboard's is carried.
+#[tokio::test]
+async fn only_the_dashboard_may_publish_an_access_change() {
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+    let topic = "platform.config.command.define-user-group";
+    let mut heard_on = listening.subscribe(topic).await.unwrap();
+    listening.flush().await.unwrap();
+    settle().await;
+
+    let mut withheld = Vec::new();
+    for credential in [
+        "MERIDIAN_TEST_BROKER_URL_CUSTODY",
+        "MERIDIAN_TEST_BROKER_URL_REFERENCE",
+        "MERIDIAN_TEST_BROKER_URL_RUNTIME",
+        "MERIDIAN_TEST_BROKER_URL_INSTRUMENT",
+        "MERIDIAN_TEST_BROKER_URL_ANALYTICS",
+    ] {
+        let client = raw(credential).await;
+        let sent = mark(&format!("access-change-by-{credential}"));
+        client.publish(topic, sent.clone().into()).await.unwrap();
+        client.flush().await.unwrap();
+        withheld.push((credential, sent));
+    }
+    let dashboard = raw("MERIDIAN_TEST_BROKER_URL_DASHBOARD").await;
+    let carried = mark("access-change-by-the-dashboard");
+    dashboard
+        .publish(topic, carried.clone().into())
+        .await
+        .unwrap();
+    dashboard.flush().await.unwrap();
+
+    use futures_util::StreamExt;
+    let mut heard = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, heard_on.next()).await {
+        heard.push(String::from_utf8_lossy(&message.payload).to_string());
+    }
+    assert!(
+        heard.contains(&carried),
+        "the dashboard's access change was not carried"
+    );
+    for (credential, sent) in withheld {
+        assert!(
+            !heard.contains(&sent),
+            "{credential} published an access change"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_instrument_store_asks_for_the_plugin_catalogue_with_its_own_credential() {
     // Contract v20 (the product owner, 2026-10-11): the instrument store reads

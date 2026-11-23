@@ -1,0 +1,14 @@
+# k3s's own system images for the cluster runs (tools/ci-k3s-images.sh):
+# each k3s release's airgap tarball, pinned by the digest its release
+# publishes (sha256sum-<arch>.txt), one row per k3s the cluster jobs run on
+# each architecture: the Makefile's KUBERNETES_VERSION on both, and on amd64
+# each other minor tools/ci_tier.py CLUSTERS names. A cluster job whose k3s
+# has no row here fails at its preload and says so; add the row with the k3s.
+#
+# k3s (rancher/k3s's tag)  arch     sha256 of k3s-airgap-images-<arch>.tar.zst
+v1.36.5-k3s1               x86_64   7d939471907df2d4e537a9c308bf94173e453fff4a2e9e77e9ae92a64be3007f
+v1.36.5-k3s1               aarch64  aeb7b47b0f0cb1356a5f0bc1c11b7c499deceeeafcd411963064e02bfc77da84
+v1.33.13-k3s2              x86_64   7e59087b6a72e00db45a3bcb4f144114b13eb72dc8947c2b7908a0e1482b42b3
+v1.34.12-k3s1              x86_64   c2c6571bee0e2cee5cc3e248aa0edc0343bcbfc0e512589630030b635be3d581
+v1.35.9-k3s1               x86_64   7f1cbfea56d38f5e69aec13500a89290119096cc2f5a6d4f542e5f26599977d0
+v1.37.1-k3s1               x86_64   865b2a63ad7a63fc0db17b7fc2985bf4ae11d5ae93ca1472be6218d20aeb6b23

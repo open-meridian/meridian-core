@@ -256,21 +256,71 @@ impl Spec {
             "
         );
         for table in tables {
-            sql.push_str(&format!(
-                "DROP TRIGGER IF EXISTS {prefix}_captured ON {table};
-                CREATE TRIGGER {prefix}_captured AFTER INSERT OR DELETE ON {table}
-                    FOR EACH ROW EXECUTE FUNCTION {prefix}_capture();
-                DROP TRIGGER IF EXISTS {prefix}_captured_update ON {table};
-                CREATE TRIGGER {prefix}_captured_update AFTER UPDATE ON {table}
-                    FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)
-                    EXECUTE FUNCTION {prefix}_capture();
-                DROP TRIGGER IF EXISTS {prefix}_captured_truncate ON {table};
-                CREATE TRIGGER {prefix}_captured_truncate AFTER TRUNCATE ON {table}
-                    FOR EACH STATEMENT EXECUTE FUNCTION {prefix}_capture();
-                "
-            ));
+            sql.push_str(&self.triggers_sql(table));
         }
         sql
+    }
+
+    /// The triggers that capture one table's rows.
+    fn triggers_sql(&self, table: &str) -> String {
+        let prefix = self.prefix;
+        format!(
+            "DROP TRIGGER IF EXISTS {prefix}_captured ON {table};
+            CREATE TRIGGER {prefix}_captured AFTER INSERT OR DELETE ON {table}
+                FOR EACH ROW EXECUTE FUNCTION {prefix}_capture();
+            DROP TRIGGER IF EXISTS {prefix}_captured_update ON {table};
+            CREATE TRIGGER {prefix}_captured_update AFTER UPDATE ON {table}
+                FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)
+                EXECUTE FUNCTION {prefix}_capture();
+            DROP TRIGGER IF EXISTS {prefix}_captured_truncate ON {table};
+            CREATE TRIGGER {prefix}_captured_truncate AFTER TRUNCATE ON {table}
+                FOR EACH STATEMENT EXECUTE FUNCTION {prefix}_capture();
+            "
+        )
+    }
+
+    /// In a migration's own transaction, after its SQL and before it writes
+    /// rows of its own (a backfill): each of the store's tables the schema
+    /// holds that is not captured yet -- one the migration just made --
+    /// given its capture triggers, so those rows are in the log. Where no
+    /// log is installed yet, nothing: the log, installed after, starts from
+    /// what the store holds (`kept_from`). [`Spec::install`], run after the
+    /// migrations, installs every table's again as it always does.
+    pub fn capture_new_tables(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<(), postgres::Error> {
+        let logged: bool = client
+            .query_one(
+                "SELECT to_regprocedure($1) IS NOT NULL",
+                &[&format!("{}_capture()", self.prefix)],
+            )?
+            .get(0);
+        if !logged {
+            return Ok(());
+        }
+        let bare: Vec<String> = client
+            .query(
+                "SELECT name FROM unnest($1::text[]) AS name
+                  WHERE to_regclass(name) IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM pg_trigger
+                                     WHERE tgrelid = to_regclass(name) AND tgname = $2)",
+                &[
+                    &self
+                        .tables
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>(),
+                    &format!("{}_captured", self.prefix),
+                ],
+            )?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        for table in &bare {
+            client.batch_execute(&self.triggers_sql(table))?;
+        }
+        Ok(())
     }
 
     /// Install the log; see [`Spec::install_sql`]. Done once per version of
@@ -810,6 +860,10 @@ impl Tail {
 /// tables hold: the two compared by each store's tests.
 pub type State = std::collections::BTreeMap<(String, String), String>;
 
+/// What a follower reloads before following: the partition's head, the
+/// tables' state, and which captured tables the schema held then.
+pub type Snapshot = (u64, State, std::collections::BTreeSet<String>);
+
 /// The key of a row of `table`: its primary key's columns, as JSON.
 fn key_of(
     keys: &std::collections::BTreeMap<String, Vec<String>>,
@@ -883,11 +937,14 @@ impl Spec {
         Ok(keys)
     }
 
-    /// What the captured tables hold now, as a [`State`].
+    /// What the captured tables hold now, as a [`State`]: none of a table
+    /// the schema does not hold yet (a store a release before left, whose
+    /// next migration makes it).
     pub fn state(&self, client: &mut impl GenericClient) -> Result<State, postgres::Error> {
         let keys = self.keys(client)?;
+        let held = self.held(client)?;
         let mut state = State::new();
-        for table in self.tables {
+        for table in self.tables.iter().filter(|table| held.contains(**table)) {
             for row in client.query(&format!("SELECT to_jsonb(t)::text FROM {table} t"), &[])? {
                 let row: String = row.get(0);
                 // Through jsonb's own text, as the log keeps it.
@@ -895,6 +952,23 @@ impl Spec {
             }
         }
         Ok(state)
+    }
+
+    /// Which of the captured tables the schema holds now.
+    pub fn held(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<std::collections::BTreeSet<String>, postgres::Error> {
+        let mut held = std::collections::BTreeSet::new();
+        for table in self.tables {
+            let there: bool = client
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[table])?
+                .get(0);
+            if there {
+                held.insert(table.to_string());
+            }
+        }
+        Ok(held)
     }
 
     /// Apply a change of this log to a state: each row's insert, update or
@@ -964,7 +1038,7 @@ fn split_array(array: &str) -> Vec<String> {
 impl Spec {
     /// The partition's head and the tables' state, read in one snapshot:
     /// what a follower reloads before following from that head.
-    pub fn snapshot(&self, client: &mut postgres::Client) -> Result<(u64, State), String> {
+    pub fn snapshot(&self, client: &mut postgres::Client) -> Result<Snapshot, String> {
         let mut tx = client
             .build_transaction()
             .isolation_level(postgres::IsolationLevel::RepeatableRead)
@@ -979,7 +1053,8 @@ impl Spec {
             .map_err(|e| e.to_string())?
             .get(0);
         let state = self.state(&mut tx).map_err(|e| e.to_string())?;
-        Ok((head as u64, state))
+        let held = self.held(&mut tx).map_err(|e| e.to_string())?;
+        Ok((head as u64, state, held))
     }
 
     /// What every store's tests hold its log to (step 3a's done-when): a
@@ -992,7 +1067,7 @@ impl Spec {
     pub fn check_follows(
         &self,
         client: &mut postgres::Client,
-        from: &(u64, State),
+        from: &Snapshot,
     ) -> Result<u64, String> {
         let mut tx = client
             .build_transaction()
@@ -1001,6 +1076,19 @@ impl Spec {
             .start()
             .map_err(|e| e.to_string())?;
         let keys = self.keys(&mut tx).map_err(|e| e.to_string())?;
+        // A captured table there at the reload and gone now is an error,
+        // even an empty one, which the comparison below would pass over
+        // (review-core-3c N7). One made since is not: a migration made it,
+        // and each of its rows must then be in the log, which the
+        // comparison checks. One missing at both is passed over: a store a
+        // release before left, before the migration that makes it.
+        let now = self.held(&mut tx).map_err(|e| e.to_string())?;
+        if let Some(gone) = from.2.difference(&now).next() {
+            return Err(format!(
+                "the captured table {gone} was there at {} and is gone",
+                from.0
+            ));
+        }
         let held = self.state(&mut tx).map_err(|e| e.to_string())?;
         let mut followed_changes = 0;
         for page in [1usize, 700, 4096, crate::PAGE_MOST] {

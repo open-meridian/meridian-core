@@ -673,7 +673,11 @@ impl Prepared {
     }
 
     /// Move it from pending to `to`, its step and notices with it: false
-    /// when it had settled already.
+    /// when it had settled already. Dated when it settles: the clock read
+    /// again here, never earlier than `now_ns`, the time its caller read
+    /// before the act -- a slow act's settle is not dated back past
+    /// migration 17's skew allowance, which the database refuses
+    /// (review-core-3d F5).
     #[allow(clippy::too_many_arguments)]
     pub async fn settle(
         &self,
@@ -685,6 +689,7 @@ impl Prepared {
         note: &str,
         now_ns: i64,
     ) -> Result<bool, String> {
+        let now_ns = now_ns.max(app.clock.now_ns());
         let records = app
             .records
             .current(now_ns)

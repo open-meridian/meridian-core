@@ -32,7 +32,8 @@
 //!   named as not: a rollback to the release before cannot read what it
 //!   leaves.
 //! - **Plugins:** the launched instances, each keeping the sidecar it runs
-//!   until relaunched.
+//!   until relaunched: one launched before per-credential inboxes is
+//!   blocked, since this release's broker refuses its inboxes (INTERIM(v33)).
 //! - **Backups:** the newest backup's age.
 
 use std::path::Path;
@@ -609,21 +610,116 @@ pub fn judge_backups(
     }
 }
 
-/// The launched plugins: each keeps the sidecar it runs until relaunched.
-pub fn judge_plugins(launched: &[String]) -> Finding {
+/// The label the launcher's template stamps on a launched Deployment whose
+/// sidecar asks on per-credential inboxes, and its value.
+pub const SIDECAR_INBOXES: (&str, &str) = ("meridian.dev/sidecar-inboxes", "per-credential");
+
+/// A launched plugin's sidecar, as the chart reads it from its Deployment
+/// when it renders the hook: a launched plugin is its own Deployment, made
+/// from the launcher's template at its launch, and Helm does not move it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Sidecar {
+    pub instance: String,
+    pub image: String,
+    /// Its Deployment's [`SIDECAR_INBOXES`] label; empty where it has none.
+    pub inboxes: String,
+}
+
+/// The launched plugins' sidecars, where the chart read them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Sidecars {
+    pub running: Vec<Sidecar>,
+}
+
+impl Sidecars {
+    /// `MERIDIAN_PREFLIGHT_SIDECARS_READ` and
+    /// `MERIDIAN_PREFLIGHT_LAUNCHED_SIDECARS`, `<instance>=<image>=<label>`
+    /// apart by spaces; None unless the chart said it read them, as it does
+    /// only where a cluster answered its lookup.
+    pub fn read(read: bool, running: Option<String>) -> Option<Sidecars> {
+        read.then(|| Sidecars {
+            running: running
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|each| {
+                    let (instance, rest) = each.split_once('=')?;
+                    let (image, inboxes) = rest.rsplit_once('=')?;
+                    Some(Sidecar {
+                        instance: instance.to_string(),
+                        image: image.to_string(),
+                        inboxes: inboxes.to_string(),
+                    })
+                })
+                .collect(),
+        })
+    }
+}
+
+/// The launched plugins and the sidecar each runs. INTERIM(v33): gone once
+/// no deployment can hold a plugin launched before per-credential inboxes.
+///
+/// From this release a sidecar asks on inboxes named for its credential,
+/// `_INBOX.<user>`, the only ones the broker's grants allow; a sidecar
+/// launched before asks on async-nats's default `_INBOX.<nuid>`, which they
+/// refuse, so every call it makes would time out once the broker takes the
+/// new grants. A launched plugin keeps the sidecar it was launched with
+/// until it is relaunched, and the launcher's template stamps
+/// [`SIDECAR_INBOXES`] on each it launches from this release: one launched
+/// without it blocks the upgrade, named with the way through. Nothing is
+/// relaunched for the person. Without the sidecars read -- run by hand, or
+/// rendered where no cluster answered -- it is not checked.
+pub fn judge_plugins(launched: &[String], sidecars: Option<&Sidecars>) -> Finding {
     if launched.is_empty() {
-        finding("plugins_relaunch", Verdict::Ready, "no plugin is launched")
-    } else {
-        finding(
+        return finding("plugins_relaunch", Verdict::Ready, "no plugin is launched");
+    }
+    let Some(sidecars) = sidecars else {
+        return finding(
+            "plugins_relaunch",
+            Verdict::NotChecked,
+            format!(
+                "{} launched plugin(s); their sidecars were not read: the chart's hook reads them \
+                 from their Deployments",
+                launched.len()
+            ),
+        );
+    };
+    let before: Vec<&Sidecar> = launched
+        .iter()
+        .filter_map(|instance| {
+            sidecars
+                .running
+                .iter()
+                .find(|each| &each.instance == instance && each.inboxes != SIDECAR_INBOXES.1)
+        })
+        .collect();
+    if before.is_empty() {
+        return finding(
             "plugins_relaunch",
             Verdict::Ready,
             format!(
-                "{} launched plugin(s) keep the sidecar they run until each is relaunched; \
-                 `meridian upgrade-deployment` lists them afterwards",
+                "{} launched plugin(s), each on a sidecar with per-credential inboxes or not running",
                 launched.len()
             ),
-        )
+        );
     }
+    let named = before
+        .iter()
+        .map(|each| format!("{} (sidecar {})", each.instance, each.image))
+        .collect::<Vec<_>>()
+        .join(", ");
+    finding(
+        "plugins_relaunch",
+        Verdict::Blocked,
+        format!(
+            "{} launched plugin(s) run a sidecar launched before per-credential inboxes: {named}. \
+             This release's broker allows a sidecar's answers only on inboxes named for its \
+             credential, which an earlier sidecar does not ask on, so every call it makes would \
+             time out. Stop them, upgrade, launch them again: `meridian plugin stop <instance>` \
+             for each, then once upgraded `meridian plugin launch <name> <version> --instance \
+             <instance>`",
+            before.len()
+        ),
+    )
 }
 
 // ── Reading ────────────────────────────────────────────────────────────────
@@ -646,6 +742,8 @@ pub struct Inputs {
     /// The backups' directory, mounted read-only, where backups are kept.
     pub backups: Option<String>,
     pub backup_configured: bool,
+    /// The launched plugins' sidecars, where the chart read them.
+    pub sidecars: Option<Sidecars>,
     pub now_ns: i64,
     /// How long, in all, a database is waited for before it is said not to
     /// answer: [`DATABASE_WAITS_AT_MOST`] from the chart's hook; nothing, one
@@ -681,6 +779,10 @@ impl Inputs {
                 .unwrap_or(1024 * 1024),
             backups: var("MERIDIAN_PREFLIGHT_BACKUPS"),
             backup_configured: var("MERIDIAN_PREFLIGHT_BACKUP_CONFIGURED").is_some(),
+            sidecars: Sidecars::read(
+                var("MERIDIAN_PREFLIGHT_SIDECARS_READ").is_some(),
+                var("MERIDIAN_PREFLIGHT_LAUNCHED_SIDECARS"),
+            ),
             now_ns,
             database_waits_at_most: DATABASE_WAITS_AT_MOST,
         }
@@ -1018,7 +1120,7 @@ pub fn run(inputs: &Inputs) -> Vec<Finding> {
                         })
                         .map(|l| l.instance_id.clone())
                         .collect();
-                    findings.push(judge_plugins(&launched));
+                    findings.push(judge_plugins(&launched, inputs.sidecars.as_ref()));
                     let records = meridian_config::access_records_of(snapshot, inputs.now_ns);
                     findings.push(judge_answer(
                         "the dashboard's access records",

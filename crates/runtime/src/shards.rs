@@ -2200,7 +2200,7 @@ pub(crate) mod tests {
             };
             let epoch = numbering
                 .take(&request.instance, request.shard, &taking)
-                .map_err(|behind| format!("fenced: transitions seen {}", behind.seen))?;
+                .map_err(|refused| format!("fenced: {refused:?}"))?;
             Ok((
                 "meridian.v1.TakeShardReply".into(),
                 meridian_domain::v1::TakeShardReply { epoch }.encode_to_vec(),

@@ -104,6 +104,30 @@
 {{- end }}
 {{- end }}
 {{- end }}
+{{- /* INTERIM(v33): the launched plugins' sidecars (review-core-2c, finding
+       1): a launched plugin is its own Deployment, made from the launcher's
+       template at its launch, which Helm does not move, so it keeps the
+       sidecar it was launched with. Read from this release's own launched
+       Deployments where a cluster answers (as backups, above), each with
+       its `meridian.dev/sidecar-inboxes` label, which the template stamps
+       from the release whose sidecars ask on per-credential inboxes; the
+       check blocks on one without it. With nothing to ask (`helm
+       template`), nothing is given, and the check says it was not made. */}}
+{{- $sidecarsRead := false }}
+{{- $launchedSidecars := list }}
+{{- if lookup "v1" "ServiceAccount" .Release.Namespace "default" }}
+{{- $sidecarsRead = true }}
+{{- range dig "items" (list) (default (dict) (lookup "apps/v1" "Deployment" .Release.Namespace "")) }}
+{{- $labels := dig "metadata" "labels" (dict) . }}
+{{- if and (eq (index $labels "meridian.dev/launched" | default "") "true") (eq (index $labels "app.kubernetes.io/instance" | default "") $.Release.Name) }}
+{{- $instance := index $labels "meridian.dev/instance" | default "" }}
+{{- $inboxes := index $labels "meridian.dev/sidecar-inboxes" | default "" }}
+{{- range dig "spec" "template" "spec" "containers" (list) . }}
+{{- if eq .name "sidecar" }}{{ $launchedSidecars = append $launchedSidecars (printf "%s=%s=%s" $instance .image $inboxes) }}{{ end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- /* Internal TLS as the database serves it now, not as this upgrade
        will make it (see above). */}}
 {{- $tls := dict "top" . "on" (include "meridian-runtime.databaseServesTls" . | eq "true") }}
@@ -219,6 +243,13 @@ spec:
             - name: MERIDIAN_PREFLIGHT_BACKUPS
               value: /backups
             {{- end }}
+            {{- end }}
+            {{- if $sidecarsRead }}
+            # The launched plugins' sidecars, read above.
+            - name: MERIDIAN_PREFLIGHT_SIDECARS_READ
+              value: "true"
+            - name: MERIDIAN_PREFLIGHT_LAUNCHED_SIDECARS
+              value: {{ join " " $launchedSidecars | quote }}
             {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

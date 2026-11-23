@@ -1220,6 +1220,26 @@ fn admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
     Ok(by)
 }
 
+/// INTERIM(v32): v32.8's conductor check, with delegation, replaces it.
+/// Whether `subject` is a deployment admin as their claims hold them for a
+/// call made through no delegation: by their logins and the directory groups
+/// their latest sign-in stored, as the dashboard derives a person's access
+/// (`prepared::access_of`; the runtime's
+/// `wiring::the_conductor_holds_a_deployment_admin_as_the_dashboard_does`
+/// compares the two).
+pub fn deployment_admin_as_signed_in(
+    records: &meridian_domain::v1::AccessRecords,
+    subject: &str,
+) -> bool {
+    let stored = records
+        .people
+        .iter()
+        .find(|person| person.subject == subject)
+        .map(|person| person.directory_groups.as_slice())
+        .unwrap_or_default();
+    meridian_access::person_access(records, subject, stored).deployment_admin
+}
+
 /// The delegation the person acted through, when they acted through a
 /// client (decisions/029); empty otherwise.
 pub(crate) fn delegation(envelope: &Envelope) -> String {
@@ -1262,6 +1282,28 @@ fn book_reading(envelope: &Envelope) -> bool {
             && meta.acting_for_subject.is_empty()
             && meta.acting_through_delegation.is_empty()
     })
+}
+
+/// The plugin a sidecar's ask for its configuration is for: the instance it
+/// says it is, where its own credential asked.
+///
+/// INTERIM(v32): the sender a request names is its sidecar's to set, and
+/// the answer carries that plugin's secret settings opened, so a request
+/// naming another instance is refused unless that instance's credential
+/// asked -- the owner of the inbox it is answered on (v31a, item 3; the
+/// access audit's mismatch 1). Deleted when v32 binds the sender at the
+/// broker by the request's subject.
+pub(crate) fn asking_plugin(envelope: &Envelope) -> Result<String, String> {
+    let plugin = publisher(envelope);
+    if !meridian_bus::inbox::asked_as(&plugin) {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::PermissionDenied,
+            &["publisher_instance_id".to_string()],
+            "publisher_instance_id: a sidecar asks for its own plugin's configuration alone, \
+             with its own credential",
+        ));
+    }
+    Ok(plugin)
 }
 
 fn publisher(envelope: &Envelope) -> String {
@@ -2521,6 +2563,31 @@ pub fn serve_with(
                 ));
             }
             let before = cx.snapshot()?;
+            // INTERIM(v32): replaced by v32.8's conductor check, with
+            // delegation (the second review of v31a-core-2, finding 7).
+            // A link naming a new account creates it and grants it to the
+            // plugin: an access change, which a plugin's credential may
+            // publish, so the conductor checks the right itself (decision 47;
+            // the review of v31a-core-2, F3) as well as the sidecar
+            // (W6.3, W6.4). The person it is sent for must be a deployment
+            // admin as their claims hold one. A delegation is not read here:
+            // a real admin's call through one that does not cover admin
+            // still passes, until v31b binds the assertion and v32's S2 the
+            // sender.
+            if !request.new_account_name.is_empty()
+                && !deployment_admin_as_signed_in(&before.records, &by)
+            {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &["new_account_name".to_string()],
+                    format!(
+                        "{by} is not a deployment admin: a link names an existing account, and \
+                         only a deployment admin names a new one. A deployment admin by a \
+                         directory group may need to sign in again: their groups are read from \
+                         their latest stored sign-in"
+                    ),
+                ));
+            }
             rules::link(&before, &request)?;
             let mut link = ExternalAccountLink {
                 plugin_instance_id: request.plugin_instance_id,
@@ -2687,7 +2754,9 @@ pub fn serve_with(
             if group.user_group_id.is_empty() {
                 group.user_group_id = ids::user_group(cx.clock.now_ns());
             }
-            cx.store.put_user_group(&group).map_err(|f| f.to_string())?;
+            cx.store
+                .put_user_group(&group, &author(envelope), cx.clock.now_ns())
+                .map_err(|f| f.to_string())?;
             tracing::info!(
                 user_group = group.user_group_id,
                 by = subject(envelope),
@@ -2713,7 +2782,7 @@ pub fn serve_with(
                 group.account_group_id = ids::account_group(cx.clock.now_ns());
             }
             cx.store
-                .put_account_group(&group)
+                .put_account_group(&group, &author(envelope), cx.clock.now_ns())
                 .map_err(|f| f.to_string())?;
             tracing::info!(
                 account_group = group.account_group_id,
@@ -2947,7 +3016,7 @@ pub fn serve_with(
             "meridian.v1.PluginConfiguration",
         ),
         |cx, _: PluginConfigurationRequest, envelope| {
-            let plugin = publisher(envelope);
+            let plugin = asking_plugin(envelope)?;
             Ok(configuration(&*cx.snapshot()?, &plugin, &cx.key))
         },
     );

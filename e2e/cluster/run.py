@@ -1414,22 +1414,57 @@ def footprint(s):
         and "meridian.dev/component" in pod["metadata"].get("labels", {})
         and pod.get("status", {}).get("phase") == "Running"
     }
+    def reading():
+        """One `kubectl top pods`, tried three times: its output, or None and
+        why. A non-zero exit here once ended the whole run with no FAILED
+        line (core#139's queue run); a reading it cannot give is recorded as
+        missing instead, and the run goes on."""
+        why = ""
+        for attempt in range(3):
+            if attempt:
+                time.sleep(2)
+            try:
+                done = subprocess.run(
+                    ["kubectl", "--namespace", NAMESPACE, "top", "pods", "--no-headers"],
+                    capture_output=True, text=True, errors="replace", timeout=20)
+            except subprocess.TimeoutExpired:
+                why = "no answer in 20 s"
+                continue
+            if done.returncode == 0 and done.stdout.strip():
+                return done.stdout, ""
+            said = (done.stderr.strip() or done.stdout.strip()).splitlines()
+            why = f"exit {done.returncode}: {said[-1] if said else 'no output'}"
+        return None, why
+
+    readings, missing, why = 12, 0, ""
     peak = None
-    for _ in range(12):
-        said = kubectl("top", "pods", "--no-headers")
-        total = 0.0
-        for line in said.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[0] in ours and parts[2].endswith("Mi"):
-                total += float(parts[2][:-2])
-        if said:
+    for _ in range(readings):
+        said, failed = reading()
+        if said is None:
+            missing, why = missing + 1, failed
+        else:
+            total = 0.0
+            for line in said.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] in ours and parts[2].endswith("Mi"):
+                    total += float(parts[2][:-2])
             peak = total if peak is None else max(peak, total)
         time.sleep(5)
     disk = None
     if ROUTE == "brought":
         size = psql("select sum(pg_database_size(datname)) from pg_database")
         disk = round(int(size) / 1048576, 1) if size.isdigit() else None
-    s.note(f"footprint: {len(ours)} pods running, memory at its peak {peak} MiB, disk {disk} MiB")
+    s.note(f"footprint: {len(ours)} pods running, memory at its peak {peak} MiB "
+           f"({readings - missing} of {readings} readings), disk {disk} MiB")
+    # A missing reading may have been the peak, so it never passes as within
+    # the baseline: any missing fails this check, and the peak is then not
+    # written for footprint-judge, which holds the median of the jobs that
+    # read every time (this job is red by this check).
+    s.check(missing == 0,
+            f"the memory was read every 5 s for a minute: {missing} of {readings} readings of "
+            f"`kubectl top pods` missing after three tries each" + (f" (last: {why})" if why else ""))
+    if missing:
+        peak = None
     command = [sys.executable, "tools/footprint.py", "measured",
                "--baseline", "deploy/footprint-baseline.yaml"]
     if peak is not None:
@@ -1442,7 +1477,10 @@ def footprint(s):
         command += ["--disk-mib", f"{disk:.1f}"]
     done = subprocess.run(command, capture_output=True, text=True, errors="replace")
     s.note((done.stdout + done.stderr).strip())
-    s.check(done.returncode == 0, "the default profile's footprint is within v29's baseline (ruling 1058)")
+    unread = "" if peak is not None else (
+        ": its disk alone, the memory peak not having been read" if disk is not None
+        else ": nothing judged here, the memory peak not having been read")
+    s.check(done.returncode == 0, "the default profile's footprint is within v29's baseline (ruling 1058)" + unread)
 
 
 def verdict(s):

@@ -60,6 +60,10 @@ metadata:
     meridian.dev/instance: {{ .instance | quote }}
     {{- if .launched }}
     meridian.dev/launched: "true"
+    # INTERIM(v33): its sidecar asks on inboxes named for its credential,
+    # which preflight tells from one launched before them (review-core-2c,
+    # finding 1); gone once no deployment predates them.
+    meridian.dev/sidecar-inboxes: per-credential
     {{- end }}
     {{- if .live }}
     meridian.dev/live: "true"

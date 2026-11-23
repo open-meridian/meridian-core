@@ -92,6 +92,9 @@ pub struct Contract {
 struct Row {
     /// With `*` for an instance segment, as the grant grammar has it.
     topic: String,
+    /// A command or a query: a request, which its subscriber answers on the
+    /// asker's inbox. An event is answered by nobody.
+    request: bool,
     publishers: Vec<String>,
     subscribers: Vec<String>,
 }
@@ -130,7 +133,7 @@ impl Contract {
             };
         }
         for columns in lines(topics) {
-            let [topic, _kind, publishers, subscribers] = columns[..] else {
+            let [topic, kind, publishers, subscribers] = columns[..] else {
                 return Err(format!("a topic line is not four columns: {columns:?}"));
             };
             let names = |column: &str| -> Vec<String> {
@@ -143,6 +146,7 @@ impl Contract {
             };
             contract.rows.push(Row {
                 topic: topic.to_string(),
+                request: matches!(kind, "command" | "query"),
                 publishers: names(publishers),
                 subscribers: names(subscribers),
             });
@@ -204,6 +208,16 @@ impl Contract {
         }
         let names: Vec<&str> = roles.iter().map(String::as_str).collect();
         Ok(self.named(&names))
+    }
+
+    /// Each request row's askers and answerers, as its publisher and
+    /// subscriber columns name them: who may send a command or a query, and
+    /// who serves it. Events are left out, as nobody answers one.
+    pub fn requests(&self) -> impl Iterator<Item = (&[String], &[String])> {
+        self.rows
+            .iter()
+            .filter(|row| row.request)
+            .map(|row| (row.publishers.as_slice(), row.subscribers.as_slice()))
     }
 
     /// A component's own rows. `sidecar` is every sidecar's.
@@ -427,6 +441,30 @@ platform.config.command.file-ticket\tcommand\tcustody,operations\tdashboard
         // Narrower than the grant, in both concrete and wildcard form.
         assert!(g.may_subscribe("platform.street.event.position-updated"));
         assert!(g.may_subscribe("platform.street.event.*"));
+    }
+
+    /// The request rows, with who asks and who answers each, as the columns
+    /// name them; an event, answered by nobody, is not one.
+    #[test]
+    fn the_request_rows_are_the_commands_and_queries_with_their_columns() {
+        let contract = contract();
+        let requests: Vec<(Vec<&str>, Vec<&str>)> = contract
+            .requests()
+            .map(|(asking, answering)| {
+                (
+                    asking.iter().map(String::as_str).collect(),
+                    answering.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            requests,
+            vec![
+                (vec!["custody"], vec!["street"]),
+                (vec!["reporting", "dashboard"], vec!["street"]),
+                (vec!["sidecar"], vec!["conductor"]),
+            ]
+        );
     }
 
     #[test]

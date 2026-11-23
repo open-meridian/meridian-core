@@ -471,3 +471,85 @@ fn a_component_login_not_made_is_named_with_the_sql_that_makes_it_and_warns() {
         missing.why
     );
 }
+
+/// The review of v31a-core-2 (review-core-2c, finding 1): a launched plugin
+/// keeps the sidecar it was launched with, and one launched before
+/// per-credential inboxes asks on `_INBOX.<nuid>`, which this release's
+/// grants refuse. Preflight answered Ready over it. It blocks on exactly
+/// those, told by the label the launcher's template stamps, whatever the
+/// image: a later upgrade over a labelled plugin is not blocked.
+#[test]
+fn a_launched_plugin_from_before_per_credential_inboxes_blocks_the_upgrade() {
+    let sidecar = |instance: &str, image: &str, inboxes: &str| Sidecar {
+        instance: instance.into(),
+        image: image.into(),
+        inboxes: inboxes.into(),
+    };
+    let older = "ghcr.io/open-meridian/meridian-core:a1b2c3d";
+    let launched = vec!["custody-1".to_string(), "reporting-1".to_string()];
+    let sidecars = Sidecars {
+        running: vec![
+            sidecar("custody-1", older, ""),
+            sidecar("reporting-1", older, "per-credential"),
+        ],
+    };
+    let blocked = judge_plugins(&launched, Some(&sidecars));
+    assert_eq!(blocked.verdict, Verdict::Blocked, "{}", blocked.why);
+    assert!(
+        blocked
+            .why
+            .contains(&format!("custody-1 (sidecar {older})")),
+        "{}",
+        blocked.why
+    );
+    assert!(!blocked.why.contains("reporting-1"), "{}", blocked.why);
+    assert!(
+        blocked
+            .why
+            .contains("Stop them, upgrade, launch them again"),
+        "{}",
+        blocked.why
+    );
+
+    // Labelled on an older image, or with no Deployment running: Ready.
+    let labelled = Sidecars {
+        running: vec![sidecar("reporting-1", older, "per-credential")],
+    };
+    assert_eq!(
+        judge_plugins(&launched, Some(&labelled)).verdict,
+        Verdict::Ready
+    );
+    // None launched.
+    assert_eq!(judge_plugins(&[], Some(&sidecars)).verdict, Verdict::Ready);
+    // Run by hand, nothing read of the cluster: not checked, never Ready.
+    assert_eq!(judge_plugins(&launched, None).verdict, Verdict::NotChecked);
+}
+
+#[test]
+fn the_sidecars_read_as_the_chart_writes_them() {
+    assert_eq!(Sidecars::read(false, Some("a=b=".into())), None);
+    assert_eq!(
+        Sidecars::read(
+            true,
+            Some("custody-1=r:old=  reporting-1=r@sha256:00=per-credential nonsense".into())
+        ),
+        Some(Sidecars {
+            running: vec![
+                Sidecar {
+                    instance: "custody-1".into(),
+                    image: "r:old".into(),
+                    inboxes: "".into(),
+                },
+                Sidecar {
+                    instance: "reporting-1".into(),
+                    image: "r@sha256:00".into(),
+                    inboxes: "per-credential".into(),
+                },
+            ],
+        })
+    );
+    assert_eq!(
+        Sidecars::read(true, None),
+        Some(Sidecars { running: vec![] })
+    );
+}

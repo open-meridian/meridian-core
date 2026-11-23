@@ -169,8 +169,9 @@ pub fn configuration(
     launched: &[Launched],
     hashes: &BTreeMap<String, String>,
 ) -> Result<(String, Vec<String>), String> {
-    use crate::broker::{instance_user, rendered, users, Password};
+    use crate::broker::{answer_grants, instance_user, rendered, users, Password};
     let mut admitted = users(contract, chart)?;
+    let mut instances = chart.to_vec();
     let mut left_out = Vec::new();
     for plugin in launched {
         let id = &plugin.instance_id;
@@ -183,10 +184,16 @@ pub fn configuration(
             continue;
         };
         match instance_user(contract, &plugin.instance(), Password::Bcrypt(hash.clone())) {
-            Ok(user) => admitted.push(user),
+            Ok(user) => {
+                admitted.push(user);
+                instances.push(plugin.instance());
+            }
             Err(refusal) => left_out.push(refusal),
         }
     }
+    // A launched plugin is answered on its inboxes as a chart's is: by the
+    // runtime, and by each core credential serving a request it may send.
+    answer_grants(contract, &instances, &mut admitted);
     Ok((rendered(header, &admitted), left_out))
 }
 

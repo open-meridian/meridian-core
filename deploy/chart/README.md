@@ -337,7 +337,8 @@ and a blocked check stops `helm upgrade` -- and `meridian upgrade-deployment`
   additive or not;
 - the stored templates this release would read differently: fields it does
   not know, or a model its engine does not have;
-- the launched plugins, which keep their sidecar until relaunched;
+- each launched plugin's sidecar: one launched before per-credential inboxes
+  blocks the upgrade; stop that plugin, upgrade, then launch it again;
 - the newest backup's age, where backups are kept on the chart's own volume.
 
 It changes nothing: its database sessions are read-only, it holds no RBAC and

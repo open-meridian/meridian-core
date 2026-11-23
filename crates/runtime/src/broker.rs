@@ -20,13 +20,128 @@
 use std::collections::BTreeSet;
 
 use meridian_analytics::queue as units;
-use meridian_bus::write_ahead;
+use meridian_bus::{inbox, write_ahead};
 use meridian_sidecar::Contract;
 
-/// Where a reply lands. A caller has to hear its own answer, and a responder
-/// has to be able to reply to whoever asked; the broker scopes the second to
-/// inboxes it actually received, which is tighter than any list.
-const INBOX: &str = "_INBOX.>";
+/// Where a reply lands: each user's own inboxes, `_INBOX.<user>.`, which its
+/// client makes its inboxes under (v31a, item 2; [`inbox`]). A caller hears
+/// its own answers and no other's. Who else may publish into them, to answer
+/// it, is [`answer_grants`]'s to say.
+fn own_inbox(user: &str) -> String {
+    inbox::grant(user)
+}
+
+/// What a credential is, for the inboxes it answers on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answering {
+    /// The runtime's credential, which answers every other.
+    Runtime,
+    /// A component's own credential, or a component instance's.
+    Core,
+    /// A plugin instance's, which answers none.
+    Plugin,
+}
+
+/// Each credential's publish, never subscribe, on the inboxes of those it
+/// answers (v31a, item 2, as restated 2026-11-20; the proposal on answers
+/// refused across a broker reload, option A, approved by consensus).
+///
+/// - A non-runtime core credential -- an own-credential component
+///   (first-run, instrument, analytics) or a component instance (the
+///   dashboard's, the launcher's) -- gets `_INBOX.<asker>.>` for every
+///   credential the contract allows to send a request it serves: each
+///   command or query row whose subscriber column names it, every
+///   credential its publisher column names. From those two columns alone,
+///   never from the rendered grants: a component topic is granted publish
+///   and subscribe alike, which would read every holder as answering every
+///   other.
+/// - The runtime's credential answers every one of them already, so it gets
+///   every other credential's: the lake's writer also answers a write it
+///   took from the write-ahead stream on the inbox the write named (W10.4),
+///   carried there by no request, and answers only an inbox of the instance
+///   whose subject the write came on (`meridian_lake::write_ahead`).
+/// - A plugin credential gets none: no plugin publishes into another's
+///   inboxes.
+///
+/// So an answer never needs the broker's `allow_responses`, the one answer
+/// it admits on a request's reply subject whatever the grants: a
+/// configuration reload -- every plugin launch, removal and entitlement
+/// change makes one -- registers each client's user again and forgets the
+/// replies it was owed, and an answer it would admit leaves a reply entry
+/// on the answering connection until it expires when it is never sent.
+/// `allow_responses` stays, as the fallback ([`ANSWERED_WITHIN`]): `ha`'s
+/// brokers reload one after another. A standing rule, not an interim;
+/// reply rights across a reload are an input to v32's accounts spike
+/// (decision 12).
+///
+/// Subscribe stays each credential's own: only X hears `_INBOX.X.>`, and no
+/// grant holds `_INBOX.>`. Called once every user is made, with the
+/// instances they were made for, and again whenever one is added.
+pub fn answer_grants(contract: &Contract, instances: &[Instance], users: &mut [User]) {
+    // Each user's kind, and the contract's names it holds: the runtime its
+    // components, a component its own name, a plugin instance its roles and
+    // its sidecar's traffic. A user made for none of these answers nobody.
+    let held: Vec<Option<(Answering, Vec<String>)>> = users
+        .iter()
+        .map(|user| {
+            let user = user.user.as_str();
+            if user == "runtime" {
+                return Some((
+                    Answering::Runtime,
+                    RUNTIME_COMPONENTS.map(String::from).to_vec(),
+                ));
+            }
+            if OWN_CREDENTIAL.contains(&user) {
+                return Some((Answering::Core, vec![user.to_string()]));
+            }
+            match instances.iter().find(|instance| instance.id() == user)? {
+                Instance::Plugin { roles, .. } => {
+                    let mut names = meridian_domain::roles_now(roles);
+                    names.push("sidecar".to_string());
+                    Some((Answering::Plugin, names))
+                }
+                Instance::Component { component, .. } => {
+                    Some((Answering::Core, vec![component.clone()]))
+                }
+            }
+        })
+        .collect();
+    let named = |index: usize, column: &[String]| {
+        held[index]
+            .as_ref()
+            .is_some_and(|(_, names)| names.iter().any(|name| column.contains(name)))
+    };
+    let kind = |index: usize| held[index].as_ref().map(|(kind, _)| *kind);
+    // Whom each core credential answers: by index into `users`.
+    let mut askers: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); users.len()];
+    for (asking, serving) in contract.requests() {
+        let sending: Vec<usize> = (0..users.len())
+            .filter(|&index| named(index, asking))
+            .collect();
+        for responder in (0..users.len()).filter(|&index| named(index, serving)) {
+            if kind(responder) == Some(Answering::Core) {
+                askers[responder].extend(&sending);
+            }
+        }
+    }
+    let inboxes: Vec<String> = users.iter().map(|user| own_inbox(&user.user)).collect();
+    for (index, user) in users.iter_mut().enumerate() {
+        let theirs = (0..inboxes.len()).filter(|&other| {
+            other != index
+                && match kind(index) {
+                    Some(Answering::Runtime) => true,
+                    Some(Answering::Core) => askers[index].contains(&other),
+                    Some(Answering::Plugin) | None => false,
+                }
+        });
+        // In the users' order, so the file reads as the list does.
+        for other in theirs {
+            if !user.publish.contains(&inboxes[other]) {
+                user.publish.push(inboxes[other].clone());
+            }
+        }
+    }
+}
 
 /// The components this deployment's runtime hosts, sharing one credential.
 const RUNTIME_COMPONENTS: [&str; 4] = ["street", "bor", "lake", "conductor"];
@@ -421,8 +536,8 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
             subscribe.push(topic.to_string());
         }
         publish.extend(jetstream_grants(&[component]));
-        publish.push(INBOX.to_string());
-        subscribe.push(INBOX.to_string());
+        publish.push(own_inbox(component));
+        subscribe.push(own_inbox(component));
         users.push(User {
             user: component.to_string(),
             password: Password::Env(variable(component)),
@@ -438,8 +553,8 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
         subscribe.push(topic.to_string());
     }
     publish.extend(jetstream_grants(&RUNTIME_COMPONENTS));
-    publish.push(INBOX.to_string());
-    subscribe.push(INBOX.to_string());
+    publish.push(own_inbox("runtime"));
+    subscribe.push(own_inbox("runtime"));
     users.push(User {
         user: "runtime".to_string(),
         password: Password::Env(variable("runtime")),
@@ -455,6 +570,7 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
             Password::Env(variable(instance.id())),
         )?);
     }
+    answer_grants(contract, instances, &mut users);
 
     Ok(users)
 }
@@ -502,8 +618,8 @@ pub fn instance_user(
             )
         }
     };
-    publish.push(INBOX.to_string());
-    subscribe.push(INBOX.to_string());
+    publish.push(own_inbox(instance.id()));
+    subscribe.push(own_inbox(instance.id()));
     Ok(User {
         user: instance.id().to_string(),
         password,
@@ -513,6 +629,19 @@ pub fn instance_user(
     })
 }
 
+/// How long a responder may send its one answer to a request it was
+/// delivered, whatever its grants say (`allow_responses`): the broker's own
+/// default, two minutes. The fallback alone: every answer is granted by
+/// name ([`answer_grants`]), the longest waits on the bus among them -- an
+/// install or an update of a plugin or a pack, which the conductor answers
+/// on the dashboard's inbox -- so none rides it, as a run of the real-NATS
+/// suite on a broker with no `allow_responses` at all showed (v31a, item 2
+/// as restated 2026-11-20). It stays for `ha`'s brokers, which reload one
+/// after another. A reply entry it leaves on a connection for a request
+/// never answered lasts as long as this; it was fifteen minutes while
+/// answers rode it (the review of v31a-core-2, F2).
+pub const ANSWERED_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The users, as the broker's own configuration.
 pub fn rendered(header: &str, users: &[User]) -> String {
     let mut out = String::from(header);
@@ -521,7 +650,7 @@ pub fn rendered(header: &str, users: &[User]) -> String {
         out.push_str(&format!("    # {}\n", user.note));
         out.push_str(&format!(
             "    {{ user: {}, password: {}, permissions: {{ publish: {{ allow: {} }}, \
-             subscribe: {{ allow: {} }}, allow_responses: true }} }}\n",
+             subscribe: {{ allow: {} }}, allow_responses: {{ max: 1, expires: \"{}s\" }} }} }}\n",
             user.user,
             match &user.password {
                 Password::Env(variable) => format!("${variable}"),
@@ -531,6 +660,7 @@ pub fn rendered(header: &str, users: &[User]) -> String {
             },
             list(&user.publish),
             list(&user.subscribe),
+            ANSWERED_WITHIN.as_secs(),
         ));
     }
     out.push_str("  ]\n}\n");

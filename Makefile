@@ -968,6 +968,13 @@ K3D ?= k3d
 # E2E_K3S_IMAGE (.github/workflows/ci.yaml).
 KUBERNETES_VERSION := 1.36.5
 E2E_K3S_IMAGE ?= rancher/k3s:v$(KUBERNETES_VERSION)-k3s1
+# The k3s release's airgap tarball of its system images, for E2E_K3S_IMAGE's
+# version and this machine's architecture, handed to every node, where k3s
+# imports it before it starts a pod, so nothing in kube-system is pulled
+# from Docker Hub. CI's cluster jobs set it (.github/actions/k3s-images,
+# tools/ci-k3s-images.sh), with the node image loaded beside it; empty, the
+# system images are pulled as k3s pulls them.
+E2E_K3S_AIRGAP ?=
 E2E_K3D_CLUSTER ?= meridian-e2e
 E2E_K3D_NETWORK ?= meridian-k3d
 E2E_K3D_SUBNET ?= 172.28.0.0/16
@@ -1036,7 +1043,8 @@ e2e-cluster-k3d:
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
 	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
 	@$(if $(E2E_K3D_SHARED),docker volume rm -f $(E2E_K3D_SHARED) >/dev/null && docker volume create $(E2E_K3D_SHARED) >/dev/null,:)
-	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)"
+	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)$(if $(E2E_K3S_AIRGAP), with its system images from $(E2E_K3S_AIRGAP))"
+	@$(if $(E2E_K3S_AIRGAP),test -s "$(E2E_K3S_AIRGAP)" || { echo "e2e-cluster-k3d: E2E_K3S_AIRGAP names $(E2E_K3S_AIRGAP): it is not there" >&2; exit 1; },:)
 	@: >.e2e-k3d.log; made=; nodes=; at=0; \
 	if [ "$(E2E_K3D_AGENTS)" != 0 ]; then nodes="--agents $(E2E_K3D_AGENTS)"; fi; \
 	$(if $(E2E_K3D_SHARED),nodes="$$nodes --volume $(E2E_K3D_SHARED):$(E2E_K3D_SHARED_PATH)@server:*;agent:*";) \
@@ -1046,6 +1054,7 @@ e2e-cluster-k3d:
 	for attempt in 1 2; do \
 	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --image $(E2E_K3S_IMAGE) --network $(E2E_K3D_NETWORK) $$nodes \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
+		$(if $(E2E_K3S_AIRGAP),--volume "$(abspath $(E2E_K3S_AIRGAP)):/var/lib/rancher/k3s/agent/images/$(notdir $(E2E_K3S_AIRGAP))@server:*;agent:*") \
 		--api-port $(E2E_K3D_API) -p "$(E2E_K3D_HTTP):80@loadbalancer" \
 		--kubeconfig-update-default=false --kubeconfig-switch-context=false \
 		--wait --timeout $(E2E_K3D_READY_SECONDS)s >>.e2e-k3d.log 2>&1; then made=yes; break; fi; \
@@ -1063,7 +1072,10 @@ e2e-cluster-k3d:
 	&& ready "every API group to be discoverable" kubectl api-resources \
 	&& kubectl -n kube-system rollout restart deploy/coredns >/dev/null \
 	&& ready "CoreDNS to come back from its restart" kubectl -n kube-system rollout status deploy/coredns --timeout=10s \
-	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made"
+	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made" \
+	&& pulled=$$(kubectl get events -A --field-selector reason=Pulling \
+		-o jsonpath='{range .items[*]}{.message}{"; "}{end}' 2>/dev/null | sed 's/Pulling image //g'; true) \
+	&& echo "e2e-cluster-k3d: images pulled while it was made: $${pulled:-none}"
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
 		E2E_IMAGE_LOAD="e2e/cluster/image-load.sh $(K3D) $(E2E_K3D_CLUSTER)" E2E_CLUSTER_HTTP_PORT=$(E2E_K3D_HTTP); \
 	  held=$$?; \
@@ -1251,7 +1263,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)) $(if $(E2E_FAILOVER_DRIVEN),$(INTEROP_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-failover-claims.jsonl .e2e-failover-figures.jsonl .e2e-failover-history.edn .e2e-said-*.log .e2e-shards-*.log
+	@rm -f .e2e-failover-claims.jsonl .e2e-failover-figures.jsonl .e2e-failover-history.edn .e2e-failover-book.log .e2e-elle-*.log .e2e-said-*.log .e2e-shards-*.log
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 	 E2E_K3D_LOG_LINES=$(E2E_K3D_LOG_LINES) \
@@ -1492,7 +1504,72 @@ test-broker: network runtime-image tests-image
 		>.test-broker.log 2>&1 \
 		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
 		     tail -40 .test-broker.log >&2; exit 1; }
-	@echo "test-broker OK: messages cross a process boundary through the broker"
+	@# Answers in flight across a configuration reload (v31a, item 2): the
+	@# test, alone, puts its requests in flight and says RELOAD-NOW; the
+	@# broker is then given the configuration a launch would give it -- one
+	@# more custody instance, so its users change -- and reloaded while the
+	@# test waits, and the test answers after. dev.conf is put back after,
+	@# and reloaded again, however the step ends -- a failure or an
+	@# interrupt -- and a failure to put it back fails the step; the wait
+	@# for RELOAD-NOW ends when the test has (review-core-2c, finding 3).
+	@sed 's|"instances": \[|"instances": [{"instance_id": "launched-test-1", "roles": ["custody"]},|' \
+		deploy/nats/dev-instances.json >.test-broker-launched.json
+	@grep -q launched-test-1 .test-broker-launched.json \
+		|| { echo "test-broker FAILED: the launched instance was not added for the reload" >&2; exit 1; }
+	@restore() { \
+		$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+			--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf \
+		&& $(COMPOSE_TEST) kill -s HUP nats >/dev/null \
+		|| { echo "test-broker FAILED: deploy/nats/dev.conf was not put back and the broker reloaded after the reload test" >&2; return 1; }; \
+	}; \
+	trap 'restore || exit 1' EXIT; trap 'exit 130' INT TERM HUP; \
+	$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-bus --test nats -- --ignored --exact answers_in_flight_across_a_configuration_reload --nocapture \
+		>.test-broker-reload.log 2>&1 & asking=$$!; \
+	for i in $$(seq 1 120); do grep -q RELOAD-NOW .test-broker-reload.log && break; kill -0 $$asking 2>/dev/null || break; sleep 1; done; \
+	if grep -q RELOAD-NOW .test-broker-reload.log; then \
+		$(BROKER_CONFIG) --instances /w/.test-broker-launched.json \
+			--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf \
+		&& $(COMPOSE_TEST) kill -s HUP nats >/dev/null; \
+	fi; \
+	wait $$asking; status=$$?; \
+	[ $$status = 0 ] \
+		|| { echo "test-broker FAILED: answers across a configuration reload. The last 40 lines, and the whole of it in .test-broker-reload.log:" >&2; \
+		     tail -40 .test-broker-reload.log >&2; exit 1; }
+	@grep -q 'answers_in_flight_across_a_configuration_reload' .test-broker-reload.log \
+		|| { echo "test-broker FAILED: the reload's test did not run (.test-broker-reload.log)" >&2; exit 1; }
+	@# No answer rides allow_responses (v31a item 2's condition; review-core-2c,
+	@# finding 6): every answer is granted by name, and allow_responses is
+	@# kept only as the fallback for ha's brokers reloading one after another.
+	@# The suite again on dev.conf with every allow_responses removed, so an
+	@# answer that needs the fallback fails here, on every run, not once by
+	@# hand. dev.conf is generated again and the broker restarted after,
+	@# however the step ends, and a failure to do so fails it.
+	@restore() { \
+		$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+			--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf \
+		&& $(COMPOSE_TEST) restart nats >/dev/null \
+		&& $(COMPOSE_TEST) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-broker FAILED: deploy/nats/dev.conf was not put back and the broker restarted after the no-fallback run" >&2; return 1; }; \
+	}; \
+	trap 'restore || exit 1' EXIT; trap 'exit 130' INT TERM HUP; \
+	granted=$$(grep -c 'allow_responses' deploy/nats/dev.conf); users=$$(grep -c '{ user:' deploy/nats/dev.conf); \
+	sed -E 's/, allow_responses: \{[^}]*\}//g' deploy/nats/dev.conf >.test-broker-no-fallback.conf \
+		&& mv -f .test-broker-no-fallback.conf deploy/nats/dev.conf || exit 1; \
+	[ "$$granted" -gt 0 ] && [ "$$(grep -c 'allow_responses' deploy/nats/dev.conf)" = 0 ] \
+		&& [ "$$(grep -c '{ user:' deploy/nats/dev.conf)" = "$$users" ] \
+		|| { echo "test-broker FAILED: dev.conf's allow_responses ($$granted) were not all removed, its $$users users kept" >&2; exit 1; }; \
+	$(COMPOSE_TEST) restart nats >/dev/null; \
+	$(COMPOSE_TEST) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-broker FAILED: the broker did not come back without allow_responses" >&2; exit 1; }; \
+	$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-bus --test nats \
+		>.test-broker-no-fallback.log 2>&1 \
+		|| { echo "test-broker FAILED: an answer needs allow_responses, the fallback alone. The last 40 lines, and the whole of it in .test-broker-no-fallback.log:" >&2; \
+		     tail -40 .test-broker-no-fallback.log >&2; exit 1; }; \
+	grep -qE '[1-9][0-9]* tests run: [1-9][0-9]* passed' .test-broker-no-fallback.log \
+		|| { echo "test-broker FAILED: the no-fallback run passed no test (.test-broker-no-fallback.log)" >&2; exit 1; }
+	@echo "test-broker OK: messages cross a process boundary through the broker, answers in flight across a configuration reload reach their askers, and no answer needs allow_responses"
 
 # The analytics units' work queue end to end on three JetStream servers, as
 # `ha` runs them, under the analytics component's own credential and the
@@ -1501,6 +1578,14 @@ test-broker: network runtime-image tests-image
 # and the lake's write-ahead stream not answered to it. As test-broker's
 # cluster: the servers made afresh on the new config, so it is the one in
 # force, and their routes made before the test starts.
+#
+# Then on the same servers, after the queue's test has waited out their
+# group's forming, the lake's writer against a real write-ahead stream (the
+# second review of v31a-core-2, finding 1): a write on one instance's subject
+# naming another instance's inbox is recorded and answered to nobody, and the
+# write after it, naming its own, is answered. Under the tests credential,
+# which may publish anywhere, so the refusal proven is the lake's own and not
+# the broker's.
 test-jetstream: network runtime-image tests-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
@@ -1514,7 +1599,14 @@ test-jetstream: network runtime-image tests-image
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'the_queue_runs_end_to_end_under_the_analytics_credential' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the queue's test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential"
+	@$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-lake --lib -- --ignored --exact tests::write_ahead::a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody \
+		>>.test-jetstream.log 2>&1 \
+		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
+		     tail -40 .test-jetstream.log >&2; exit 1; }
+	@grep -q 'a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody' .test-jetstream.log \
+		|| { echo "test-jetstream FAILED: the lake's write-ahead test did not run (.test-jetstream.log)" >&2; exit 1; }
+	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, and the lake answers a write on its sender's inboxes alone"
 
 # Signing in against a real directory. Its own target rather than part of
 # `test`, for the reason `test-broker` is: it needs a server standing up, and

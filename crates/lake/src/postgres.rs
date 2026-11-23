@@ -23,7 +23,7 @@ use meridian_domain::v1::{
 };
 
 mod moves;
-pub use moves::{RangeTip, SwitchTimes, Switched};
+pub use moves::{RangeTip, Standing, SwitchTimes, Switched};
 
 use crate::memory::{as_of, number, number_parts, served_of};
 use crate::migrations;
@@ -48,6 +48,28 @@ thread_local! {
     /// than one.
     static SNAPSHOT_HEADS: std::cell::RefCell<Option<BTreeMap<String, u64>>> =
         const { std::cell::RefCell::new(None) };
+    /// The rows of the partitions the reads on this thread chose what they
+    /// answer by, where one asked ([`standing_during`]).
+    static STANDING: std::cell::RefCell<Option<Vec<Standing>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `read`, with each of its datasets' rows in `lake_partition` as its reads
+/// on this thread found them, and whether each answered the range: from
+/// the look each read chose what it answers by, in its own transaction, so
+/// the snapshot its rows came from (step 3d; the review of 2026-11-23 of
+/// the lake's routing, findings 3, 5 and 6). For a lake over several
+/// databases ([`crate::spread::Spread`]), which holds what its databases
+/// answered together; with one, nothing is noted. A read made inside
+/// another's notes its own.
+///
+/// INTERIM(v32): gone when v32's ownership record says where a range is
+/// read.
+pub(crate) fn standing_during<T>(read: impl FnOnce() -> T) -> (T, Vec<Standing>) {
+    let outer = STANDING.with(|noted| noted.borrow_mut().replace(Vec::new()));
+    let answer = read();
+    let noted = STANDING.with(|noted| std::mem::replace(&mut *noted.borrow_mut(), outer));
+    (answer, noted.unwrap_or_default())
 }
 
 /// The next reads on this thread say the heads of the snapshot each answers
@@ -64,6 +86,15 @@ pub fn stamp_from_snapshot() {
 pub fn snapshot_heads() -> Option<BTreeMap<String, u64>> {
     STAMPING.with(|stamping| stamping.set(false));
     SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take())
+}
+
+/// A read's own transaction on `conn`: one snapshot, nothing written.
+fn read_only(conn: &mut Connection) -> Result<Transaction<'_>> {
+    conn.build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .map_err(unavailable)
 }
 
 /// In a read's repeatable-read transaction, where its thread asked: the
@@ -262,10 +293,37 @@ fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<cra
     Ok(open)
 }
 
+/// [`open_ranges_taken`]'s statement: a dataset's open ranges ($1), each
+/// with the group, the head and whether the epoch is a move's pointer ($2)
+/// of the row taken, and whether it was taken. Named for the test that
+/// reads it across a switch committing between its snapshot and its take.
+pub const OPEN_RANGES_TAKEN: &str =
+    "SELECT p.dataset, p.lo, p.hi, l.writer_group, l.taken IS NOT NULL,
+            coalesce(l.head, p.head), coalesce(l.epoch = $2, false)
+       FROM lake_partition p
+       LEFT JOIN LATERAL (SELECT true AS taken, q.writer_group, q.head, q.epoch
+                            FROM lake_partition q
+                           WHERE q.dataset = p.dataset
+                             FOR UPDATE SKIP LOCKED) AS l ON true
+      WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
+        AND p.closed_at IS NULL";
+
 /// [`open_ranges`], each range's row taken for the rest of `tx` where no
 /// move's switch holds it (step 3d; section 6.8), skipped where one does:
 /// with the group each names and whether `tx` holds it. Under the
 /// dataset's lock, so the ranges stand still.
+///
+/// The group, the head and the epoch are the taken row's own (`l`), never
+/// the statement's snapshot's (`p`): a switch takes the row alone, not the
+/// dataset's lock, and one that commits between this statement's snapshot
+/// and its take leaves the snapshot naming the group the range was, on a
+/// row taken that names the other. Read from the snapshot, the batch went
+/// on as the range's owner to the head's epoch check, and its write was
+/// refused as fenced by a newer writer where it is the other group's to
+/// commit (main's ha range-move flake: "this writer's 2, the partition's
+/// 1"). A row not taken is held by a switch, or was deleted since the
+/// snapshot by a move between databases (`moved_in`), and its parts wait
+/// whatever it named.
 #[allow(clippy::type_complexity)]
 fn open_ranges_taken(
     client: &mut impl GenericClient,
@@ -276,14 +334,7 @@ fn open_ranges_taken(
 )> {
     let rows = client
         .query(
-            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head,
-                    p.epoch = $2
-               FROM lake_partition p
-               LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
-                                   WHERE q.dataset = p.dataset
-                                     FOR UPDATE SKIP LOCKED) AS l ON true
-              WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
-                AND p.closed_at IS NULL",
+            OPEN_RANGES_TAKEN,
             &[&dataset, &meridian_changes::moves::POINTER_EPOCH],
         )
         .map_err(unavailable)?;
@@ -671,6 +722,18 @@ impl PostgresStore {
         }
     }
 
+    /// The group that owns `partition` by what its row's `writer_group`
+    /// names, as just read under the row's lock: that group where the store
+    /// has it, else its dataset's rendezvous owner. What
+    /// [`meridian_changes::groups::Groups::owner_by`] answers from the
+    /// member's view, answered from the row.
+    fn named_owner(&self, partition: &str, named: Option<u32>) -> u32 {
+        let count = self.groups.count();
+        named.filter(|group| *group < count).unwrap_or_else(|| {
+            meridian_changes::groups::owner(crate::range::dataset_of(partition), count)
+        })
+    }
+
     /// Refused where another writer group owns `dataset` (step 3d): its
     /// writes are handed to that group's writer, never committed here.
     fn owned(&self, partition: &str) -> Result<()> {
@@ -742,6 +805,16 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// The head a batch would number `partition` from, taken in a
+    /// transaction of its own and let go: for the tests of what
+    /// [`Self::head`] refuses, and as what.
+    #[doc(hidden)]
+    pub fn head_taken(&self, partition: &str) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        self.head(&mut tx, partition)
+    }
+
     /// The partition's head, taken under its lock, its epoch checked against
     /// the writer's (step 3a): a batch commits only while the head row's
     /// epoch is its own. A dataset begun here takes the writer's epoch, the
@@ -755,7 +828,8 @@ impl PostgresStore {
         self.epoch_now()?;
         let held = |tx: &mut Transaction<'_>| {
             tx.query_opt(
-                "SELECT head, epoch, closed_at FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+                "SELECT head, epoch, closed_at, writer_group FROM lake_partition
+                  WHERE dataset = $1 FOR UPDATE",
                 &[&dataset],
             )
             .map_err(unavailable)
@@ -794,6 +868,22 @@ impl PostgresStore {
                 })?
             }
         };
+        // The group the row names, read under its lock, before its epoch
+        // is checked: another group's epoch is never this writer's fence.
+        // `owned` above read this member's view, which a read of the owners
+        // from before a switch can set back (the review of c503f16d,
+        // finding 1); the write is the group's the row names.
+        if self.groups.several() {
+            let named = row.get::<_, Option<i32>>(3).map(|group| group as u32);
+            let group = self.named_owner(dataset, named);
+            if group != self.groups.mine() {
+                meridian_bus::owners::hand_to(group);
+                return Err(StoreError::NotOwned {
+                    partition: dataset.to_string(),
+                    group,
+                });
+            }
+        }
         // A move's pointer: never written under, never a fence (C3).
         if row.get::<_, i64>(1) == meridian_changes::moves::POINTER_EPOCH {
             return Err(StoreError::Held(format!(
@@ -1803,6 +1893,10 @@ fn again(failed: &StoreError) -> StoreError {
             words: words.clone(),
         },
         StoreError::ShardFenced(fenced) => StoreError::ShardFenced(fenced.clone()),
+        StoreError::FailedPrecondition { field, words } => StoreError::FailedPrecondition {
+            field,
+            words: words.clone(),
+        },
     }
 }
 
@@ -1853,21 +1947,63 @@ fn shards_checked<'a>(
 
 /// A take refused: the Lease's transitions it was sent with are below the
 /// highest a take of the shard was numbered with (review c5a M2), so a
-/// later take holds the Lease. FAILED_PRECONDITION,
-/// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits.
-pub(crate) fn take_behind(
+/// later take holds the Lease -- FAILED_PRECONDITION,
+/// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits; or its
+/// transitions are past the most an epoch is (the review of v31a-core-2,
+/// F1(b)), refused naming `lease_transitions`; or the shard's epoch is held
+/// at the most already, so no take numbers past it (the second review,
+/// finding 3): FAILED_PRECONDITION naming `shard`, the instance, the shard
+/// and the epoch held, until a person resets the shard's fence.
+pub(crate) fn take_refused(
     took: &meridian_domain::v1::ShardTookOver,
     taking: &meridian_changes::shard_fence::Taking,
-    behind: meridian_changes::shard_fence::TakeBehind,
+    refused: meridian_changes::shard_fence::TakeRefused,
 ) -> StoreError {
     let lease_transitions = taking.lease_transitions;
+    let seen = match refused {
+        meridian_changes::shard_fence::TakeRefused::Behind { seen } => seen,
+        meridian_changes::shard_fence::TakeRefused::Beyond => {
+            tracing::warn!(
+                instance = took.instance,
+                shard = took.shard,
+                lease_transitions,
+                "a shard's take refused: its Lease's transitions are past an int32"
+            );
+            return StoreError::Invalid {
+                field: "lease_transitions",
+                words: "lease_transitions: a shard's epoch is numbered within an int32, the \
+                        Lease's transitions' type, and this take's transitions are past it"
+                    .into(),
+            };
+        }
+        meridian_changes::shard_fence::TakeRefused::AtTheMost { held } => {
+            tracing::error!(
+                instance = took.instance,
+                shard = took.shard,
+                held,
+                "a shard's take refused: its epoch is held at the most one is, and a person must \
+                 reset its fence"
+            );
+            return StoreError::FailedPrecondition {
+                field: "shard",
+                words: format!(
+                    "shard: instance {} shard {} holds epoch {held}, at or past the most a \
+                     shard's epoch is ({}, an int32), so no take numbers past it; a person must \
+                     reset the shard's fence",
+                    took.instance,
+                    took.shard,
+                    meridian_changes::shard_fence::EPOCH_MOST
+                ),
+            };
+        }
+    };
     tracing::warn!(
         instance = took.instance,
         shard = took.shard,
         holder = took.holder,
         lease_transitions,
         lease_uid = taking.lease_uid,
-        seen = behind.seen,
+        seen,
         "a shard's take refused: a later take of its Lease was numbered already"
     );
     StoreError::ShardFenced(ShardFenced {
@@ -1878,7 +2014,7 @@ pub(crate) fn take_behind(
             in_stream: 0,
             stream: 0,
         },
-        held: behind.seen,
+        held: seen,
     })
 }
 
@@ -2114,8 +2250,14 @@ impl PostgresStore {
                     "range {partition} is switching to another writer group: ask again in a moment"
                 ))),
                 Some((named, true, here, pointer)) => {
+                    // The group by the row taken, never by this member's
+                    // view read back: a read of the owners from before a
+                    // switch, written between the two, set it back, and
+                    // the batch went on as the owner to be fenced at the
+                    // head (the review of c503f16d, finding 1). The view
+                    // is only told.
                     self.groups.assign(partition, *named);
-                    let group = self.groups.owner_by(partition, dataset);
+                    let group = self.named_owner(partition, *named);
                     if group != mine || self.headed_elsewhere(partition, *here) {
                         Some(StoreError::NotOwned {
                             partition: partition.clone(),
@@ -3211,7 +3353,7 @@ impl Store for PostgresStore {
         .map_err(unavailable)?;
         took.epoch = match numbered {
             Ok(epoch) => epoch,
-            Err(behind) => return Err(take_behind(&took, taking, behind)),
+            Err(refused) => return Err(take_refused(&took, taking, refused)),
         };
         tx.commit().map_err(unavailable)?;
         Ok(took)
@@ -4555,8 +4697,11 @@ impl Store for PostgresStore {
             as_assessed(&mut out, &assessments, as_of_ns);
             return Ok(out);
         }
-        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
-        let rows = conn
+        // One snapshot, as every other read of a dataset's rows has: what
+        // it answers is chosen from the rows it reads beside them.
+        let mut tx = read_only(&mut conn)?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
+        let rows = tx
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
@@ -4571,7 +4716,8 @@ impl Store for PostgresStore {
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
         let mut out = as_of(out, as_of_ns);
-        let assessments = assessments_of(&mut *conn, &out)?;
+        let assessments = assessments_of(&mut tx, &out)?;
+        tx.commit().map_err(unavailable)?;
         as_assessed(&mut out, &assessments, as_of_ns);
         Ok(out)
     }
@@ -4636,8 +4782,9 @@ impl Store for PostgresStore {
         data_type: crate::row::DataType,
     ) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
-        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
-        let rows = conn
+        let mut tx = read_only(&mut conn)?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
+        let rows = tx
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2
@@ -4651,7 +4798,8 @@ impl Store for PostgresStore {
             let body: Vec<u8> = row.get(0);
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
-        let assessments = assessments_of(&mut *conn, &out)?;
+        let assessments = assessments_of(&mut tx, &out)?;
+        tx.commit().map_err(unavailable)?;
         as_assessed(&mut out, &assessments, 0);
         Ok(out)
     }
@@ -4929,8 +5077,9 @@ impl Store for PostgresStore {
 
     fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
-        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
-        let rows = conn
+        let mut tx = read_only(&mut conn)?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
+        let rows = tx
             .query(
                 "SELECT data_type, body FROM lake_row
                   WHERE dataset = $1 AND row_key = $2 AND version = $3
@@ -4947,7 +5096,8 @@ impl Store for PostgresStore {
                 .ok_or_else(|| StoreError::Unavailable(format!("data type {code} unknown")))?;
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
-        let assessments = assessments_of(&mut *conn, &out)?;
+        let assessments = assessments_of(&mut tx, &out)?;
+        tx.commit().map_err(unavailable)?;
         as_assessed(&mut out, &assessments, 0);
         Ok(out)
     }
@@ -5940,19 +6090,42 @@ impl PostgresStore {
         if self.databases <= 1 {
             return Ok(every);
         }
-        let named: BTreeMap<String, Option<i32>> = client
+        // Each one's row, and whether it is answered here: what a read
+        // over several databases is held to ([`standing_during`]).
+        let mut rows: Vec<Standing> = client
             .query(
-                "SELECT dataset, writer_group FROM lake_partition WHERE dataset = ANY($1)",
-                &[&every],
+                "SELECT dataset, head, epoch <> $2, writer_group, closed_at IS NOT NULL
+                   FROM lake_partition WHERE dataset = ANY($1)",
+                &[&every, &meridian_changes::moves::POINTER_EPOCH],
             )
             .map_err(unavailable)?
             .iter()
-            .map(|row| (row.get(0), row.get(1)))
+            .map(|row| self.standing_from(row))
             .collect();
-        Ok(every
-            .into_iter()
-            .filter(|partition| self.serves(partition, named.get(partition).copied().flatten()))
-            .collect())
+        for row in &mut rows {
+            row.served = self.serves(&row.partition, row.group.map(|group| group as i32));
+        }
+        // One with no row here is its group's by its dataset, as before.
+        let answered: BTreeMap<&str, bool> = rows
+            .iter()
+            .map(|row| (row.partition.as_str(), row.served))
+            .collect();
+        let served = every
+            .iter()
+            .filter(|partition| {
+                answered
+                    .get(partition.as_str())
+                    .copied()
+                    .unwrap_or_else(|| self.serves(partition, None))
+            })
+            .cloned()
+            .collect();
+        STANDING.with(|noted| {
+            if let Some(noted) = noted.borrow_mut().as_mut() {
+                noted.extend(rows);
+            }
+        });
+        Ok(served)
     }
 
     /// The writer group of `partition` as this database's row names it

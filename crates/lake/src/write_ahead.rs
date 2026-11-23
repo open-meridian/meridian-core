@@ -674,6 +674,31 @@ pub fn stream_config(bounds: &Bounds) -> stream::Config {
     }
 }
 
+/// Where a write taken from the stream is answered: the inbox its write
+/// named, where that is an inbox of the credential that wrote it -- the
+/// instance its subject names, which alone may publish there (v31a, item 2;
+/// the access audit's point 10). Any other reply-to is refused: the write is
+/// recorded and answered to nobody, and said so, so no plugin has the lake
+/// publish into another's inbox as the runtime.
+pub(crate) fn answered_to(subject: &str, reply_to: Option<String>) -> Option<String> {
+    let to = reply_to.filter(|to| !to.is_empty())?;
+    let sender = meridian_bus::write_ahead::dataset_of_subject(subject).and_then(|dataset| {
+        dataset
+            .split_once(':')
+            .map(|(instance, _)| instance.to_string())
+    });
+    if sender.is_some() && meridian_bus::inbox::owner(&to) == sender.as_deref() {
+        return Some(to);
+    }
+    tracing::warn!(
+        subject,
+        reply_to = to,
+        "a write-ahead write named a reply-to outside its sender's inboxes: refused, its rows \
+         recorded and answered to nobody"
+    );
+    None
+}
+
 /// A write as the stream sent it, or why it could not be read.
 fn taken(message: &jetstream::Message) -> Result<Taken, String> {
     let info = message.info().map_err(|failed| failed.to_string())?;
@@ -688,7 +713,7 @@ fn taken(message: &jetstream::Message) -> Result<Taken, String> {
         sequence: info.stream_sequence,
         at_ns: info.published.unix_timestamp_nanos() as i64,
         topic: header(TOPIC_HEADER).unwrap_or_default(),
-        reply_to: header(REPLY_HEADER).filter(|to| !to.is_empty()),
+        reply_to: answered_to(&message.subject, header(REPLY_HEADER)),
         after: header(AFTER_HEADER).and_then(|said| said.parse().ok()),
         envelope: Envelope::decode(message.payload.clone()).unwrap_or_default(),
         dataset: meridian_bus::write_ahead::dataset_of_subject(&message.subject)

@@ -478,6 +478,23 @@ fn run() -> Result<(), String> {
                 clock.clone(),
             ),
         );
+        // The delegations the release before removed with no record, given
+        // theirs: at start and every REMOVALS_OWED_EVERY after, while its
+        // last replicas may still be removing them (review-core-3c N4,
+        // review-core-3d F1).
+        let owing = Arc::clone(&delegations);
+        let owing_clock = clock.clone();
+        meridian_runtime::background(meridian_runtime::again_every(
+            "the release before's removals could not be given their records",
+            meridian_dashboard::delegation::REMOVALS_OWED_EVERY,
+            move || {
+                let owing = Arc::clone(&owing);
+                let clock = owing_clock.clone();
+                async move {
+                    meridian_dashboard::delegation::removals_owed(&owing, clock.as_ref()).await
+                }
+            },
+        ));
 
         // What custody connectors say about their accounts and connections,
         // heard from now on (W2.1, W2.8, W4.8). Subscribed before anything
