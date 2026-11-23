@@ -47,6 +47,7 @@ use crate::terminal::{hashed, same, unreserved, url_safe, verifies, Person, Unav
 pub mod record;
 mod store;
 pub use record::DelegationChange;
+pub use store::backfill_from_rows;
 pub(crate) use store::held_when_records_began;
 pub use store::{CallsOf, DelegationStore, InMemory, InPostgres};
 

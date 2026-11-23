@@ -1158,7 +1158,7 @@ impl Store for PostgresStore {
             .conn()?
             .query(
                 "SELECT kind, was, became, changed_by, through_delegation, changed_at_ns,
-                        backfilled, note
+                        valid_at_ns, backfilled, note
                    FROM config_group_change
                   WHERE group_kind = $1 AND group_id = $2
                   ORDER BY change_id",
@@ -1179,8 +1179,9 @@ impl Store for PostgresStore {
                     by: row.get(3),
                     delegation: row.get(4),
                     at_ns: row.get(5),
-                    backfilled: row.get(6),
-                    note: row.get(7),
+                    valid_at_ns: row.get(6),
+                    backfilled: row.get(7),
+                    note: row.get(8),
                 })
             })
             .collect()
@@ -3408,7 +3409,6 @@ pub(crate) fn read_access_group(
     }))
 }
 
-/// One access change's own record (decisions/031).
 /// One user-group or account-group change's record (decision 47).
 fn insert_group_change(
     client: &mut impl postgres::GenericClient,
@@ -3418,8 +3418,8 @@ fn insert_group_change(
         .execute(
             "INSERT INTO config_group_change
                     (group_kind, group_id, kind, was, became, changed_by, through_delegation,
-                     changed_at_ns, backfilled, note)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                     changed_at_ns, valid_at_ns, backfilled, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &record.group.code(),
                 &record.group_id,
@@ -3429,6 +3429,7 @@ fn insert_group_change(
                 &record.by,
                 &record.delegation,
                 &record.at_ns,
+                &record.valid_at_ns,
                 &record.backfilled,
                 &record.note,
             ],
@@ -3437,6 +3438,7 @@ fn insert_group_change(
     Ok(())
 }
 
+/// One access change's own record (decisions/031).
 pub(crate) fn insert_access_change(
     client: &mut impl postgres::GenericClient,
     record: &AccessChangeRecord,

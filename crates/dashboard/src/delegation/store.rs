@@ -11,9 +11,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
-use super::record::{
-    change, ChangeKind, ACTING_FILLED, HELD_WHEN_RECORDS_BEGAN, REMOVED, REWRITTEN,
-};
+use super::record::{backfilled, change, ChangeKind, ACTING_FILLED, REMOVED, REWRITTEN};
 use super::{
     Client, Covers, Delegation, DelegationChange, Grant, Kind, Revoked, Token, ToolCall,
     CALLS_KEPT_NS, KEPT_NS, UNCONSENTED_NS,
@@ -671,8 +669,8 @@ fn record(
     conn.execute(
         "INSERT INTO dashboard_delegation_change
              (delegation_id, subject, client_id, kind, was, became, changed_by, changed_at_ns,
-              backfilled, note)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              valid_at_ns, backfilled, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         &[
             &change.delegation_id,
             &change.subject,
@@ -682,6 +680,7 @@ fn record(
             &change.became,
             &change.by,
             &change.at_ns,
+            &change.valid_at_ns,
             &change.backfilled,
             &change.note,
         ],
@@ -690,45 +689,68 @@ fn record(
     Ok(())
 }
 
-/// Migration 16's records (decision 47, decisions/031): each delegation
-/// standing as it runs, revoked or not, said as it stood at `at_ns`, the
-/// moment it ran, backfilled; one given one already is left, so it runs
-/// once.
+/// The records each delegation with none is owed (decision 47,
+/// decisions/031): those its row holds the facts of
+/// ([`super::record::backfilled`]), recorded at `at_ns`. Migration 16 gives
+/// them to every delegation standing as it runs, revoked or not. Each row is
+/// held and read again before its records are written, so two at once write
+/// them once; a delegation given any record is left as it is.
+pub fn backfill_from_rows(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Result<usize, String> {
+    const NONE_RECORDED: &str = "NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
+                                        WHERE r.delegation_id = d.delegation_id)";
+    let owed: Vec<String> = tx
+        .query(
+            &format!(
+                "SELECT d.delegation_id FROM dashboard_delegation d
+                  WHERE {NONE_RECORDED} ORDER BY d.delegation_id"
+            ),
+            &[],
+        )
+        .map_err(said)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut given = 0;
+    for id in &owed {
+        let Some(row) = tx
+            .query_opt(
+                &format!(
+                    "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
+                       JOIN dashboard_oauth_client c USING (client_id)
+                      WHERE d.delegation_id = $1
+                        FOR UPDATE OF d"
+                ),
+                &[id],
+            )
+            .map_err(said)?
+        else {
+            continue;
+        };
+        // Read again under the row's lock: another may have recorded it.
+        let none: bool = tx
+            .query_one(
+                &format!("SELECT {NONE_RECORDED} FROM (SELECT $1::text AS delegation_id) d"),
+                &[id],
+            )
+            .map_err(said)?
+            .get(0);
+        if !none {
+            continue;
+        }
+        for record_owed in backfilled(&delegation_of(&row), at_ns) {
+            record(tx, &record_owed)?;
+        }
+        given += 1;
+    }
+    Ok(given)
+}
+
+/// Migration 16's records: [`backfill_from_rows`] at the moment it ran.
 pub(crate) fn held_when_records_began(
     tx: &mut postgres::Transaction<'_>,
     at_ns: i64,
 ) -> Result<(), String> {
-    let standing = tx
-        .query(
-            &format!(
-                "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
-                   JOIN dashboard_oauth_client c USING (client_id)
-                  WHERE NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
-                                     WHERE r.delegation_id = d.delegation_id
-                                       AND r.kind = 'held_when_records_began')
-                  ORDER BY d.delegation_id"
-            ),
-            &[],
-        )
-        .map_err(said)?;
-    for row in &standing {
-        let delegation = delegation_of(row);
-        record(
-            tx,
-            &DelegationChange {
-                backfilled: true,
-                ..change(
-                    ChangeKind::HeldWhenRecordsBegan,
-                    None,
-                    Some(&delegation),
-                    "",
-                    at_ns,
-                    HELD_WHEN_RECORDS_BEGAN,
-                )
-            },
-        )?;
-    }
-    Ok(())
+    backfill_from_rows(tx, at_ns).map(|_| ())
 }
 
 impl InPostgres {
@@ -1181,7 +1203,7 @@ impl DelegationStore for InPostgres {
             .conn()?
             .query(
                 "SELECT delegation_id, subject, client_id, kind, was, became, changed_by,
-                        changed_at_ns, backfilled, note
+                        changed_at_ns, valid_at_ns, backfilled, note
                    FROM dashboard_delegation_change
                   WHERE delegation_id = $1 ORDER BY change_id",
                 &[&id],
@@ -1200,8 +1222,9 @@ impl DelegationStore for InPostgres {
                     became: row.get(5),
                     by: row.get(6),
                     at_ns: row.get(7),
-                    backfilled: row.get(8),
-                    note: row.get(9),
+                    valid_at_ns: row.get(8),
+                    backfilled: row.get(9),
+                    note: row.get(10),
                 })
             })
             .collect()

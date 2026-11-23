@@ -10,7 +10,8 @@
 -- A group standing before this has one backfilled record (kind 3), saying it
 -- as it stood and that who defined it or last changed it, and when, is not
 -- known, written by the conductor in the same transaction at the
--- deployment's time as the migration runs (migrations.rs), never back-dated.
+-- deployment's time as the migration runs (migrations.rs), never back-dated,
+-- its valid time not known.
 CREATE TABLE IF NOT EXISTS config_group_change (
     change_id          bigserial PRIMARY KEY,
     -- 1 a user group, 2 an account group.
@@ -23,7 +24,11 @@ CREATE TABLE IF NOT EXISTS config_group_change (
     -- Empty where who made it is not known.
     changed_by         text      NOT NULL DEFAULT '',
     through_delegation text      NOT NULL DEFAULT '',
+    -- When it was recorded, by the deployment's clock.
     changed_at_ns      bigint    NOT NULL,
+    -- When the change was made (its valid time); NULL where not known, as
+    -- it always is for a backfilled record: a group's row holds no date.
+    valid_at_ns        bigint,
     backfilled         boolean   NOT NULL DEFAULT false,
     note               text      NOT NULL DEFAULT '',
     CHECK (backfilled = (kind = 3))

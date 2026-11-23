@@ -7,13 +7,18 @@
 -- renewed, revoked, its rows rewritten or its tools filled in by an
 -- upgrade, removed -- is also a row here, written in the transaction that
 -- made the change: what it was, what it became (the dates a renewal
--- replaced among them), who made it, and when. No key names the delegation
--- row, so the records outlive it; the dashboard only ever adds to them.
+-- replaced among them), who made it, when it was made and when it was
+-- recorded. No key names the delegation row, so the records outlive it; the
+-- dashboard only ever adds to them.
 --
--- A delegation standing before this has one backfilled record, saying it as
--- it stood and that who made each change before is not known, written by the
--- dashboard in the same transaction at the deployment's time as the
--- migration runs (database.rs), never back-dated.
+-- A delegation standing before this is given the records its row holds the
+-- facts of, as config_plugin_launch_gap was (config migration 15): made, by
+-- its person, when the row says; renewed, by its person, where it was
+-- renewed since; its tools filled in, where they were; revoked, by whom and
+-- why the row says. Each is marked backfilled, valid when the row says, and
+-- recorded at the deployment's time as the migration runs (database.rs),
+-- never back-dated; what the row does not hold -- what a renewal replaced,
+-- any renewal before its last -- is said to be not known.
 CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     change_id     bigserial PRIMARY KEY,
     delegation_id text      NOT NULL,
@@ -21,23 +26,26 @@ CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     subject       text      NOT NULL,
     client_id     text      NOT NULL,
     kind          text      NOT NULL CHECK (kind IN ('made', 'renewed', 'revoked', 'rewritten',
-                                                     'acting_filled', 'removed',
-                                                     'held_when_records_began')),
+                                                     'acting_filled', 'removed')),
     was           text      NOT NULL DEFAULT '',
     became        text      NOT NULL DEFAULT '',
     -- The person consenting, the subject revoking (or `client`, or
     -- `dashboard`); empty for an upgrade's or the sweep's, and where it is
     -- not known.
     changed_by    text      NOT NULL DEFAULT '',
+    -- When it was recorded, by the deployment's clock.
     changed_at_ns bigint    NOT NULL,
+    -- When the change was made (its valid time); NULL where not known.
+    valid_at_ns   bigint,
+    -- Written after the change, from what the delegation's row held.
     backfilled    boolean   NOT NULL DEFAULT false,
     note          text      NOT NULL DEFAULT '',
-    CHECK (backfilled = (kind = 'held_when_records_began'))
+    CHECK (NOT backfilled OR kind IN ('made', 'renewed', 'acting_filled', 'revoked'))
 );
 
 CREATE INDEX IF NOT EXISTS dashboard_delegation_change_by_delegation
     ON dashboard_delegation_change (delegation_id, change_id);
 
--- Once per delegation.
+-- A delegation's records backfilled once.
 CREATE UNIQUE INDEX IF NOT EXISTS dashboard_delegation_change_backfill_once
-    ON dashboard_delegation_change (delegation_id) WHERE kind = 'held_when_records_began';
+    ON dashboard_delegation_change (delegation_id) WHERE backfilled AND kind = 'made';

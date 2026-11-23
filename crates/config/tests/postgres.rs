@@ -3345,6 +3345,11 @@ fn each_user_group_and_account_group_change_is_its_own_record() {
     );
     assert_eq!(records[0].was, "");
     assert_eq!(
+        records.iter().map(|r| r.valid_at_ns).collect::<Vec<_>>(),
+        [Some(10), Some(20)],
+        "valid when made, as recorded"
+    );
+    assert_eq!(
         records[0].became,
         "\"UG-1\": directory groups desk; logins ada"
     );
@@ -3455,6 +3460,7 @@ fn groups_standing_before_their_records_began_are_backfilled_once() {
         assert_eq!(held.by, "", "{id}: who made it is not known");
         assert!(held.backfilled, "{id}");
         assert_eq!(held.at_ns, 1_000, "{id}: the migration's own time");
+        assert_eq!(held.valid_at_ns, None, "{id}: a group's row holds no date");
         assert_eq!(held.note, HELD_WHEN_RECORDS_BEGAN);
     }
 

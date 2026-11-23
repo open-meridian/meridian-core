@@ -82,7 +82,12 @@ pub struct GroupChangeRecord {
     /// Who made the change; empty where that is not known (a backfill).
     pub by: String,
     pub delegation: String,
+    /// When it was recorded, by the deployment's clock: never back-dated.
     pub at_ns: i64,
+    /// When the change was made (its valid time): the moment recorded for a
+    /// change recorded as it was made; None where it is not known, as for
+    /// every backfilled record (a group's row holds no date).
+    pub valid_at_ns: Option<i64>,
     /// True for the record a group standing when the records began was
     /// given.
     pub backfilled: bool,
@@ -191,6 +196,7 @@ fn record(
         by: author.by.clone(),
         delegation: author.delegation.clone(),
         at_ns,
+        valid_at_ns: Some(at_ns),
         backfilled: false,
         note: String::new(),
     }

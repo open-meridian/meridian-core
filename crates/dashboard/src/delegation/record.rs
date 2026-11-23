@@ -8,8 +8,11 @@
 //! from the list -- is also a record of its own, written with the change and
 //! never updated or removed: which delegation, whose and to which client,
 //! what it was and what it became (the dates a renewal replaced among them),
-//! who made the change, and when. A delegation standing when the records
-//! began has one backfilled record saying it as it stood then. Store-only:
+//! who made the change, and when it was made (its valid time) as well as when
+//! it was recorded. A delegation standing when the records began is given,
+//! from its row, the records the row holds the facts of -- made, last
+//! renewed, its tools filled in, revoked -- each marked backfilled, at the
+//! moment they are written, with the valid time the row holds. Store-only:
 //! the records are read here, and no page or message carries them yet.
 //!
 //! What a delegation is evaluated with as the person's directory says it
@@ -35,8 +38,6 @@ pub enum ChangeKind {
     ActingFilled,
     /// Removed from the list a month after it ended.
     Removed,
-    /// As it stood when its records began (backfilled).
-    HeldWhenRecordsBegan,
 }
 
 impl ChangeKind {
@@ -49,7 +50,6 @@ impl ChangeKind {
             ChangeKind::Rewritten => "rewritten",
             ChangeKind::ActingFilled => "acting_filled",
             ChangeKind::Removed => "removed",
-            ChangeKind::HeldWhenRecordsBegan => "held_when_records_began",
         }
     }
 
@@ -61,7 +61,6 @@ impl ChangeKind {
             ChangeKind::Rewritten,
             ChangeKind::ActingFilled,
             ChangeKind::Removed,
-            ChangeKind::HeldWhenRecordsBegan,
         ]
         .into_iter()
         .find(|kind| kind.name() == name)
@@ -76,16 +75,24 @@ pub struct DelegationChange {
     pub subject: String,
     pub client_id: String,
     pub kind: ChangeKind,
-    /// The delegation as it was; empty for one made, or held when the
-    /// records began.
+    /// The delegation as it was; empty for one made, and where it is not
+    /// known (a backfilled renewal's).
     pub was: String,
-    /// As it became; empty for one removed.
+    /// As it became; empty for one removed, and where it is not known (a
+    /// backfilled making's, renewed since).
     pub became: String,
     /// Who made the change: the person consenting, the subject revoking (or
     /// `client`, or `dashboard`); empty for an upgrade's or the sweep's, and
     /// where it is not known (a backfill).
     pub by: String,
+    /// When it was recorded, by the deployment's clock: never back-dated.
     pub at_ns: i64,
+    /// When the change was made (its valid time): the moment recorded for a
+    /// change recorded as it was made; the row's for a backfilled one; None
+    /// where it is not known.
+    pub valid_at_ns: Option<i64>,
+    /// True for a record written after the change, from what its row held
+    /// (decisions/031).
     pub backfilled: bool,
     pub note: String,
 }
@@ -102,11 +109,23 @@ pub const ACTING_FILLED: &str = "filled in once, no person: a delegation narrowe
 pub const REMOVED: &str = "removed from the list by the sweep, no person: it ended more than \
      30 days before";
 
-/// What the backfilled record says (migration 16).
-pub const HELD_WHEN_RECORDS_BEGAN: &str = "backfilled by migration 16: the delegation as it \
-     stood when each delegation change began to be its own record; it was made at its \
-     person's consent, but any renewal before the last one shown, what each changed, and who \
-     made each change other than a revocation shown, are not known";
+/// What a backfilled making's record says (migration 16).
+pub const MADE_BACKFILLED: &str = "backfilled from the delegation's row, which holds when it \
+     was made, at its person's consent; what it covered then is what the row holds, or not \
+     known where it was renewed since, and any rewrite at contract v15 is not known";
+
+/// What a backfilled renewal's record says.
+pub const RENEWED_BACKFILLED: &str = "backfilled from the delegation's row, which holds when it \
+     was last renewed, at its person's consent; what it covered before, and any renewal \
+     before this one, are not known";
+
+/// What a backfilled fill's record says.
+pub const ACTING_FILLED_BACKFILLED: &str = "backfilled from the delegation's row, which holds \
+     when its consented tools were filled in once, no person (contract v18)";
+
+/// What a backfilled revocation's record says.
+pub const REVOKED_BACKFILLED: &str = "backfilled from the delegation's row, which holds when \
+     it was revoked, by whom and why";
 
 /// A delegation as a record says it: what it covers, its dates and, once
 /// revoked, by whom, when and why.
@@ -197,7 +216,91 @@ pub fn change(
         became: after.map(described).unwrap_or_default(),
         by: by.to_string(),
         at_ns,
+        valid_at_ns: Some(at_ns),
         backfilled: false,
         note: note.to_string(),
     }
+}
+
+/// The records a delegation's row holds the facts of, for one that has none
+/// (decisions/031): made, by its person, when the row says; renewed, by its
+/// person, where it was renewed since; its tools filled in, where they
+/// were; revoked, by whom the row says. Each backfilled, recorded at
+/// `at_ns`, valid when the row says, each one's `was` the one before's
+/// `became`.
+pub fn backfilled(delegation: &Delegation, at_ns: i64) -> Vec<DelegationChange> {
+    let renewed = delegation.renewed_at_ns != delegation.made_at_ns;
+    // As it stood before it was revoked, and before its tools were filled.
+    let unrevoked = Delegation {
+        revoked: None,
+        ..delegation.clone()
+    };
+    let unfilled = match delegation.acting_backfilled_at_ns {
+        Some(_) => Delegation {
+            covers: Covers {
+                acting: None,
+                ..unrevoked.covers.clone()
+            },
+            acting_backfilled_at_ns: None,
+            ..unrevoked.clone()
+        },
+        None => unrevoked.clone(),
+    };
+    let one =
+        |kind, was: String, became: String, by: &str, valid_at_ns, note: &str| DelegationChange {
+            delegation_id: delegation.id.clone(),
+            subject: delegation.subject.clone(),
+            client_id: delegation.client_id.clone(),
+            kind,
+            was,
+            became,
+            by: by.to_string(),
+            at_ns,
+            valid_at_ns: Some(valid_at_ns),
+            backfilled: true,
+            note: note.to_string(),
+        };
+    let mut records = vec![one(
+        ChangeKind::Made,
+        String::new(),
+        if renewed {
+            String::new()
+        } else {
+            described(&unfilled)
+        },
+        &delegation.subject,
+        delegation.made_at_ns,
+        MADE_BACKFILLED,
+    )];
+    if renewed {
+        records.push(one(
+            ChangeKind::Renewed,
+            String::new(),
+            described(&unfilled),
+            &delegation.subject,
+            delegation.renewed_at_ns,
+            RENEWED_BACKFILLED,
+        ));
+    }
+    if let Some(filled_at) = delegation.acting_backfilled_at_ns {
+        records.push(one(
+            ChangeKind::ActingFilled,
+            described(&unfilled),
+            described(&unrevoked),
+            "",
+            filled_at,
+            ACTING_FILLED_BACKFILLED,
+        ));
+    }
+    if let Some(revoked) = &delegation.revoked {
+        records.push(one(
+            ChangeKind::Revoked,
+            described(&unrevoked),
+            described(delegation),
+            &revoked.by,
+            revoked.at_ns,
+            REVOKED_BACKFILLED,
+        ));
+    }
+    records
 }

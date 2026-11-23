@@ -1400,13 +1400,18 @@ impl meridian_clock::Clock for At {
     }
 }
 
-/// Migration 16 (decision 47, decisions/031): each delegation standing
-/// before it, revoked or not, gets one backfilled record at the moment the
-/// migration ran, saying it as it stood -- its dates, and a revocation's
-/// who and why -- and that the rest is not known; run again, nothing more.
+/// Migration 16 (decision 47, decisions/031; review-core-3 2): each
+/// delegation standing before it, revoked or not, is given the records its
+/// row holds the facts of -- made by its person when the row says, renewed
+/// where it was, its tools filled in where they were, revoked by whom the row
+/// says -- each backfilled, valid when the row says and recorded at the
+/// moment the migration ran; given again, nothing more.
 #[test]
-fn delegations_standing_before_their_records_began_are_backfilled_once() {
-    use delegation::record::{ChangeKind, HELD_WHEN_RECORDS_BEGAN};
+fn delegations_standing_before_their_records_began_keep_the_facts_their_rows_hold() {
+    use delegation::record::{
+        ChangeKind, ACTING_FILLED_BACKFILLED, MADE_BACKFILLED, RENEWED_BACKFILLED,
+        REVOKED_BACKFILLED,
+    };
     let url = scratch("delegation_backfill");
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     db.batch_execute(
@@ -1453,38 +1458,119 @@ fn delegations_standing_before_their_records_began_are_backfilled_once() {
     )
     .unwrap();
 
+    db.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_b', 'meridian on mdc_b', '{}', 'meridian-cli', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              covers_plugins, made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns,
+              covers_acting, acting_backfilled_at_ns)
+         VALUES ('DLG-FILLED', 'local|ada', 'Ada Park', 'mdc_b', false,
+                 '{oms-1:oms:write}', $1, $1, $2, $1, '{place_order}', $3)",
+        &[&T0, &(T0 + 30 * DAY_NS), &(T0 + DAY_NS)],
+    )
+    .unwrap();
+
     let database = Database::connect(&url, 2).unwrap();
     database.migrate(&At(1_000)).unwrap();
     database
         .migrate(&At(2_000))
         .expect("migrating twice is a no-op");
+    // Given again, directly: each delegation has its records, so nothing.
+    for _ in 0..2 {
+        let mut tx = db.transaction().unwrap();
+        assert_eq!(delegation::backfill_from_rows(&mut tx, 3_000).unwrap(), 0);
+        tx.commit().unwrap();
+    }
     let store = delegation::InPostgres::on(database);
-    for (id, became) in [
+    let made = "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+                renewed 2026-09-26T00:00:00Z; expires 2026-09-27T00:00:00Z";
+    let revoked = "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+                   renewed 2026-09-26T00:00:00Z; expires 2026-09-27T00:00:00Z; \
+                   revoked 2026-09-26T00:00:00Z by local|root: left";
+    let renewed_to = "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+                      renewed 2026-10-16T00:00:00Z; expires 2027-01-14T00:00:00Z";
+    let unfilled = "covers deployment admin no; plugins oms-1 oms write; account groups none; \
+                    made 2026-09-26T00:00:00Z; renewed 2026-09-26T00:00:00Z; \
+                    expires 2026-10-26T00:00:00Z";
+    let filled = "covers deployment admin no; plugins oms-1 oms write; account groups none; \
+                  acting place_order; made 2026-09-26T00:00:00Z; \
+                  renewed 2026-09-26T00:00:00Z; expires 2026-10-26T00:00:00Z";
+    for (id, owed) in [
         (
             "DLG-LIVE",
-            "covers everything the person holds; made 2026-09-26T00:00:00Z; \
-             renewed 2026-10-16T00:00:00Z; expires 2027-01-14T00:00:00Z",
+            vec![
+                (ChangeKind::Made, "", "", "local|ada", T0, MADE_BACKFILLED),
+                (
+                    ChangeKind::Renewed,
+                    "",
+                    renewed_to,
+                    "local|ada",
+                    renewed,
+                    RENEWED_BACKFILLED,
+                ),
+            ],
         ),
         (
             "DLG-GONE",
-            "covers everything the person holds; made 2026-09-26T00:00:00Z; \
-             renewed 2026-09-26T00:00:00Z; expires 2026-09-27T00:00:00Z; \
-             revoked 2026-09-26T00:00:00Z by local|root: left",
+            vec![
+                (ChangeKind::Made, "", made, "local|ada", T0, MADE_BACKFILLED),
+                (
+                    ChangeKind::Revoked,
+                    made,
+                    revoked,
+                    "local|root",
+                    T0,
+                    REVOKED_BACKFILLED,
+                ),
+            ],
+        ),
+        (
+            "DLG-FILLED",
+            vec![
+                (
+                    ChangeKind::Made,
+                    "",
+                    unfilled,
+                    "local|ada",
+                    T0,
+                    MADE_BACKFILLED,
+                ),
+                (
+                    ChangeKind::ActingFilled,
+                    unfilled,
+                    filled,
+                    "",
+                    T0 + DAY_NS,
+                    ACTING_FILLED_BACKFILLED,
+                ),
+            ],
         ),
     ] {
         let records = store.changes(id).unwrap();
-        assert_eq!(records.len(), 1, "{id}: {records:?}");
-        let held = &records[0];
-        assert_eq!(held.kind, ChangeKind::HeldWhenRecordsBegan);
-        assert_eq!(held.became, became);
-        assert_eq!(held.was, "");
-        assert_eq!(held.by, "", "{id}: who made each change is not known");
-        assert!(held.backfilled);
-        assert_eq!(held.at_ns, 1_000, "{id}: the migration's own time");
-        assert_eq!(held.note, HELD_WHEN_RECORDS_BEGAN);
-        assert_eq!(
-            (held.subject.as_str(), held.client_id.as_str()),
-            ("local|ada", "mdc_a")
-        );
+        let seen: Vec<_> = records
+            .iter()
+            .map(|r| {
+                (
+                    r.kind,
+                    r.was.as_str(),
+                    r.became.as_str(),
+                    r.by.as_str(),
+                    r.valid_at_ns.expect("valid when the row says"),
+                    r.note.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(seen, owed, "{id}");
+        for record in &records {
+            assert!(record.backfilled, "{id}");
+            assert_eq!(record.at_ns, 1_000, "{id}: the migration's own time");
+            assert_eq!(record.subject, "local|ada");
+        }
     }
 }
