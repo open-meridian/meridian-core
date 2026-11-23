@@ -14012,3 +14012,111 @@ fn a_read_waits_for_its_own_databases_pool_as_before() {
         holder.join().unwrap();
     }
 }
+
+/// The keys a read of every row of `dataset`'s `subjects` answers through
+/// `member`.
+fn range_keys(
+    member: &meridian_lake::spread::Spread,
+    dataset: &str,
+    subjects: &[&str],
+) -> meridian_lake::store::Result<Vec<String>> {
+    let mut keys: Vec<String> = member
+        .read(&Query {
+            datasets: vec![dataset.to_string()],
+            data_type: DataType::Trade,
+            subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::Range {
+                from_ns: 0,
+                until_ns: i64::MAX,
+            },
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })?
+        .iter()
+        .map(|row| row.meta().row_key.clone())
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// Every connection of `stores`' pools taken, each waiting on a lock held
+/// by what is answered: the database out of those members' reach until it
+/// is rolled back and the holders joined.
+fn out_of_reach(
+    url: &Scratch,
+    stores: &[&Arc<PostgresStore>],
+    partition: &str,
+) -> (postgres::Client, Vec<std::thread::JoinHandle<()>>) {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("BEGIN; LOCK TABLE lake_partition IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    let held = stores
+        .iter()
+        .flat_map(|store| [*store, *store])
+        .map(|store| {
+            let (store, partition) = (store.clone(), partition.to_string());
+            std::thread::spawn(move || drop(store.range_tip(&partition)))
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    (admin, held)
+}
+
+/// A range split in the database it moved to sends no read on to every
+/// database (the review of 2026-11-23 of the lake's routing, finding 4):
+/// its row there is closed and stands at or past the pointer its source
+/// keeps, which it satisfies. Counted as held nowhere, the pointer sent
+/// every read of the dataset to every database for good, and refused it
+/// while any was out of reach -- here a third, which holds nothing of it.
+#[test]
+fn a_range_split_where_it_moved_to_sends_no_read_to_every_database() {
+    use meridian_changes::groups::Groups;
+    let urls = databases(3);
+    let m = members(&urls);
+    let dataset = owned_by_zero_of("coinbase-1:t", 3);
+    let (low, high) = halves_of("lake-split-after");
+    let lower = halved(&m, &dataset, &low, &high);
+    moved_to_one(&m, &lower);
+    m.one
+        .split_partition(&lower, "admin-1", "busier where it went", 1_300)
+        .unwrap();
+    m.one
+        .record(&dataset, vec![trade(&dataset, "l2", &low, 13)], 1_400)
+        .unwrap();
+    m.zeros[0].pin_owners().unwrap();
+    // A member whose view was read after all of it.
+    let groups = Groups::new(0, 3).unwrap();
+    let stores = stores_of(&urls, groups, 2);
+    let reader = meridian_lake::spread::Spread::new(stores.clone(), groups);
+    reader.read_owners_again().unwrap();
+    assert_eq!(
+        range_keys(&reader, &dataset, &[&low, &high]).unwrap(),
+        ["h0", "l0", "l1", "l2"]
+    );
+    let (mut admin, held) = out_of_reach(&urls[2], &[&stores[2]], &lower);
+    let started = std::time::Instant::now();
+    let read = range_keys(&reader, &dataset, &[&low, &high]);
+    let took = started.elapsed();
+    admin.batch_execute("ROLLBACK").unwrap();
+    for holder in held {
+        holder.join().unwrap();
+    }
+    assert_eq!(
+        read.ok(),
+        Some(
+            ["h0", "l0", "l1", "l2"]
+                .iter()
+                .map(|key| key.to_string())
+                .collect()
+        ),
+        "a range split where it moved to sent the read to a database holding nothing of it"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "it waited {took:?} on that database"
+    );
+}

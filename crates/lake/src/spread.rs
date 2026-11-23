@@ -423,7 +423,9 @@ impl Spread {
     /// - **Every other's** only where one holds a move's pointer of a
     ///   range none of them holds, or they have begun nothing of the
     ///   dataset: each holding a range of it is asked as well. A range a
-    ///   split closed sends no read on: it moves nowhere.
+    ///   split closed sends no read on: it moves nowhere, and where it was
+    ///   split in the database it moved to, its closed row there is what
+    ///   its source's pointer is held by.
     /// - **Refused UNAVAILABLE** where such a database cannot be asked
     ///   within [`crate::postgres::PostgresStore::standing_of`]'s bound:
     ///   never answered without a range a move took there, nor held for a
@@ -464,9 +466,12 @@ impl Spread {
         }
         // Each range's row furthest on among those read where they are: a
         // written row a failed move left behind a pointer stands for
-        // nothing (the review of the book's fix, finding 1).
+        // nothing (the review of the book's fix, finding 1). One a split
+        // closed where it moved to stands for it as an open one does, at
+        // or past its source's pointer (the review of 2026-11-23 of this
+        // routing, finding 4).
         let mut held: BTreeMap<&str, u64> = BTreeMap::new();
-        for (_, row) in rows.iter().filter(|(d, row)| !row.closed && here(*d, row)) {
+        for (_, row) in rows.iter().filter(|(d, row)| here(*d, row)) {
             let at = held.entry(row.partition.as_str()).or_insert(row.head);
             *at = (*at).max(row.head);
         }
