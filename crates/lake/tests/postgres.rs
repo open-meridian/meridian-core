@@ -6832,6 +6832,120 @@ fn a_lake_range_moved_between_databases_is_copied_and_its_chain_reads_whole() {
     assert!(one.heads().unwrap()[&lower] > zeros[0].heads().unwrap()[&lower]);
 }
 
+/// A read of a dataset, made through a member whose view of the writer
+/// groups was read before one of its ranges moved to another group's
+/// database and not since, answers the range from the database it is
+/// written in now (step 3d; sections 5 and 6.4; the book's stale read of
+/// merge-queue run 45104369464, the same shape here). A reader reads the
+/// writer groups at its start and every few seconds; its `read_after` is
+/// held to every database's heads, the target's among them, while the read
+/// went by the view to the range's source, which holds it as it closed.
+#[test]
+fn a_read_follows_a_range_past_a_stale_view_of_its_owner() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    let urls = two_databases();
+    let stores = |group: u32| -> Vec<Arc<PostgresStore>> {
+        let groups = Groups::new(group, 2).unwrap();
+        urls.iter()
+            .enumerate()
+            .map(|(d, url)| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_databases(2)
+                        .in_database(d as u32),
+                )
+            })
+            .collect()
+    };
+    // A reader's stores are a member's of its own: its own view.
+    let (zeros, ones, readers) = (stores(0), stores(1), stores(0));
+    let member = |stores: &[Arc<PostgresStore>]| {
+        meridian_lake::spread::Spread::new(stores.to_vec(), stores[0].groups())
+    };
+    let (zero, one, reader) = (member(&zeros), member(&ones), member(&readers));
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:s{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .unwrap();
+    let (low, high) = halves_of("lake-stale");
+    zero.record(
+        &dataset,
+        vec![
+            trade(&dataset, "l0", &low, 10),
+            trade(&dataset, "h0", &high, 11),
+        ],
+        1_000,
+    )
+    .unwrap();
+    zero.split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    zero.record(&dataset, vec![trade(&dataset, "l1", &low, 12)], 1_200)
+        .unwrap();
+    zeros[0].pin_owners().unwrap();
+    for store in zeros.iter().chain(&ones) {
+        store.read_owners().unwrap();
+    }
+    let lower = format!("{dataset}/0000-7fff");
+    let keys = |member: &meridian_lake::spread::Spread| -> Vec<String> {
+        let mut keys: Vec<String> = member
+            .read(&Query {
+                datasets: vec![dataset.clone()],
+                data_type: DataType::Trade,
+                subjects: vec![low.clone()],
+                kinds: vec![],
+                interval_ns: 0,
+                when: When::Latest { at_ns: 0 },
+                as_of_ns: 0,
+                published_as_of_ns: 0,
+                latest_only: false,
+            })
+            .unwrap()
+            .iter()
+            .map(|row| row.meta().row_key.clone())
+            .collect();
+        keys.sort();
+        keys
+    };
+    // The reader's one look at the writer groups, and a read by it.
+    reader.read_owners_again().unwrap();
+    assert_eq!(keys(&reader), ["l0", "l1"]);
+    assert_eq!(reader.of(&lower), 0);
+    let mover = Mover::new(
+        zeros.clone(),
+        zeros[0].groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(5),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(&lower));
+    let ended = mover.run(&lower, 1, &Asked::default()).unwrap();
+    assert!(matches!(ended, Ended::Moved(..)), "{ended:?}");
+    for store in ones.iter() {
+        store.read_owners().unwrap();
+    }
+    one.record(&dataset, vec![trade(&dataset, "l2", &low, 13)], 1_300)
+        .unwrap();
+    // What the read names: the head its row was committed at, in database
+    // 1; the reader's `read_after` passes on every database's heads.
+    let written = one.heads().unwrap()[&lower];
+    assert!(written > zeros[0].heads().unwrap()[&lower]);
+    assert!(reader.heads().unwrap()[&lower] >= written);
+    // Its view of the owner is not read again by any timer here.
+    assert_eq!(
+        keys(&reader),
+        ["l0", "l1", "l2"],
+        "a read after the row was acknowledged answered without it"
+    );
+    assert_eq!(reader.of(&lower), 1);
+}
+
 /// A dataset whose ranges sit in two groups and two databases (step 3d;
 /// sections 6.4 and 6.8): its counts are each database's of the ranges
 /// read there, summed -- never one database's overwriting the other's, and
