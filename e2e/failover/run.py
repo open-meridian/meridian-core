@@ -6111,12 +6111,18 @@ def driver_lines(path):
             for line in driver_file(instance, path).splitlines()]
 
 
+# Each move's window as window_held read it, (began ms, until ms), in turn:
+# what refused_between reads the stretches between moves from.
+WINDOWS = []
+
+
 def window_held(s, what, began_ms, ended_ms):
     """The driver's writes while a move ran, and through the hold after it
     began: their p99 time within the hold, and none refused. A move shorter
     than the driver's pace began no write of its own (CI 43626539705, ha:
     "None ms of 0 writes"), so the window is at least the hold."""
     until_ms = max(ended_ms, began_ms + HOLD_SECONDS * 1000) + 1000
+    WINDOWS.append((began_ms, until_ms))
     # Each write by when it began (its answer's time less its own), never
     # by its answer alone, refused or answered alike (PR CI 45225932982: an
     # order begun before a move's window, timed out 5 s later inside it,
@@ -6152,6 +6158,31 @@ def window_held(s, what, began_ms, ended_ms):
     if p99 is not None:
         claim(s, "rebalance", what, p99 / 1000, HOLD_SECONDS,
               {"move_s": round((ended_ms - began_ms) / 1000, 2), "writes": len(took)})
+
+
+def refused_between(s, what, windows):
+    """The driver's writes refused between moves: begun after one of a
+    phase's move windows ended and before the next began (`windows`, the
+    phase's in turn), with nothing moved, upgraded or aborted meanwhile. A
+    write refused there is refused in steady state, which no write may be,
+    as none may within a move's window: the class fails, each named, and
+    kept with the window's in .e2e-refused.log."""
+    found = []
+    if windows:
+        first, last = windows[0][0], max(until for _, until in windows)
+        for p in driver_lines("/tmp/refused"):
+            said = refusal(p)
+            if said and first <= said[0] <= last and not any(b <= said[0] <= u for b, u in windows):
+                found.append(p)
+    if found:
+        with open(".e2e-refused.log", "a") as kept:
+            kept.write(f"== refused between moves, {what}\n")
+            for p in found:
+                kept.write(" ".join(p) + "\n")
+        for p in found:
+            print(f"      refused between moves: {' '.join(p)}", flush=True)
+    s.check(not found, f"rebalance: {what}: no write refused between moves ({len(found)}: "
+                       f"{[' '.join(p[:3]) for p in found[:3]]}; each in full above and in .e2e-refused.log)")
 
 
 def committed_cut(store, d, kind, name):
@@ -6483,11 +6514,13 @@ def moves(s, dash):
             f"rebalance: the driver's half and P0 each held by a group ({half_from} and {p0_from})")
     if half_from not in (0, 1) or p0_from not in (0, 1) or len(accounts) < 2:
         return
+    phase = len(WINDOWS)
     a_move(s, dash, "lake", "range", loaded, 1 - half_from, (0, 0))
     a_move(s, dash, "book", "partition", "P0", 1 - p0_from, (0, 0), by_dialog=True)
     others = sorted(p for p, g in owners.items() if p != "P0" and int(g) == p0_from) or \
         sorted(p for p in owners if p != "P0")
     a_move(s, dash, "book", "account", accounts[0], others[0], (0, 0))
+    refused_between(s, "within one database", WINDOWS[phase:])
     # Across two databases: each store's second database brought by an
     # upgrade, group 1 writing to it; its partitions moved there by the
     # count's change; then the driver's half, P0 and an account moved from
@@ -6536,6 +6569,7 @@ def moves(s, dash):
     # pod was ready (CI 43636763392, 20:36:43-45, the lake's and the book's
     # at once, before any move began) -- the restart's, not a move's.
     since_ms = int(time.time() * 1000)
+    phase = len(WINDOWS)
     in_one = happens(lambda: int(psql("select count(*) from book_entry where account_id <> '~control'",
                                       pod=database_pod("bor", 1)) or 0) > 0, 300, every=5)
     s.check(in_one, "rebalance: group 1's book partitions moved to database 1 by the count's change")
@@ -6568,6 +6602,7 @@ def moves(s, dash):
     moved_p0 = "P0" in zeros and a_move(s, dash, "book", "partition", "P0", 1, (0, 1))
     if "P0" not in zeros:
         s.check(False, f"rebalance: P0 in group 0's database to move ({owners})")
+    refused_between(s, "across two databases", WINDOWS[phase:])
     # The aborts, from group 1's database back towards group 0's: the
     # lake's range by an injected digest mismatch, the book's P0 by an
     # injected lag (the gate held shut for moves.switchSeconds).

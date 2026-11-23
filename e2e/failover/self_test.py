@@ -434,5 +434,37 @@ class RefusedByWhenItBegan(unittest.TestCase):
         self.assertFalse(ok, what)
 
 
+def between(windows, refused):
+    """`refused_between` over a phase's windows, the driver's refusals
+    given: whether its check held, and its words."""
+    said = Checks()
+    with Driven(refused=refused):
+        run.refused_between(said, "a phase", windows)
+    return next((ok, what) for ok, what in said.said if "refused between moves" in what)
+
+
+class RefusedBetweenMoves(unittest.TestCase):
+    """A write begun after one move's window ended and before the next
+    began, with nothing moving, is refused in steady state: named as such,
+    and the class fails, as a refusal inside a window does."""
+
+    A, B = (1_000_000, 1_007_000), (1_010_000, 1_017_000)
+
+    def test_a_write_begun_between_two_windows_and_refused_is_named_and_fails(self):
+        # Refused inside B, begun before it: of no window, between the two.
+        ok, what = between([self.A, self.B],
+                           ["REFUSED order 1003172 1013100 5000 status=DEADLINE_EXCEEDED detail=Deadline Exceeded"])
+        self.assertFalse(ok, what)
+        self.assertIn("1003172", what)
+
+    def test_a_write_refused_in_a_window_or_outside_the_phase_is_not_between(self):
+        ok, what = between([self.A, self.B], [
+            "REFUSED order 1 1003000 20 status=UNAVAILABLE",
+            "REFUSED order 2 1012000 20 status=UNAVAILABLE",
+            "REFUSED order 3 999000 20 status=UNAVAILABLE",
+            "REFUSED order 4 1030000 20 status=UNAVAILABLE"])
+        self.assertTrue(ok, what)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
