@@ -6446,6 +6446,111 @@ fn a_lake_range_moved_under_load_keeps_its_chain_and_its_sibling_writes_on() {
         .expect("group 0 writes the range moved back, never fenced");
 }
 
+/// A range switched to another writer group as a batch reads its ranges
+/// (step 3d; section 6.8; main's ha range-move flake, "fenced: ... this
+/// writer's 2, the partition's 1"): the batch takes each open range's row
+/// where no switch holds it, and reads the group and the epoch the row names
+/// from the row it took. Read beside it from the statement's snapshot, a
+/// switch that committed between the snapshot and the take left the batch
+/// the group the range was, on a row it held that named the other: the
+/// write went on to the head's epoch check and was refused as fenced by a
+/// newer writer, where it is the other group's to commit. The range is
+/// switched back and forth under its writes: every one is committed once,
+/// by the group that owns the range then; none is refused.
+#[test]
+fn a_range_switched_as_a_batch_reads_it_is_handed_on_never_fenced() {
+    use meridian_lake::postgres::Switched;
+    use meridian_lake::store::StoreError;
+    const SWITCHES: u32 = 1_500;
+    let (url, zero, one, dataset, _lower, upper, _low, high) =
+        two_groups_and_a_split_of("lake-sw", 1);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = |tag: &'static str| {
+        let (zero, one, dataset, high, stop) = (
+            zero.clone(),
+            one.clone(),
+            dataset.clone(),
+            high.clone(),
+            stop.clone(),
+        );
+        std::thread::spawn(move || {
+            let (mut written, mut refused) = (0u64, Vec::new());
+            let mut to = 1u32;
+            let mut n = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                n += 1;
+                let rows = vec![trade(&dataset, &format!("{tag}{n}"), &high, 100 + n as i64)];
+                let store = if to == 0 { &zero } else { &one };
+                match store.record(&dataset, rows, 2_000 + n as i64) {
+                    Ok(_) => written += 1,
+                    Err(StoreError::Held(_)) => n -= 1,
+                    Err(StoreError::NotOwned { group, .. }) => {
+                        n -= 1;
+                        to = group;
+                    }
+                    Err(failed) => {
+                        refused.push(format!("group {to}'s write {tag}{n}: {failed}"));
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+            (written, refused)
+        })
+    };
+    let writers = [writer("a"), writer("b")];
+    let mut switched = 0;
+    while switched < SWITCHES && !stop.load(Ordering::SeqCst) {
+        let target = switched % 2;
+        let ended = zero
+            .switch_range(
+                &zero,
+                &upper,
+                target,
+                std::time::Duration::from_secs(5),
+                false,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(ended, Switched::Moved { .. }), "{ended:?}");
+        switched += 1;
+    }
+    stop.store(true, Ordering::SeqCst);
+    let mut written = 0;
+    let mut refused = Vec::new();
+    for writer in writers {
+        let (rows, failed) = writer.join().unwrap();
+        written += rows;
+        refused.extend(failed);
+    }
+    assert!(
+        refused.is_empty(),
+        "after {switched} switches and {written} writes: {refused:?}"
+    );
+    assert!(
+        !meridian_changes::fenced_seen(),
+        "a switch is never a fence: no member steps down for one"
+    );
+    assert!(written > 20, "{written} writes under {switched} switches");
+    // Every write once: each key held by one row of the record.
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let keys: Vec<i64> = admin
+        .query(
+            "SELECT count(*) FROM lake_row WHERE dataset = $1 AND subject = $2 GROUP BY row_key",
+            &[&dataset, &high],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(keys.iter().all(|rows| *rows == 1), "a key held twice");
+    // And the one the split's setup wrote.
+    assert_eq!(
+        keys.len() as u64,
+        written + 1,
+        "every write is in the record"
+    );
+}
+
 /// Every cause a range's move aborts for (section 6.8; MoveAbortCause): the
 /// injected lag before anything is held, a switch that cannot finish
 /// within moves.switchSeconds (a batch holds the range's row), and the
