@@ -7174,14 +7174,14 @@ fn a_database_out_of_reach_slows_no_read_of_a_dataset_written_in_another() {
         })
         .collect();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    // With no read before it: database 1 is asked where each range is for
-    // 1 s at most, once a look, never on its pool's 30 s.
+    // With no read before it: its home, asked first, holds its ranges, and
+    // database 1 is not asked at all.
     let started = std::time::Instant::now();
     let read = latest_keys(&fresh, &stays, &low);
     let took = started.elapsed();
     assert_eq!(read.ok(), Some(vec!["l0".to_string(), "l1".to_string()]));
     assert!(
-        took < std::time::Duration::from_secs(4),
+        took < std::time::Duration::from_secs(1),
         "a member's first read of a dataset database 0 writes waited {took:?} on database 1"
     );
     let started = std::time::Instant::now();
@@ -14118,5 +14118,129 @@ fn a_range_split_where_it_moved_to_sends_no_read_to_every_database() {
     assert!(
         took < std::time::Duration::from_millis(500),
         "it waited {took:?} on that database"
+    );
+}
+
+/// A dataset held away from its group's home -- the database count raised,
+/// the dataset not moved home yet -- is read where it is held on that
+/// pool's own wait, as on main (the review of 2026-11-23 of the lake's
+/// routing, finding 1; its probe P1): its home, asked first, has begun
+/// nothing of it, so the database holding it is one the read needs, never
+/// one asked for 1 s at most and then gone without.
+#[test]
+fn a_dataset_held_away_from_its_home_is_read_while_its_databases_pool_is_busy() {
+    use meridian_changes::groups::Groups;
+    let urls = two_databases();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:pa{n}")))
+        .find(|d| meridian_changes::groups::owner(d, 2) == 1)
+        .unwrap();
+    let subject = unique("LCL-PA");
+    {
+        let member = |group: u32| {
+            let store = PostgresStore::connect(&urls[0], 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap());
+            store.adopt().unwrap();
+            store
+        };
+        let (zero, one) = (member(0), member(1));
+        zero.pin_owners().unwrap();
+        one.record(
+            &dataset,
+            vec![trade(&dataset, "before", &subject, 10)],
+            1_000,
+        )
+        .unwrap();
+    }
+    let groups = Groups::new(0, 2).unwrap();
+    let stores: Vec<Arc<PostgresStore>> = urls
+        .iter()
+        .enumerate()
+        .map(|(d, url)| {
+            Arc::new(
+                PostgresStore::connect(url, 2)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_databases(2)
+                    .in_database(d as u32),
+            )
+        })
+        .collect();
+    let reader = meridian_lake::spread::Spread::new(stores.clone(), groups);
+    reader.read_owners_again().unwrap();
+    assert_eq!(
+        range_keys(&reader, &dataset, &[&subject]).ok(),
+        Some(vec!["before".to_string()])
+    );
+    let mut admin = postgres::Client::connect(&urls[0], postgres::NoTls).unwrap();
+    admin
+        .batch_execute("BEGIN; LOCK TABLE lake_partition IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let (store, d) = (stores[0].clone(), dataset.clone());
+            std::thread::spawn(move || drop(store.range_tip(&d)))
+        })
+        .collect();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(3_000));
+        admin.batch_execute("ROLLBACK").unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let busy = range_keys(&reader, &dataset, &[&subject]);
+    release.join().unwrap();
+    for h in held {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        busy.ok(),
+        Some(vec!["before".to_string()]),
+        "a dataset held away from its home was not read while its database's pool was busy"
+    );
+}
+
+/// A member that has read nothing, another database out of reach for as
+/// long, waits on it in no read of a dataset its home writes (the review of
+/// 2026-11-23 of the lake's routing, finding 2; its probe P3): the home is
+/// asked first and holds the dataset's ranges, so no other is asked -- not
+/// for 1 s in each of a read's two looks, on every read, as nothing was
+/// settled by a look that could not ask every database.
+#[test]
+fn a_member_that_has_read_nothing_waits_on_no_database_out_of_reach() {
+    use meridian_changes::groups::Groups;
+    let urls = two_databases();
+    let m = members(&urls);
+    let dataset = owned_by_zero("coinbase-1:c");
+    let (low, high) = halves_of("lake-cold");
+    halved(&m, &dataset, &low, &high);
+    let groups = Groups::new(0, 2).unwrap();
+    let stores = stores_of(&urls, groups, 2);
+    let fresh = meridian_lake::spread::Spread::new(stores.clone(), groups);
+    let mut admin = postgres::Client::connect(&urls[1], postgres::NoTls).unwrap();
+    admin
+        .batch_execute("BEGIN; LOCK TABLE lake_partition IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let (store, d) = (stores[1].clone(), dataset.clone());
+            std::thread::spawn(move || drop(store.range_tip(&d)))
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut took = Vec::new();
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let read = latest_keys(&fresh, &dataset, &low);
+        took.push(t.elapsed());
+        assert_eq!(read.ok(), Some(vec!["l0".to_string(), "l1".to_string()]));
+    }
+    admin.batch_execute("ROLLBACK").unwrap();
+    for h in held {
+        h.join().unwrap();
+    }
+    assert!(
+        took[2] < std::time::Duration::from_millis(500),
+        "each read of a dataset database 0 writes waited on database 1: {took:?}"
     );
 }

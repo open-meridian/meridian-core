@@ -309,22 +309,6 @@ impl Spread {
     /// -- or none has begun it. Once there, it is there until its owner
     /// changes.
     pub fn of(&self, partition: &str) -> u32 {
-        self.of_within(partition, None)
-    }
-
-    /// [`Self::of`]; for a read, with the databases it has found
-    /// `out_of_reach`, each database past the partition's owner's home is
-    /// asked on a connection waited for 1 s at most
-    /// ([`PostgresStore::range_tip_within`]) and, once out of reach, not
-    /// again in this look: a read's first of a partition never waits a
-    /// pool's 30 s on a database it may not need (the review of the book's
-    /// fix, finding 3). Nothing is settled by a look that could not ask
-    /// every database.
-    fn of_within(
-        &self,
-        partition: &str,
-        out_of_reach: Option<&std::cell::RefCell<std::collections::BTreeSet<u32>>>,
-    ) -> u32 {
         if partition == meridian_changes::CONTROL {
             return 0;
         }
@@ -343,24 +327,8 @@ impl Spread {
         }
         let count = self.groups.count();
         let mut best = (0u64, home);
-        let mut every = true;
         for (d, store) in self.stores.iter().enumerate() {
-            let tip = match out_of_reach.filter(|_| d as u32 != home) {
-                Some(out) if out.borrow().contains(&(d as u32)) => {
-                    every = false;
-                    continue;
-                }
-                Some(out) => match store.range_tip_within(partition) {
-                    Ok(tip) => tip,
-                    Err(_) => {
-                        out.borrow_mut().insert(d as u32);
-                        every = false;
-                        continue;
-                    }
-                },
-                None => store.range_tip(partition).ok().flatten(),
-            };
-            let Some(tip) = tip else {
+            let Ok(Some(tip)) = store.range_tip(partition) else {
                 continue;
             };
             // A move's pointer is where it let go, never where it is
@@ -387,20 +355,24 @@ impl Spread {
         {
             best.1 = home;
         }
-        if best.1 == home && every {
+        if best.1 == home {
             self.settled.lock().expect("settled poisoned").insert(key);
         }
         best.1
     }
 
-    /// The databases a read of `dataset` asks, by the view: its own, and
-    /// each its ranges' groups write, as this member last read them.
-    fn sent(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
-        let out_of_reach = Default::default();
+    /// The databases a read of `dataset` asks first: its owner's home and
+    /// each of its ranges' owners', by this member's view. Named, never
+    /// looked for: where a partition stands in every database
+    /// ([`Self::of`]) is a write's to find, on each pool's own wait, and a
+    /// read's own look says more ([`Self::follow_owners`]; the review of
+    /// 2026-11-23 of this routing, findings 1 and 2).
+    fn homes(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
+        let home = |owner| meridian_changes::databases::of_group(owner, self.count());
         let mut out =
-            std::collections::BTreeSet::from([self.of_within(dataset, Some(&out_of_reach))]);
-        for (range, _) in self.groups.ranges_of(dataset) {
-            out.insert(self.of_within(&range, Some(&out_of_reach)));
+            std::collections::BTreeSet::from([home(self.groups.owner_by(dataset, dataset))]);
+        for (_, owner) in self.groups.ranges_of(dataset) {
+            out.insert(home(owner));
         }
         out
     }
@@ -416,21 +388,26 @@ impl Spread {
     /// target's head. Each database answers the ranges its own rows say
     /// are read there, so a read needs only the right databases.
     ///
-    /// - **The view's databases asked**, one read of each, on the pool's
-    ///   own wait as the read's rows are: theirs where each range one of
-    ///   them let go is held by another of them, at or past where it was
-    ///   let go.
-    /// - **Every other's** only where one holds a move's pointer of a
-    ///   range none of them holds, or they have begun nothing of the
-    ///   dataset: each holding a range of it is asked as well. A range a
-    ///   split closed sends no read on: it moves nowhere, and where it was
-    ///   split in the database it moved to, its closed row there is what
-    ///   its source's pointer is held by.
-    /// - **Refused UNAVAILABLE** where such a database cannot be asked
-    ///   within [`crate::postgres::PostgresStore::standing_of`]'s bound:
-    ///   never answered without a range a move took there, nor held for a
-    ///   pool's 30 s by another database's outage (the review of
-    ///   2026-11-23, finding 4).
+    /// - **Its owners' homes asked first** ([`Self::homes`]), one read of
+    ///   each, on the pool's own wait as the read's rows are: theirs where
+    ///   they have begun the dataset and each range one of them let go is
+    ///   held by another of them, at or past where it was let go.
+    /// - **Every other's on that wait too** where the homes have begun
+    ///   nothing of the dataset: held away from home -- the database count
+    ///   raised, the dataset not moved home yet -- it is read where it is
+    ///   held, a database the read needs as it needs its home (the review
+    ///   of 2026-11-23 of this routing, finding 1).
+    /// - **Every other's for 1 s at most** only where a home holds a
+    ///   move's pointer of a range none of them holds: each holding a
+    ///   range of the dataset is asked as well. A range a split closed
+    ///   sends no read on: it moves nowhere, and where it was split in the
+    ///   database it moved to, its closed row there is what its source's
+    ///   pointer is held by.
+    /// - **Refused UNAVAILABLE** where such a database cannot be asked:
+    ///   never answered without a range a move took there or a dataset
+    ///   held there, nor held for a pool's 30 s by the outage of a
+    ///   database only a pointer names (the review of 2026-11-23, finding
+    ///   4).
     /// - **This read's alone**: the view is never written here (the same
     ///   review, finding 3). A reader's replicas share it with its own
     ///   stores, and one behind a move would write the owner before it.
@@ -440,7 +417,7 @@ impl Spread {
     /// read with `read_after` is never answered without a range a move
     /// took elsewhere.
     fn follow_owners(&self, dataset: &str) -> Result<Followed> {
-        let mut databases = self.sent(dataset);
+        let mut databases = self.homes(dataset);
         if self.stores.len() == 1 || dataset == meridian_changes::CONTROL {
             return Ok(Followed {
                 databases,
@@ -488,7 +465,8 @@ impl Spread {
                 .filter(|d| !databases.contains(d))
                 .collect();
             for d in others {
-                let asked = self.database(d).standing_of(dataset, true).map_err(|failed| {
+                // On the short wait only where a pointer sent the read on.
+                let asked = self.database(d).standing_of(dataset, astray).map_err(|failed| {
                     StoreError::Unavailable(format!(
                         "dataset {dataset}'s ranges in database {d}, which may hold one, could not be read ({failed}): ask again"
                     ))

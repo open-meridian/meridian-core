@@ -72,8 +72,8 @@ pub struct Standing {
     pub closed: bool,
 }
 
-/// How long a read waits for a connection to ask a database it may not
-/// need for a dataset's rows ([`PostgresStore::standing_of`]): a constant,
+/// How long a read waits for a connection to ask a database a move's
+/// pointer sent it to ([`PostgresStore::standing_of`]): a constant,
 /// short beside the pool's own 30 s, so a database out of reach holds no
 /// read that long (the review of 2026-11-23, finding 4).
 const STANDING_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -177,17 +177,6 @@ impl PostgresStore {
         range_tip_of(&mut *conn, partition)
     }
 
-    /// [`Self::range_tip`] on a connection waited for
-    /// [`STANDING_CHECKOUT`] at most: for a read finding where a range is,
-    /// in a database it may not need.
-    pub fn range_tip_within(&self, partition: &str) -> Result<Option<RangeTip>> {
-        let mut conn = self
-            .pool
-            .get_timeout(STANDING_CHECKOUT)
-            .map_err(unavailable)?;
-        range_tip_of(&mut *conn, partition)
-    }
-
     /// The last row of `partition`'s own this database holds: its sequence
     /// and recording time (a move's target, warming).
     pub fn range_tip_held(&self, partition: &str) -> Result<(u64, i64)> {
@@ -259,8 +248,8 @@ impl PostgresStore {
     /// `dataset`'s rows here as a read of it finds them
     /// ([`crate::spread::Spread`]), its own and each range's. On a
     /// connection waited for [`STANDING_CHECKOUT`] at most where `bounded`:
-    /// a database the read may not need holds it no longer. It commits
-    /// nothing, so follows no timeline first.
+    /// a database only a move's pointer sent the read to holds it no
+    /// longer. It commits nothing, so follows no timeline first.
     ///
     /// INTERIM(v32): read before every read of a dataset over several
     /// databases only because a member's view of the writer groups is read
