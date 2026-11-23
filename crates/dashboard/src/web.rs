@@ -36,6 +36,7 @@ use crate::session::{Session, Sessions, ABSOLUTE_NS};
 mod delegations;
 pub(crate) mod oauth;
 mod reset;
+pub(crate) mod status_badge;
 mod terminal;
 pub(crate) use delegations::path_segment;
 pub(crate) use terminal::bearer as bearer_token;
@@ -376,7 +377,19 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     // W6.9: the instances the person holds any level on, `admin` included;
     // through All plugins (admin), every one running -- launched from the
     // catalogue, or reporting.
-    let launches = crate::catalogue::launches(&app).await;
+    let every_launch = crate::catalogue::every_launch(&app).await;
+    let launches: Vec<&meridian_domain::v1::PluginLaunch> = every_launch
+        .iter()
+        .filter(|launch| launch.state == meridian_domain::v1::PluginLaunchState::Launched as i32)
+        .collect();
+    // An instance's latest launch, live or ended: for its name, and its
+    // status badge's Stopped.
+    let latest = |instance: &str| {
+        every_launch
+            .iter()
+            .filter(|launch| launch.instance_id == instance)
+            .max_by_key(|launch| launch.launched_at_ns)
+    };
     let mut listed: std::collections::BTreeSet<String> = access
         .plugins
         .iter()
@@ -388,10 +401,9 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         listed.extend(app.health.view().into_keys());
     }
     let name_of = |instance: &str| {
-        launches
-            .iter()
-            .find(|launch| launch.instance_id == instance)
+        latest(instance)
             .map(|launch| launch.name.clone())
+            .filter(|name| !name.is_empty())
     };
     let mut body = String::from(
         "<div class=\"page-head\"><div><h1>Your plugins</h1>\
@@ -485,6 +497,18 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         }
         // Paged by the kit's om-pager, as many as fit (kit 0.11.0): each card
         // a row of it.
+        // The lake's listing, read once for every card's status badge: each
+        // data or reporting instance's setting-up steps and data age.
+        let reports = app.health.view();
+        let datasets = if listed.iter().any(|instance| {
+            crate::admin::reads_data(&crate::admin::roles_of(&app, &records, instance))
+        }) {
+            crate::admin::data_sources::datasets(&app.bus, &session.subject)
+                .await
+                .ok()
+        } else {
+            None
+        };
         body.push_str("<om-pager><ul class=\"plugins list\" id=\"home-plugins\" data-plugins>");
         for instance in listed.iter().map(|i| i.as_str()) {
             // A button per level held (W6.9), where a page can be opened.
@@ -496,18 +520,42 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 Vec::new()
             };
             // Contract v26 (W11.8), ruling 831 (its item 177): a connection
-            // shows where it trades and, beside it, its data, each on its
-            // own: "Trading: Demo · Data: Live".
+            // shows where it trades, "Trading: Demo"; its data, "Data:
+            // Live", is said in its status badge's note.
             let roles = access.known_roles.get(instance);
             let holds = |wanted: &str| roles.is_some_and(|roles| roles.iter().any(|r| r == wanted));
-            let badge = if holds("connectivity") {
-                Some(Badge {
-                    trading: crate::admin::connectivity::trading(&app, &records, instance).await,
-                    data: holds("data"),
-                })
+            let trading = if holds("connectivity") {
+                Some(crate::admin::connectivity::trading(&app, &records, instance).await)
             } else {
                 None
             };
+            let steps = crate::admin::setting_up_steps_from(
+                &app,
+                instance,
+                &records,
+                access.deployment_admin,
+                datasets.as_ref(),
+            );
+            let launch = latest(instance);
+            let stopped_by = launch
+                .and_then(|launch| {
+                    records
+                        .people
+                        .iter()
+                        .find(|person| person.subject == launch.stopped_by)
+                })
+                .map(|person| person.display_name.as_str())
+                .unwrap_or_default();
+            let status = status_badge::status(&status_badge::Known {
+                instance,
+                launch,
+                report: reports.get(instance),
+                steps: &steps,
+                listed: datasets.as_ref(),
+                stopped_by,
+                data_live: holds("connectivity") && holds("data"),
+                now: app.clock.now_ns(),
+            });
             body.push_str(&plugin_card(
                 instance,
                 name_of(instance).as_deref(),
@@ -517,7 +565,8 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                     .known_roles
                     .get(instance)
                     .is_some_and(|roles| roles.len() > 1),
-                badge,
+                trading,
+                &status,
             ));
         }
         body.push_str(
@@ -551,22 +600,38 @@ const SEARCH_FROM: usize = 8;
 /// admin, open for write, view for read"). The name is only the plugin's:
 /// the buttons are the ways in (the product owner, 2026-09-30: "the plugin
 /// name is linked to the admin page (it shouldn't)").
-/// A connectivity plugin's badge on its card (ruling 831): where it trades,
-/// and whether it holds the data role, whose data is the vendor's own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Badge {
-    trading: &'static str,
-    data: bool,
+/// A connectivity plugin's trading badge (ruling 831): where it trades,
+/// its own badge, since the demo guard turns on it. Whether its data is the
+/// vendor's own is said in its status badge's note.
+fn trading_badge(trading: &str) -> String {
+    let said = format!("Trading: {trading}");
+    format!(
+        "<span class=\"badge {kind}\" data-environment=\"{trading}\" title=\"{said}\">{said}</span>",
+        kind = match trading {
+            "Demo" => "good",
+            "Live" => "warn",
+            _ => "plain",
+        },
+        trading = escape(trading),
+        said = escape(&said),
+    )
 }
 
-impl Badge {
-    fn words(self) -> String {
-        if self.data {
-            format!("Trading: {} \u{b7} Data: Live", self.trading)
-        } else {
-            format!("Trading: {}", self.trading)
-        }
-    }
+/// A plugin's name, its whole on hover: an organisation's prefix
+/// (`open-meridian/`) faint, so the plugin's own part reads first.
+fn plugin_name(title: &str) -> String {
+    let named = match title.rfind('/') {
+        Some(at) if at + 1 < title.len() => format!(
+            "<span class=\"faint\">{}</span>{}",
+            escape(&title[..=at]),
+            escape(&title[at + 1..])
+        ),
+        _ => escape(title),
+    };
+    format!(
+        "<span class=\"plugin-name\" title=\"{}\">{named}</span>",
+        escape(title)
+    )
 }
 
 fn plugin_card(
@@ -575,7 +640,8 @@ fn plugin_card(
     levels: &[meridian_access::AccessLevel],
     held: &meridian_access::PluginHeld,
     several: bool,
-    badge: Option<Badge>,
+    trading: Option<&str>,
+    status: &status_badge::Status,
 ) -> String {
     // The plugin's name where the catalogue launched it; one installed
     // otherwise is known by its instance alone.
@@ -583,51 +649,36 @@ fn plugin_card(
         Some(name) => (
             name,
             format!(
-                "<span class=\"plugin-instance\">{}</span>",
-                escape(instance)
+                "<span class=\"plugin-instance\" title=\"{id}\">{id}</span>",
+                id = escape(instance)
             ),
         ),
         None => (instance, String::new()),
     };
     let initial: String = title
+        .rsplit('/')
+        .next()
+        .unwrap_or(title)
         .chars()
         .find(|c| c.is_alphanumeric())
         .map(String::from)
         .unwrap_or_default();
-    // Contract v26 (W11.8), ruling 831: where a connectivity plugin trades,
-    // and its data beside it, each said on its own.
-    let badge = match badge {
-        Some(badge) => {
-            let said = badge.words();
-            format!(
-                " <span class=\"badge {kind}\" data-environment=\"{trading}\" title=\"{said}\">{said}</span>",
-                kind = match badge.trading {
-                    "Demo" => "good",
-                    "Live" => "warn",
-                    _ => "plain",
-                },
-                trading = escape(badge.trading),
-                said = escape(&said),
-            )
-        }
-        None => String::new(),
-    };
-    // On the line under the name, beside the instance, which gives way
-    // first: a narrow card never cuts the badge off (ruling 831).
-    let sub = if badge.is_empty() {
-        sub
-    } else {
-        format!("<span class=\"plugin-sub\">{sub}{badge}</span>")
-    };
+    // Its status (one of four, its why on hover), then, for a connectivity
+    // plugin, where it trades (ruling 831); on the line under the name, each
+    // whole where it fits and cut with its words on hover where it does not.
+    let (badge, note) = status_badge::badge(status, instance);
+    let trading = trading.map(trading_badge).unwrap_or_default();
     let text = format!(
         "<span class=\"plugin-icon\" aria-hidden=\"true\">{initial}</span>\
-         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>",
+         <span class=\"plugin-text\">{name}<span class=\"plugin-sub\">{sub}\
+         <span class=\"plugin-badges\">{badge}{trading}</span></span>{note}</span>",
         initial = escape(&initial),
-        title = escape(title),
+        name = plugin_name(title),
     );
     if levels.is_empty() {
         return format!(
-            "<li class=\"list-row\" data-instance=\"{id}\"><div class=\"plugin-card\">{text}\
+            "<li class=\"list-row\" data-instance=\"{id}\"><div class=\"plugin-card\">\
+             <span class=\"plugin-main\">{text}</span>\
              <span class=\"plugin-open\">Not open to you yet</span></div></li>",
             id = escape(instance)
         );

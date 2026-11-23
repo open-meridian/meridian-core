@@ -1358,14 +1358,49 @@ pub(crate) async fn setting_up_steps(
     subject: &str,
     deployment_admin: bool,
 ) -> Vec<setting_up::Step> {
-    let reports = app.health.view();
-    let report = reports.get(instance);
-    let roles: Vec<String> = report
+    let listed = if reads_data(&roles_of(app, records, instance)) {
+        data_sources::datasets(&app.bus, subject).await.ok()
+    } else {
+        None
+    };
+    setting_up_steps_from(app, instance, records, deployment_admin, listed.as_ref())
+}
+
+/// An instance's roles now: as its sidecar last reported them, or as the
+/// records know them.
+pub(crate) fn roles_of(app: &App, records: &AccessRecords, instance: &str) -> Vec<String> {
+    let roles: Vec<String> = app
+        .health
+        .view()
+        .get(instance)
         .map(|r| r.roles.clone())
         .filter(|roles| !roles.is_empty())
         .or_else(|| meridian_access::known_roles(records, instance).map(<[String]>::to_vec))
         .unwrap_or_default();
-    let roles = meridian_domain::roles_now(&roles);
+    meridian_domain::roles_now(&roles)
+}
+
+/// Whether a role of these reads the lake's datasets, and so its steps
+/// need the listing.
+pub(crate) fn reads_data(roles: &[String]) -> bool {
+    roles
+        .iter()
+        .any(|role| role == "data" || role == "reporting")
+}
+
+/// [`setting_up_steps`] from a datasets listing already read, for a page
+/// judging several instances by one read (the home page's status badges);
+/// None where it could not be read, as there.
+pub(crate) fn setting_up_steps_from(
+    app: &App,
+    instance: &str,
+    records: &AccessRecords,
+    deployment_admin: bool,
+    listed: Option<&meridian_domain::v1::ListDatasetsReply>,
+) -> Vec<setting_up::Step> {
+    let reports = app.health.view();
+    let report = reports.get(instance);
+    let roles = roles_of(app, records, instance);
     let custody = app.custody.view();
     let connected = custody.sync.keys().any(|(held_by, _)| held_by == instance);
     let unlinked = custody
@@ -1383,12 +1418,9 @@ pub(crate) async fn setting_up_steps(
                 .count()
         })
         .unwrap_or_default();
-    let reads_data = roles
-        .iter()
-        .any(|role| role == "data" || role == "reporting");
-    let (datasets_ready, entitled) = if reads_data {
-        match data_sources::datasets(&app.bus, subject).await {
-            Ok(listed) => {
+    let (datasets_ready, entitled) = if reads_data(&roles) {
+        match listed {
+            Some(listed) => {
                 let mine: Vec<&String> = listed
                     .datasets
                     .iter()
@@ -1412,7 +1444,7 @@ pub(crate) async fn setting_up_steps(
                     .any(|e| e.instance == instance && e.allowed);
                 (Some(ready), Some(entitled))
             }
-            Err(_) => (None, None),
+            None => (None, None),
         }
     } else {
         (None, None)

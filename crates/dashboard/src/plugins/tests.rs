@@ -656,8 +656,9 @@ async fn home_links_each_plugin_a_person_may_open() {
         home.body.contains(
             "<li class=\"list-row\" data-instance=\"snaptrade-1\"><div class=\"plugin-card\">\
              <span class=\"plugin-main\"><span class=\"plugin-icon\" aria-hidden=\"true\">s</span>\
-             <span class=\"plugin-text\"><span class=\"plugin-name\">snaptrade-1</span></span></span>\
-             <span class=\"plugin-levels\""
+             <span class=\"plugin-text\"><span class=\"plugin-name\" title=\"snaptrade-1\">snaptrade-1</span>\
+             <span class=\"plugin-sub\"><span class=\"plugin-badges\"><button type=\"button\" \
+             data-status=\"stopped\" class=\"badge\""
         ),
         "{}",
         home.body
@@ -674,9 +675,12 @@ async fn home_links_each_plugin_a_person_may_open() {
     assert!(
         !home.body.contains("data-level=\"write\"") && !home.body.contains("data-level=\"admin\"")
     );
+    // Its status badge, one of four, its why on hover: never launched from
+    // the catalogue and not reporting, so not launched.
+    assert!(home.body.contains(">Stopped</button>"), "{}", home.body);
     assert!(home
         .body
-        .contains("<span class=\"plugin-name\">snaptrade-1</span>"));
+        .contains("<span class=\"hint noted\" id=\"status-snaptrade-1\">Not launched</span>"));
 }
 
 #[test]
@@ -1090,8 +1094,10 @@ async fn an_admins_home_links_every_plugin_launched() {
         !card.contains(">Open</a>") && !card.contains(">View</a>"),
         "{card}"
     );
-    assert!(card.contains("<span class=\"plugin-name\">snaptrade</span>"));
-    assert!(card.contains("<span class=\"plugin-instance\">snaptrade-1</span>"));
+    assert!(card.contains("<span class=\"plugin-name\" title=\"snaptrade\">snaptrade</span>"));
+    assert!(
+        card.contains("<span class=\"plugin-instance\" title=\"snaptrade-1\">snaptrade-1</span>")
+    );
     assert!(!home.body.contains("stopped-1"), "{}", home.body);
     // Both views, the list first; the tiles a switch away.
     assert!(home
@@ -1102,6 +1108,93 @@ async fn an_admins_home_links_every_plugin_launched() {
         !home.body.contains("data-filter=\"home-plugins\""),
         "one plugin needs no search box"
     );
+}
+
+/// The home's cards fit their content (the product owner's dev deployment
+/// at 1262 px: names and "Trading: ... · Data: Live" ran past a tile): a
+/// name carries its whole text on hover, its organisation's prefix faint;
+/// the instance likewise; and the badges sit in a line of their own, which
+/// the stylesheet wraps and cuts, each with its words on hover. Its status
+/// badge is one of four, its why the note; where it trades is a badge of
+/// its own, and its data is said in the status's note.
+#[tokio::test]
+async fn a_home_card_keeps_its_name_and_badges_whole_on_hover() {
+    let h = harness(&[]).await;
+    let mut held = admin_records();
+    held.known_plugins = vec![meridian_domain::v1::KnownPluginRoles {
+        plugin_instance_id: INSTANCE.into(),
+        roles: vec!["connectivity".into(), "data".into()],
+    }];
+    held.plugin_settings = vec![meridian_domain::v1::PluginSettingsRecord {
+        plugin_instance_id: INSTANCE.into(),
+        values: vec![meridian_domain::v1::PluginSettingValue {
+            name: "environment".into(),
+            value: "paper".into(),
+        }],
+        ..Default::default()
+    }];
+    h.app.records.store(held, h.app.clock.now_ns());
+    h.app.bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                launches: vec![meridian_domain::v1::PluginLaunch {
+                    instance_id: INSTANCE.into(),
+                    name: "open-meridian/polymarket-us".into(),
+                    state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    h.app.health.hear(
+        INSTANCE,
+        meridian_domain::v1::PluginReport {
+            plugin_instance_id: INSTANCE.into(),
+            registered: true,
+            healthy: false,
+            health_detail: "the token was <refused>".into(),
+            reported_at_ns: h.app.clock.now_ns(),
+            ..Default::default()
+        },
+    );
+    let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
+    let card = home
+        .body
+        .split("<li class=\"list-row\" data-instance=\"snaptrade-1\">")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{}", home.body))
+        .split("</li>")
+        .next()
+        .unwrap();
+    assert!(
+        card.contains(
+            "<span class=\"plugin-name\" title=\"open-meridian/polymarket-us\">\
+             <span class=\"faint\">open-meridian/</span>polymarket-us</span>"
+        ),
+        "{card}"
+    );
+    assert!(card.contains("<span class=\"plugin-icon\" aria-hidden=\"true\">p</span>"));
+    assert!(
+        card.contains("<span class=\"plugin-instance\" title=\"snaptrade-1\">snaptrade-1</span>")
+    );
+    assert!(
+        card.contains(
+            "<span class=\"plugin-badges\"><button type=\"button\" data-status=\"not-healthy\" \
+             class=\"badge bad\" data-note aria-describedby=\"status-snaptrade-1\">Not healthy</button>\
+             <span class=\"badge good\" data-environment=\"Demo\" title=\"Trading: Demo\">Trading: Demo</span></span>"
+        ),
+        "{card}"
+    );
+    assert!(
+        card.contains(
+            "<span class=\"hint noted\" id=\"status-snaptrade-1\">the token was &lt;refused&gt; \u{b7} Data: Live</span>"
+        ),
+        "{card}"
+    );
+    assert!(!card.contains("Trading: Demo \u{b7} Data: Live"), "{card}");
 }
 
 /// The product owner, 2026-09-30: lists are built for 100 and more. Past a
