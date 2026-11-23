@@ -384,14 +384,40 @@ with sync_playwright() as playwright:
     page.goto(f"{DASHBOARD}/sign-in")
     if BY == "password":
         signed_in_at_the_form(page)
-    page.goto(f"{DASHBOARD}/")
-    # First run linked the administrators to All plugins (admin) (W7.6): the
-    # home offers her Manage on it, and no data level (W6.9).
-    link = page.locator(f"a.plugin-level[data-level='admin'][href='/plugins/{INSTANCE}?level=admin']")
-    check(link.count() == 1, f"home offers Manage on {INSTANCE} to its administrator, who holds no data on it")
-    if link.count() == 1:
-        link.click()
-        page.wait_for_load_state()
+    # The home lists a plugin once it is set up and not stopped, its one
+    # Open at the highest level held; Settings › Plugins says where each
+    # stands (the 2026-11-23 consensus). Read both until they agree on one
+    # status, a sidecar still joining moving it on between the reads.
+    for _ in range(10):
+        page.goto(f"{DASHBOARD}/admin")
+        row = page.locator(f"#plugins-table tr[data-id='{INSTANCE}']")
+        before = row.get_attribute("data-status") if row.count() == 1 else None
+        page.goto(f"{DASHBOARD}/")
+        opens = [a.get_attribute("href") for a in
+                 page.locator(f"li[data-instance='{INSTANCE}'] a.open-item").all()]
+        page.goto(f"{DASHBOARD}/admin")
+        after = row.get_attribute("data-status") if row.count() == 1 else None
+        if before is not None and before == after:
+            break
+        time.sleep(3)
+    check(before is not None, f"Settings › Plugins lists {INSTANCE}")
+    if before in ("setting-up", "stopped"):
+        check(opens == [], f"{before}, {INSTANCE} is not on the home: {opens}")
+    else:
+        # First run linked the administrators to All plugins (admin) (W7.6):
+        # she holds no data on it, so its one Open goes to Manage (W6.9).
+        check(opens == [f"/plugins/{INSTANCE}?level=admin"],
+              f"{before}, the home's one Open on {INSTANCE} goes to Manage: {opens}")
+    # The area, opened naming no level, opens at the first held; its level
+    # switch reaches every level held: Manage alone, she holding no data.
+    page.goto(f"{DASHBOARD}/plugins/{INSTANCE}")
+    page.wait_for_load_state()
+    head = page.locator(".plugin-area .page-head")
+    alone = head.locator("span.badge.accent[data-level='admin']")
+    check(alone.count() == 1 and alone.inner_text().strip() == "Manage"
+          and head.locator("nav.level-switch").count() == 0,
+          f"the area's level switch offers Manage alone on {INSTANCE} to its administrator, who holds no data on it")
+    if alone.count() == 1:
         # The plugin's area under Manage, opened on the dashboard's own
         # Summary tab, its status drawn there and nothing framed; its admin
         # page then read through the frame's way in, which opens it in a
