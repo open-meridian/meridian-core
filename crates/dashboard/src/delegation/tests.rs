@@ -715,7 +715,9 @@ async fn every_delegation_change_is_its_own_record_in_memory_too() {
         plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
         ..Covers::default()
     };
-    store.rewrite(&made.id, &rewritten, T0 + 2_000).unwrap();
+    assert!(store
+        .rewrite(&made.id, &made.covers, &rewritten, T0 + 2_000)
+        .unwrap());
     store
         .backfill_acting(&made.id, &["place_order".to_string()], T0 + 3_000)
         .unwrap();

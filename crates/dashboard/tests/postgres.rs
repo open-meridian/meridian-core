@@ -1739,3 +1739,55 @@ fn every_dashboard_change_record_is_kept_as_written() {
     assert_eq!(prepared.sweep(3).unwrap(), 1, "the settled one swept");
     assert_eq!(count(&url, "dashboard_prepared_call_change"), 1);
 }
+
+/// Review-core-3 4: the one-time rewrite is worked out from rows read
+/// unheld. A renewal between that read and the rewrite wins: the stale
+/// rewrite changes nothing and records nothing.
+#[test]
+fn a_stale_rewrite_after_a_renewal_keeps_the_renewals_rows() {
+    use delegation::record::ChangeKind;
+    let (_url, database) = migrated("stale_rewrite");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let made = store
+        .grant(&granting("mdc_a", old_rows, T0 + 30 * DAY_NS), T0)
+        .unwrap();
+    // What the rewrite read, and worked out from it.
+    let read = made.covers.clone();
+    let stale = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    // A renewal in between, to other rows.
+    let renewed_rows = Covers {
+        plugins: [("ems-1".to_string(), "ems".to_string(), "write".to_string())].into(),
+        ..Covers::default()
+    };
+    let renewed = store
+        .grant(
+            &granting("mdc_a", renewed_rows.clone(), T0 + 60 * DAY_NS),
+            T0 + 1,
+        )
+        .unwrap();
+    assert!(!store.rewrite(&made.id, &read, &stale, T0 + 2).unwrap());
+    let now = store.delegation(&made.id).unwrap().unwrap();
+    assert_eq!(
+        now.covers.plugins, renewed_rows.plugins,
+        "the renewal's rows"
+    );
+    assert_eq!(now.covers, renewed.covers);
+    assert_eq!(
+        store
+            .changes(&made.id)
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Renewed],
+        "no rewritten record"
+    );
+}

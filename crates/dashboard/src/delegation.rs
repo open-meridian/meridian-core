@@ -386,7 +386,14 @@ pub async fn rewrite_recorded_rows(
         let Some(covers) = rewrite_rows(&delegation.covers, records) else {
             continue;
         };
-        delegations.rewrite(&delegation.id, &covers, now_ns).await?;
+        // Worked out from what was read, unheld: a renewal since wins, and
+        // nothing is rewritten (review-core-3 4).
+        if !delegations
+            .rewrite(&delegation.id, &delegation.covers, &covers, now_ns)
+            .await?
+        {
+            continue;
+        }
         tracing::info!(
             delegation = delegation.id,
             subject = delegation.subject,
@@ -1378,10 +1385,17 @@ impl Delegations {
     }
 
     /// A delegation's rows as rewritten once to name each plugin's role, at
-    /// `now_ns`.
-    pub async fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), Unavailable> {
-        let (id, covers) = (id.to_string(), covers.clone());
-        self.stored(move |store| store.rewrite(&id, &covers, now_ns))
+    /// `now_ns`, from the rows `read`: nothing where they changed since.
+    /// True when it rewrote them.
+    pub async fn rewrite(
+        &self,
+        id: &str,
+        read: &Covers,
+        covers: &Covers,
+        now_ns: i64,
+    ) -> Result<bool, Unavailable> {
+        let (id, read, covers) = (id.to_string(), read.clone(), covers.clone());
+        self.stored(move |store| store.rewrite(&id, &read, &covers, now_ns))
             .await
     }
 

@@ -77,7 +77,16 @@ pub trait DelegationStore: Send + Sync {
 
     /// Replace a delegation's rows with the same rows rewritten to name each
     /// plugin's role (W6.17, contract v15); nothing else about it changes.
-    fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), String>;
+    /// `read` is what the rewrite was worked out from: where the rows held
+    /// now differ -- a renewal since replaced them -- nothing is rewritten
+    /// or recorded (review-core-3 4). True when it rewrote them.
+    fn rewrite(
+        &self,
+        id: &str,
+        read: &Covers,
+        covers: &Covers,
+        now_ns: i64,
+    ) -> Result<bool, String>;
 
     /// Every change recorded for one delegation, its backfilled record
     /// included, in the order recorded (decision 47); kept after the
@@ -114,6 +123,11 @@ pub enum CallsOf {
 /// How long a token is kept past its life, so a request on one just expired
 /// is told it expired rather than that it is unknown.
 const TOKEN_KEPT_NS: i64 = crate::clock::HOUR_NS;
+
+/// Whether two delegations' rows are the same: what a rewrite replaces.
+fn same_rows(held: &Covers, read: &Covers) -> bool {
+    held.plugins == read.plugins && held.unmatched == read.unmatched
+}
 
 fn order(delegations: &mut [Delegation], now_ns: i64) {
     delegations.sort_by(|a, b| {
@@ -425,9 +439,20 @@ impl DelegationStore for InMemory {
             .collect())
     }
 
-    fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), String> {
+    fn rewrite(
+        &self,
+        id: &str,
+        read: &Covers,
+        covers: &Covers,
+        now_ns: i64,
+    ) -> Result<bool, String> {
         let mut kept = self.lock();
-        if let Some(delegation) = kept.delegations.get_mut(id) {
+        let mut rewrote = false;
+        if let Some(delegation) = kept
+            .delegations
+            .get_mut(id)
+            .filter(|delegation| same_rows(&delegation.covers, read))
+        {
             let before = delegation.clone();
             delegation.covers.plugins = covers.plugins.clone();
             delegation.covers.unmatched = covers.unmatched.clone();
@@ -441,9 +466,10 @@ impl DelegationStore for InMemory {
                     now_ns,
                     REWRITTEN,
                 ));
+                rewrote = true;
             }
         }
-        Ok(())
+        Ok(rewrote)
     }
 
     fn groups_read(&self, id: &str, groups: &[String], now_ns: i64) -> Result<(), String> {
@@ -1262,11 +1288,20 @@ impl DelegationStore for InPostgres {
             .collect()
     }
 
-    fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), String> {
+    fn rewrite(
+        &self,
+        id: &str,
+        read: &Covers,
+        covers: &Covers,
+        now_ns: i64,
+    ) -> Result<bool, String> {
         let mut conn = self.database.conn()?;
         let mut tx = conn.transaction().map_err(said)?;
-        let Some(before) = Self::held(&mut tx, id)? else {
-            return Ok(());
+        // Held, and compared with what the rewrite was worked out from: a
+        // renewal since is never undone by a stale rewrite.
+        let Some(before) = Self::held(&mut tx, id)?.filter(|held| same_rows(&held.covers, read))
+        else {
+            return Ok(false);
         };
         tx.execute(
             "UPDATE dashboard_delegation SET covers_plugins = $2 WHERE delegation_id = $1",
@@ -1274,7 +1309,8 @@ impl DelegationStore for InPostgres {
         )
         .map_err(said)?;
         let after = Self::find(&mut tx, id)?.ok_or("the delegation just rewritten is gone")?;
-        if after != before {
+        let rewrote = after != before;
+        if rewrote {
             Self::caught_up(&mut tx, &before, now_ns)?;
             record(
                 &mut tx,
@@ -1288,7 +1324,8 @@ impl DelegationStore for InPostgres {
                 ),
             )?;
         }
-        tx.commit().map_err(said)
+        tx.commit().map_err(said)?;
+        Ok(rewrote)
     }
 
     fn groups_read(&self, id: &str, groups: &[String], now_ns: i64) -> Result<(), String> {
