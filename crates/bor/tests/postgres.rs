@@ -8464,7 +8464,9 @@ async fn a_read_naming_an_account_follows_its_partition_past_a_stale_view_of_its
             2,
             "a read after the order was acknowledged answered without it"
         );
-        assert_eq!(view.of(&partition), 1);
+        // By the heads it read, for itself alone: the member's view is its
+        // sweep's to read again (the review of 2026-11-23, finding 3).
+        assert_eq!(view.of(&partition), 0);
         let journal = Store::journal(view.as_ref(), &account).unwrap();
         assert_eq!(
             journal.last().map(|entry| entry.last_sequence),
@@ -8473,6 +8475,224 @@ async fn a_read_naming_an_account_follows_its_partition_past_a_stale_view_of_its
         );
     });
     blocking(move || drop((reader, view, h)));
+}
+
+/// A member's stores over `urls`, one per database, sharing `groups`'s
+/// view of the writer groups: a reader's, which acts on nothing.
+fn reading(urls: &[Scratch], groups: meridian_changes::groups::Groups) -> Vec<Arc<PostgresStore>> {
+    urls.iter()
+        .map(|url| {
+            Arc::new(
+                PostgresStore::connect(url, 2)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8),
+            )
+        })
+        .collect()
+}
+
+/// `partition` moved from database 0 to group 1's, database 1, as the mover
+/// warms and switches it; the source's accounts not let go.
+fn switched_to_one(h: &TwoDatabases, partition: &str) {
+    use meridian_bor::postgres::Switched;
+    let (source, to) = (h.zero.1.database(0), h.zero.1.database(1));
+    let warmed = to.copy_partition_from(source, partition, 0).unwrap();
+    let switched = source.switch_partition(
+        to,
+        partition,
+        1,
+        std::time::Duration::from_secs(10),
+        false,
+        warmed,
+    );
+    assert!(
+        matches!(switched, Ok(Switched::Moved { .. })),
+        "{switched:?}"
+    );
+}
+
+/// A read answered from a reader's replicas never writes the member's view
+/// of the writer groups (the review of 2026-11-23, finding 3): the replicas
+/// share that view with the member's own stores, and one behind a move
+/// holds the heads as they were before it. Following a partition there by
+/// reading its owner again wrote the owner before the move into the view
+/// every read of the member's goes by. A read is routed by the heads it
+/// just read, for itself alone: the replica's answer is its own state, and
+/// the view still names the owner the record does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_from_a_replica_behind_a_move_never_writes_the_members_view_of_the_owner() {
+    use meridian_changes::groups::Groups;
+    // The record, and what its replicas hold: the state before the move.
+    let (h, behind) = blocking(|| (two_databases(), two_databases()));
+    let partition = partition_of(0, 2);
+    let account = accounts_in("ACC-BEHIND", &partition, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    blocking(|| behind.zero.1.place_first(&account, &account)).unwrap();
+    open(&behind.zero.0, &account, "INS-AAPL").await;
+    accounts_in(
+        "ACC-BEHIND-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    blocking(|| switched_to_one(&h, &partition));
+    write_once(&h.one.0, &account, 1).await.unwrap();
+    let (reader, groups, record) = blocking(|| {
+        let groups = Groups::new(0, 2).unwrap();
+        let primary = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&primary).unwrap();
+        let record = Arc::new(meridian_bor::spread::Spread::new(primary, groups));
+        let replica = Arc::new(meridian_bor::spread::Spread::new(
+            reading(&behind.urls, groups),
+            groups,
+        ));
+        let reader = meridian_bor::reader::ReaderStore::new(
+            record.clone(),
+            Some(replica as Arc<dyn Store>),
+            1 << 20,
+            Arc::new(meridian_bor::store::Mark::new),
+        );
+        (reader, groups, record)
+    });
+    blocking(|| {
+        assert_eq!(groups.owner(&partition), 1, "the member's view, read after");
+        // The record's past, from the replicas.
+        meridian_bus::read_after::begin_read();
+        let past = Store::journal(&reader, &account).unwrap();
+        assert_eq!(
+            groups.owner(&partition),
+            1,
+            "a read from a replica behind the move wrote the owner before it into the member's view"
+        );
+        assert_eq!(record.of(&partition), 1);
+        assert_eq!(
+            past.len(),
+            1,
+            "the replica's own state, the account as it was before the move: {past:?}"
+        );
+        // And the record's, where the partition is written now.
+        assert_eq!(Store::journal(record.as_ref(), &account).unwrap().len(), 2);
+    });
+    blocking(move || drop((reader, record, h, behind)));
+}
+
+/// A read naming an account asks one head: its partition's, in the database
+/// the member's view sends it to, and no other's where that one writes it
+/// (the review of 2026-11-23, findings 4 and 7: every database was asked
+/// before every such read).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_naming_an_account_asks_one_head_where_its_partition_is_written() {
+    use meridian_changes::groups::Groups;
+    let h = blocking(two_databases);
+    let partition = partition_of(0, 0);
+    let account = accounts_in("ACC-ONE-HEAD", &partition, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    blocking(|| {
+        let groups = Groups::new(0, 2).unwrap();
+        let stores = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&stores).unwrap();
+        let view = meridian_bor::spread::Spread::new(stores.clone(), groups);
+        let asked = || stores.iter().map(|store| store.heads_asked()).sum::<u64>();
+        // Read where its owner's home is from here on.
+        assert_eq!(Store::book(&view, &account).unwrap().entries.len(), 1);
+        let before = asked();
+        assert_eq!(Store::book(&view, &account).unwrap().entries.len(), 1);
+        assert_eq!(asked() - before, 1, "the heads a read of its book asked");
+        let before = asked();
+        assert_eq!(Store::journal(&view, &account).unwrap().len(), 1);
+        assert_eq!(asked() - before, 1, "the heads a read of its journal asked");
+    });
+    blocking(move || drop(h));
+}
+
+/// A database that cannot be reached slows no read of a partition written
+/// in another, and a read whose partition it may hold is refused
+/// UNAVAILABLE at once, never answered from the copy a move let go (the
+/// review of 2026-11-23, finding 4: every database's head was asked before
+/// every read naming an account, so one database's outage held each such
+/// read for its pool's 30 s and then answered it by the view). Unreachable
+/// here as a pool finds it: every connection held, the next checkout
+/// waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_database_out_of_reach_slows_no_read_of_a_partition_written_in_another() {
+    use meridian_bor::store::StoreError;
+    use meridian_changes::groups::Groups;
+    let h = blocking(two_databases);
+    let (stays, moves) = (partition_of(0, 0), partition_of(0, 1));
+    assert_ne!(stays, moves);
+    let here = accounts_in("ACC-REACH", &stays, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    let gone = accounts_in("ACC-REACH-GONE", &moves, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    accounts_in(
+        "ACC-REACH-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    blocking(|| {
+        // A reader member: its view of the writer groups read once, before
+        // the move.
+        let groups = Groups::new(0, 2).unwrap();
+        let stores = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&stores).unwrap();
+        let view = meridian_bor::spread::Spread::new(stores.clone(), groups);
+        for account in [&here, &gone] {
+            assert_eq!(Store::book(&view, account).unwrap().entries.len(), 1);
+        }
+        switched_to_one(&h, &moves);
+        // Database 1 out of this member's reach: both connections of its
+        // pool taken, each waiting on a lock held here.
+        let mut admin = postgres::Client::connect(&h.urls[1], postgres::NoTls).unwrap();
+        admin
+            .batch_execute("BEGIN; LOCK TABLE book_partition_head IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let held: Vec<_> = (0..2)
+            .map(|_| {
+                let (store, partition) = (stores[1].clone(), moves.clone());
+                std::thread::spawn(move || drop(store.tip(&partition)))
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let read = Store::book(&view, &here).map(|book| book.entries.len());
+        let took = started.elapsed();
+        assert_eq!(read.ok(), Some(1));
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "a read of a partition database 0 writes waited {took:?} on database 1"
+        );
+        // Its partition's head in database 0 a move's pointer, and the
+        // database it may have gone to not read: refused, within the bound.
+        let started = std::time::Instant::now();
+        let refused = Store::book(&view, &gone).map(|book| book.entries.len());
+        let took = started.elapsed();
+        assert!(
+            matches!(refused, Err(StoreError::Unavailable(_))),
+            "{refused:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "refused only after {took:?}"
+        );
+        admin.batch_execute("ROLLBACK").unwrap();
+        for holder in held {
+            holder.join().unwrap();
+        }
+        // In reach again: read where it is written, the view as it was.
+        assert_eq!(Store::book(&view, &gone).unwrap().entries.len(), 1);
+        assert_eq!(groups.owner(&moves), 0);
+    });
+    blocking(move || drop(h));
 }
 
 /// A write that finds its partition between two databases -- its source

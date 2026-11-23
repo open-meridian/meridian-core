@@ -208,7 +208,16 @@ pub struct PostgresStore {
     /// database holding further on under its group (step 3d; ruled
     /// 2026-11-14): written here from then on, never asked again.
     home_settled: Mutex<std::collections::BTreeSet<String>>,
+    /// How many times a read asked this database a partition's head before
+    /// its answer ([`Self::head_at`]): what a test counts.
+    head_asks: std::sync::atomic::AtomicU64,
 }
+
+/// How long a read waits for a connection to ask a database a partition's
+/// head ([`PostgresStore::head_at`]): a constant, short beside the pool's
+/// own 30 s, so a database out of reach holds no read that long (the review
+/// of 2026-11-23, finding 4).
+const HEAD_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
@@ -237,6 +246,7 @@ impl PostgresStore {
             partitions: 1,
             databases: std::sync::OnceLock::new(),
             home_settled: Mutex::default(),
+            head_asks: Default::default(),
         })
     }
 
@@ -4153,16 +4163,33 @@ impl PostgresStore {
     /// written here -- never a move's pointer, where a move let it go
     /// (its epoch `POINTER_EPOCH`); none where it holds no head of it. The
     /// head row alone, for a read that asks before every answer
-    /// ([`crate::spread::Spread`]).
+    /// ([`crate::spread::Spread`]), on a connection waited for
+    /// [`HEAD_CHECKOUT`] at most: it commits nothing, so follows no
+    /// timeline first.
+    ///
+    /// INTERIM(v32): asked before every read naming an account only because
+    /// a member's view of the writer groups is read on a timer; gone when
+    /// v32 holds that a read with `read_after` is never answered from a
+    /// copy a move let go.
     pub fn head_at(&self, partition: &str) -> Result<Option<(u64, bool)>> {
+        self.head_asks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self
-            .conn()?
+            .pool
+            .get_timeout(HEAD_CHECKOUT)
+            .map_err(unavailable)?
             .query_opt(
                 "SELECT sequence, epoch <> -1 FROM book_partition_head WHERE partition = $1",
                 &[&partition],
             )
             .map_err(unavailable)?
             .map(|row| (row.get::<_, i64>(0).max(0) as u64, row.get(1))))
+    }
+
+    /// How many heads [`Self::head_at`] has been asked here.
+    #[doc(hidden)]
+    pub fn heads_asked(&self) -> u64 {
+        self.head_asks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The accounts this database places in `partition`.

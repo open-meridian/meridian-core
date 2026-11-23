@@ -313,44 +313,58 @@ impl Spread {
             .retain(|(held, _)| held != partition);
     }
 
-    /// `partition`'s owner read again from its heads, and the partition
-    /// routed again, where this member's view of it was read before a move
-    /// (step 3d; sections 5 and 6.4; merge-queue run 45104369464, Elle): the
-    /// database the view sends a read to has let it go -- its head there a
-    /// move's pointer -- or another's head of it is further on. A member
-    /// reads the writer groups at its start, every few seconds and on each
-    /// write handed back to it, and a reader is handed none: until its next
-    /// look, a read naming an account went by the view to the partition's
-    /// source, which holds what it closed with until it lets its accounts
-    /// go, while the read's `read_after` had passed on the target's head.
-    /// So a read naming an account asks first, as a write routes again on
-    /// being handed back ([`Self::route_again`]). A head that cannot be
-    /// read changes nothing: the read says so itself.
-    fn follow_owner(&self, partition: &str) {
+    /// The database a read naming an account of `partition` is sent to, by
+    /// the heads it has just read, where this member's view of the
+    /// partition's owner was read before a move (step 3d; sections 5 and
+    /// 6.4; merge-queue run 45104369464, Elle). A member reads the writer
+    /// groups at its start, every few seconds and on each write handed back
+    /// to it, and a reader is handed none: until its next look, a read
+    /// naming an account went by the view to the partition's source, which
+    /// holds what it closed with until it lets its accounts go, while the
+    /// read's `read_after` had passed on the target's head.
+    ///
+    /// - **One head asked** where the database the view names writes the
+    ///   partition: there.
+    /// - **Every other's** only where that head is a move's pointer, or the
+    ///   database holds nothing of the partition: the written head furthest
+    ///   on, else the view's.
+    /// - **Refused UNAVAILABLE** where a database that may write it cannot
+    ///   be asked within [`crate::postgres::PostgresStore::head_at`]'s
+    ///   bound: never answered from a copy a move let go, nor held for a
+    ///   pool's 30 s by another database's outage (the review of
+    ///   2026-11-23, finding 4).
+    /// - **This read's alone**: the view is never written here (the same
+    ///   review, finding 3). A reader's replicas share it with its own
+    ///   stores, and one behind a move would write the owner before it.
+    ///
+    /// INTERIM(v32): a stop-gap for a view of the owners read on a timer,
+    /// for reads naming an account alone; gone when v32 holds that a read
+    /// with `read_after` is never answered from a copy a move let go, and a
+    /// move during a read is refused or read again.
+    fn follow_owner(&self, partition: &str) -> Result<u32> {
+        let sent = self.of(partition);
         if self.stores.len() == 1 || partition == crate::store::CONTROL_PARTITION {
-            return;
+            return Ok(sent);
         }
-        let sent = self.of(partition) as usize;
-        let mut heads = Vec::with_capacity(self.stores.len());
-        for store in &self.stores {
-            match store.head_at(partition) {
-                Ok(head) => heads.push(head),
-                Err(_) => return,
+        let head = |d: u32| {
+            self.database(d).head_at(partition).map_err(|failed| {
+                StoreError::Unavailable(format!(
+                    "partition {partition}'s head in database {d}, which may write it, could not be read ({failed}): ask again"
+                ))
+            })
+        };
+        if matches!(head(sent)?, Some((at, true)) if at > 0) {
+            return Ok(sent);
+        }
+        let mut furthest: Option<(u64, u32)> = None;
+        for d in (0..self.count()).filter(|d| *d != sent) {
+            if let Some((at, true)) = head(d)? {
+                if at > 0 && furthest.is_none_or(|(held, _)| at > held) {
+                    furthest = Some((at, d));
+                }
             }
         }
-        let (here, written) = heads[sent].unwrap_or((0, true));
-        let further = heads
-            .iter()
-            .enumerate()
-            .any(|(d, head)| d != sent && head.is_some_and(|(there, _)| there > here));
-        if written && !further {
-            return;
-        }
-        // By the head furthest on over every database, into the view this
-        // member's stores share.
-        if self.stores[sent].read_owner(partition).is_ok() {
-            self.route_again(partition);
-        }
+        Ok(furthest.map_or(sent, |(_, d)| d))
     }
 
     /// The partition `account_id` is placed in, else its first.
@@ -435,7 +449,16 @@ impl Spread {
     /// the database its first partition is in.
     fn holding(&self, account_id: &str) -> &Arc<PostgresStore> {
         let partition = self.partition_or_first(account_id);
-        let placed = self.database(self.of(&partition));
+        self.held_from(account_id, self.database(self.of(&partition)))
+    }
+
+    /// `placed`, the database `account_id`'s partition is read in, or the
+    /// one holding the account where that one holds nothing of it.
+    fn held_from<'a>(
+        &'a self,
+        account_id: &str,
+        placed: &'a Arc<PostgresStore>,
+    ) -> &'a Arc<PostgresStore> {
         // Between its move's close and its open across databases, its new
         // database holds nothing of it yet: read where it is held, whole
         // (step 3d; the Elle read of CI 43631481777, an account read as
@@ -469,9 +492,17 @@ impl Spread {
             return read(self.holding(account_id));
         }
         // Its partition moved since this member last read the writer
-        // groups: by its heads, not the view.
-        self.follow_owner(&self.partition_or_first(account_id));
-        let mut store = self.holding(account_id);
+        // groups: by its heads, not the view, for this read alone.
+        let partition = self.partition_or_first(account_id);
+        let routed = self.follow_owner(&partition)?;
+        let of = |named: &str| {
+            if named == partition {
+                routed
+            } else {
+                self.of(named)
+            }
+        };
+        let mut store = self.held_from(account_id, self.database(routed));
         for _ in 0..READ_AGAIN {
             // What a test arms to move the account between the two.
             if let Err(stopped) =
@@ -487,8 +518,8 @@ impl Spread {
             // held nowhere (not yet written): the answer is its own.
             let now = match store.account_row(account_id) {
                 Err(_) => return Ok(answer),
-                Ok(Some(partition)) => {
-                    let placed = self.database(self.of(&partition));
+                Ok(Some(named)) => {
+                    let placed = self.database(of(&named));
                     if Arc::ptr_eq(placed, store)
                         || !matches!(placed.account_row(account_id), Ok(Some(_)))
                     {
@@ -773,9 +804,16 @@ impl Store for Spread {
             return self.home().journal(account_id);
         }
         // Its partition moved since this member last read the writer
-        // groups: by its heads, not the view.
-        self.follow_owner(&self.partition_or_first(account_id));
-        let written = self.written();
+        // groups: by its heads, not the view, for this read alone.
+        let partition = self.partition_or_first(account_id);
+        let routed = self.follow_owner(&partition)? as usize;
+        let mut written = self.written();
+        for (d, partitions) in written.iter_mut().enumerate() {
+            partitions.retain(|held| *held != partition);
+            if d == routed {
+                partitions.push(partition.clone());
+            }
+        }
         let mut entries = Vec::new();
         for (store, partitions) in self.stores.iter().zip(&written) {
             entries.extend(store.journal_written_in(account_id, partitions)?);
