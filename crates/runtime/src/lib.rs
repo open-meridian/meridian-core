@@ -595,6 +595,26 @@ where
     }
 }
 
+/// Blocking start-up work -- a store's, on a thread of its own -- tried until
+/// it succeeds ([`until_it_succeeds`], from [`TRIED_AGAIN_FIRST`] to
+/// [`TRIED_AGAIN_AT_MOST`]): the conductor's comparison of every group with
+/// its latest record (review-core-3c N7). Answers how many tries it took.
+pub async fn blocking_until_it_succeeds<W>(what: &str, work: W) -> u32
+where
+    W: Fn() -> Result<(), String> + Send + Sync + 'static,
+{
+    let work = std::sync::Arc::new(work);
+    until_it_succeeds(what, TRIED_AGAIN_FIRST, TRIED_AGAIN_AT_MOST, || {
+        let work = std::sync::Arc::clone(&work);
+        async move {
+            tokio::task::spawn_blocking(move || work())
+                .await
+                .map_err(|failed| failed.to_string())?
+        }
+    })
+    .await
+}
+
 /// A task a library started, kept to be ended with the component's own.
 pub fn keep(task: tokio::task::JoinHandle<()>) {
     let mut held = BACKGROUND
@@ -1804,6 +1824,31 @@ mod tests {
             *asked.lock().unwrap(),
             [Duration::ZERO, one, one + every, one + every * 2]
         );
+    }
+
+    /// Review-core-3d (N7's residual): the conductor's start-up comparison,
+    /// against a store that fails once and then answers, is tried again
+    /// after the first pause and done.
+    #[tokio::test]
+    async fn blocking_work_against_a_store_that_fails_once_is_tried_again() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let asked = Arc::new(AtomicU32::new(0));
+        let store = Arc::clone(&asked);
+        let tries = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::blocking_until_it_succeeds("the groups could not be compared", move || {
+                if store.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("the store is not answering yet".to_string())
+                } else {
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .expect("done after one pause");
+        assert_eq!(tries, 2);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
     /// Review finding 6, shown both ways: a SIGTERM that lands while

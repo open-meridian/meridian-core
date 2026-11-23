@@ -270,26 +270,14 @@ fn run() -> Result<(), String> {
             // (decisions/031; review-core-3b B); tried again until it is
             // done (review-core-3c N7).
             let comparing = Arc::clone(postgres);
-            meridian_runtime::background(async move {
-                meridian_runtime::until_it_succeeds(
-                    "the groups could not be compared with their records",
-                    std::time::Duration::from_secs(1),
-                    std::time::Duration::from_secs(60),
-                    || {
-                        let comparing = Arc::clone(&comparing);
-                        async move {
-                            tokio::task::spawn_blocking(move || {
-                                comparing
-                                    .backfill_group_records(now_ns())
-                                    .map_err(|failed| failed.to_string())
-                            })
-                            .await
-                            .map_err(|failed| failed.to_string())?
-                        }
-                    },
-                )
-                .await;
-            });
+            meridian_runtime::background(meridian_runtime::blocking_until_it_succeeds(
+                "the groups could not be compared with their records",
+                move || {
+                    comparing
+                        .backfill_group_records(now_ns())
+                        .map_err(|failed| failed.to_string())
+                },
+            ));
             let watched = Arc::clone(postgres);
             let writing = Arc::clone(postgres);
             holding.keep(
