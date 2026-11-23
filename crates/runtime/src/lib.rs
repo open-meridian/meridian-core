@@ -573,6 +573,28 @@ where
     }
 }
 
+/// The pause before work that failed is first tried again, and the most a
+/// pause grows to, for a component's own work in the background
+/// ([`until_it_succeeds`], [`again_every`]).
+pub const TRIED_AGAIN_FIRST: Duration = Duration::from_secs(1);
+pub const TRIED_AGAIN_AT_MOST: Duration = Duration::from_secs(60);
+
+/// `attempt` asked for now and every `every` after, for as long as the
+/// component runs: each ask tried until it succeeds ([`until_it_succeeds`],
+/// from [`TRIED_AGAIN_FIRST`] to [`TRIED_AGAIN_AT_MOST`]), the next `every`
+/// after it did (review-core-3d F1: the dashboard's removals owed, which the
+/// release before goes on making after this release starts).
+pub async fn again_every<F, A>(what: &str, every: Duration, mut attempt: F)
+where
+    F: FnMut() -> A,
+    A: std::future::Future<Output = Result<(), String>>,
+{
+    loop {
+        until_it_succeeds(what, TRIED_AGAIN_FIRST, TRIED_AGAIN_AT_MOST, &mut attempt).await;
+        tokio::time::sleep(every).await;
+    }
+}
+
 /// A task a library started, kept to be ended with the component's own.
 pub fn keep(task: tokio::task::JoinHandle<()>) {
     let mut held = BACKGROUND
@@ -1750,6 +1772,38 @@ mod tests {
         assert_eq!(tries, 5);
         // 1 + 2 + 4 + 4 seconds of pauses.
         assert_eq!(started.elapsed(), Duration::from_secs(11));
+    }
+
+    /// Review-core-3d F1: work asked for again and again is asked now,
+    /// tried again after a failure with the first pause, and asked again
+    /// each period after it succeeded.
+    #[tokio::test(start_paused = true)]
+    async fn work_asked_again_and_again_is_retried_then_asked_each_period() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let started = tokio::time::Instant::now();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let noted = Arc::clone(&asked);
+        let every = Duration::from_secs(15 * 60);
+        let task = tokio::spawn(super::again_every("the work", every, move || {
+            let mut noted = noted.lock().unwrap();
+            noted.push(started.elapsed());
+            let first = noted.len() == 1;
+            async move {
+                if first {
+                    Err("not yet".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+        tokio::time::sleep(Duration::from_secs(1) + every * 2 + Duration::from_millis(1)).await;
+        task.abort();
+        let one = Duration::from_secs(1);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [Duration::ZERO, one, one + every, one + every * 2]
+        );
     }
 
     /// Review finding 6, shown both ways: a SIGTERM that lands while

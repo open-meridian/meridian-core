@@ -106,8 +106,9 @@ pub trait DelegationStore: Send + Sync {
     fn sweep(&self, now_ns: i64) -> Result<(), String>;
     /// Each delegation the release before removed, still serving as the
     /// upgrade ran, with no record of it, given its backfilled removal once
-    /// (review-core-3b B): run once as the dashboard starts, not by the
-    /// sweep (review-core-3c N4). Answers how many.
+    /// (review-core-3b B): asked for as the dashboard starts and every
+    /// [`super::REMOVALS_OWED_EVERY`] after, not by the sweep (review-core-3c
+    /// N4, review-core-3d F1). Answers how many.
     fn removals_owed(&self, now_ns: i64) -> Result<usize, String>;
 
     /// Record one call through the deployment's MCP surface (W6.20,
@@ -1530,13 +1531,16 @@ impl DelegationStore for InPostgres {
     fn removals_owed(&self, now_ns: i64) -> Result<usize, String> {
         // Whose latest record is not its removal and which has no row: what
         // it was, as its last record said; who and when not known. One
-        // statement, in no transaction holding anything else: two replicas
-        // starting at once write each once (removed_once). The release
-        // before is the only source of these, so once as a dashboard starts
-        // finds them; read each minute it scanned every record.
-        let given = self
-            .database
-            .conn()?
+        // statement, in a transaction holding nothing else: two replicas
+        // asking at once write each once (removed_once). It reads every
+        // record, so it runs without the serving session's
+        // statement_timeout (review-core-3d F2), and is asked for at start
+        // and every REMOVALS_OWED_EVERY after, not each minute (review-core-3c
+        // N4, review-core-3d F1).
+        let mut conn = self.database.conn()?;
+        let mut tx = conn.transaction().map_err(said)?;
+        meridian_changes::serving::unbounded(&mut tx).map_err(said)?;
+        let given = tx
             .execute(
                 "INSERT INTO dashboard_delegation_change
                      (delegation_id, subject, client_id, kind, was, became, changed_by,
@@ -1555,6 +1559,7 @@ impl DelegationStore for InPostgres {
                 &[&now_ns, &REMOVED_BY_AN_EARLIER_RELEASE],
             )
             .map_err(said)?;
+        tx.commit().map_err(said)?;
         Ok(given as usize)
     }
 

@@ -373,30 +373,33 @@ pub async fn rewrite_once_records_are_read(
     }
 }
 
+/// How often the removals the release before made with no record are asked
+/// for (review-core-3d F1): it removes them until its last replica stops,
+/// after this release's dashboards have started, so asked only at start
+/// they would stay unrecorded until the next. Each ask reads every record,
+/// so not each minute (review-core-3c N4).
+pub const REMOVALS_OWED_EVERY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// The removals the release before made, still serving as the upgrade ran,
-/// given their records once as the dashboard starts (review-core-3b B,
-/// review-core-3c N4): tried every five seconds until the store answers.
-/// Spawned by the dashboard at start.
-pub async fn removals_owed_once(
-    delegations: Arc<Delegations>,
-    clock: Arc<dyn crate::clock::Clock>,
-) {
-    loop {
-        match delegations.removals_owed(clock.now_ns()).await {
-            Ok(0) => return,
-            Ok(given) => {
-                tracing::info!(
-                    given,
-                    "delegations the release before removed given their removal records"
-                );
-                return;
-            }
-            Err(unavailable) => {
-                tracing::warn!(%unavailable, "the release before's removals were not recorded yet");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
+/// given their records (review-core-3b B): one ask, said where it gave any.
+/// The dashboard asks at start and every [`REMOVALS_OWED_EVERY`] after, each
+/// failed ask tried again with a growing pause
+/// (`meridian_runtime::again_every`).
+pub async fn removals_owed(
+    delegations: &Delegations,
+    clock: &dyn crate::clock::Clock,
+) -> Result<(), String> {
+    let given = delegations
+        .removals_owed(clock.now_ns())
+        .await
+        .map_err(|unavailable| unavailable.to_string())?;
+    if given > 0 {
+        tracing::info!(
+            given,
+            "delegations the release before removed given their removal records"
+        );
     }
+    Ok(())
 }
 
 /// The rows rewrite: every delegation recorded with rows from before v15,

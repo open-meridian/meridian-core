@@ -2547,3 +2547,79 @@ fn a_rewrite_or_a_fill_after_the_expiry_records_the_lapse_first() {
         }
     }
 }
+
+/// Review-core-3d F2: the removals owed read every delegation's records, so
+/// they are given past the serving session's 5 s statement_timeout, in a
+/// transaction of their own: here a login whose every statement is
+/// cancelled after a millisecond, over more history than a millisecond
+/// reads, still gives them.
+#[test]
+fn the_removals_owed_are_given_past_the_serving_statement_timeout() {
+    let (url, database) = migrated("removals_unbounded");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // History: removals long recorded, read with the rest.
+    raw.batch_execute(
+        "INSERT INTO dashboard_delegation_change (delegation_id, subject, client_id, kind, changed_at_ns)
+         SELECT 'DLG-OLD-' || n, 'local|old', 'mdc_old', 'removed', n
+           FROM generate_series(1, 50000) n",
+    )
+    .unwrap();
+    // The release before's sweep: the row removed, no record.
+    raw.execute(
+        "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+        &[&made.id],
+    )
+    .unwrap();
+    let bounded = format!("{url}%20-cstatement_timeout%3D1");
+    let serving = delegation::InPostgres::on(Database::connect(&bounded, 1).unwrap());
+    assert_eq!(
+        serving
+            .removals_owed(T0 + 4)
+            .expect("given past the session's statement_timeout"),
+        1
+    );
+}
+
+/// Review-core-3d F1: the release before keeps removing delegations with no
+/// record until its last replica stops, after a dashboard of this release
+/// has started. The removals owed are asked for again every
+/// REMOVALS_OWED_EVERY, so one made after the first ask is given its record
+/// by the next, once.
+#[test]
+fn a_removal_by_the_release_before_after_the_first_ask_is_given_by_the_next() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("removals_again");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    assert_eq!(
+        store.removals_owed(T0 + 1).unwrap(),
+        0,
+        "none owed at start"
+    );
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .execute(
+            "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+            &[&made.id],
+        )
+        .unwrap();
+    assert_eq!(store.removals_owed(T0 + 2).unwrap(), 1, "the next ask");
+    assert_eq!(store.removals_owed(T0 + 3).unwrap(), 0, "once");
+    assert_eq!(
+        store
+            .changes(&made.id)
+            .unwrap()
+            .iter()
+            .map(|r| (r.kind, r.backfilled))
+            .collect::<Vec<_>>(),
+        [(ChangeKind::Made, false), (ChangeKind::Removed, true)]
+    );
+}
