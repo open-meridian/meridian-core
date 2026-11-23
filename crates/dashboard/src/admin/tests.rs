@@ -23,6 +23,9 @@ use crate::web::{router, SESSION_COOKIE};
 /// A plugin's Settings pages served for a real browser (make e2e-settings-page).
 mod served;
 
+/// The home page served for a real browser, both its views.
+mod home_served;
+
 struct At(i64);
 impl Clock for At {
     fn now_ns(&self) -> i64 {
