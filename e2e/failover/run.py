@@ -6115,6 +6115,55 @@ def driver_lines(path):
 # what refused_between reads the stretches between moves from.
 WINDOWS = []
 
+# The lake's and the book's members, whose logs say why a write was refused:
+# kept before each of the rebalance class's upgrades rolls them, and at a
+# class's first refused write, in one file the job keeps when it fails
+# (.e2e-*.log; never from a stalled runner, whose check run is its channel)
+# and the next run clears (.e2e-said-*.log). PR CI 45225932982: the class
+# rolled every member for two databases before any log was taken, and the
+# book's logs of a refused order were lost with them.
+STORE_MEMBERS = GROUP_COMPONENTS + ("lake-reader", "bor-reader")
+STORE_LOGS = ".e2e-said-stores.log"
+# Each kubectl call's own bound: an API server that does not answer costs
+# the run this per call, never the job's limit.
+STORE_LOGS_TIMEOUT = "20s"
+# The classes whose first refused write's logs are kept.
+STORE_LOGS_KEPT = set()
+
+
+def keep_store_logs(when):
+    """Every lake and book member's logs (`STORE_MEMBERS`, all containers,
+    timestamped, the last SAID_LINES of each), appended to STORE_LOGS under
+    `when`. Each call bounded by STORE_LOGS_TIMEOUT; what is not answered is
+    said in the file."""
+    bound = f"--request-timeout={STORE_LOGS_TIMEOUT}"
+    selector = f"app.kubernetes.io/instance={RELEASE},meridian.dev/component in ({','.join(STORE_MEMBERS)})"
+    listed = kubectl("get", "pods", "-l", selector, "-o", "name", bound, check=False)
+    parts = [f"== {when}, at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+    if listed.returncode != 0:
+        parts.append(f"(the members were not listed: {listed.stderr.decode(errors='replace').strip()})")
+    for name in listed.stdout.decode(errors="replace").split():
+        said = kubectl("logs", name, "--all-containers", "--prefix", "--timestamps", f"--tail={SAID_LINES}",
+                       bound, check=False)
+        parts.append(f"== {name}")
+        parts.append((said.stdout + said.stderr).decode(errors="replace"))
+    with open(STORE_LOGS, "a", encoding="utf-8") as kept:
+        kept.write("\n".join(parts) + "\n")
+    print(f"R: {when}: the lake's and the book's members' logs, kept in {STORE_LOGS}", flush=True)
+
+
+def store_logs_at_first_refusal(failure, what):
+    """The members' logs kept at `failure`'s first refused write, once."""
+    if failure not in STORE_LOGS_KEPT:
+        STORE_LOGS_KEPT.add(failure)
+        keep_store_logs(f"{failure}: the first refused write, {what}")
+
+
+def upgrade_kept(*sets):
+    """An upgrade (`upgrade`), the members' logs kept before it rolls them."""
+    keep_store_logs(f"before the upgrade to {' '.join(sets)}")
+    return upgrade(*sets)
+
 
 def window_held(s, what, began_ms, ended_ms):
     """The driver's writes while a move ran, and through the hold after it
@@ -6146,6 +6195,7 @@ def window_held(s, what, began_ms, ended_ms):
     # Each refusal's whole words, in the job's log and the run's artifact
     # (.e2e-refused.log): the next red names its cause (CI 43626539705).
     if refused:
+        store_logs_at_first_refusal("rebalance", what)
         with open(".e2e-refused.log", "a") as kept:
             kept.write(f"== {what}\n")
             for p in refused:
@@ -6175,6 +6225,7 @@ def refused_between(s, what, windows):
             if said and first <= said[0] <= last and not any(b <= said[0] <= u for b, u in windows):
                 found.append(p)
     if found:
+        store_logs_at_first_refusal("rebalance", f"refused between moves, {what}")
         with open(".e2e-refused.log", "a") as kept:
             kept.write(f"== refused between moves, {what}\n")
             for p in found:
@@ -6466,7 +6517,7 @@ def rebalance(s):
     """The rebalance class (step 3d; section 15), after writer_groups."""
     print("R: rebalance: a range, a partition and an account moved under load", flush=True)
     began = time.time()
-    upgraded = upgrade(f"bor.partitions={BOOK_PARTITIONS}")
+    upgraded = upgrade_kept(f"bor.partitions={BOOK_PARTITIONS}")
     s.check(upgraded.returncode == 0, "rebalance: the book at four partitions")
     # Every workload rolled out before her forward is made: the dashboard's
     # among them, handed the chart's values, which replaces its two copies
@@ -6525,7 +6576,7 @@ def moves(s, dash):
     # upgrade, group 1 writing to it; its partitions moved there by the
     # count's change; then the driver's half, P0 and an account moved from
     # group 0's database to group 1's.
-    upgraded = upgrade("lake.databases=2", "bor.databases=2")
+    upgraded = upgrade_kept("lake.databases=2", "bor.databases=2")
     s.check(upgraded.returncode == 0, "rebalance: the lake and the book at two databases")
     if upgraded.returncode != 0:
         return

@@ -375,6 +375,14 @@ class CommittedBefore(unittest.TestCase):
                 self.assertFalse(ok, what)
 
 
+class Unanswered:
+    """kubectl with no cluster behind it: every call refused."""
+
+    def __call__(self, *args, input=None, check=True, quiet=False):
+        import subprocess
+        return subprocess.CompletedProcess(args, 1, b"", b"no cluster in the self-test")
+
+
 class Driven:
     """The driver's scratch as `driver_lines` reads it: its writes' times
     (`TOOK <kind> <answered ms> <ms taken>`) and its refusals (`REFUSED
@@ -395,7 +403,11 @@ class Driven:
         self.stack.callback(os.chdir, was)
         for patch in (mock.patch.object(run, "driver_lines", lambda path: self.lines.get(path, [])),
                       mock.patch.object(run.time, "sleep", lambda _: None),
-                      mock.patch.object(run, "claim", lambda *_: None)):
+                      mock.patch.object(run, "claim", lambda *_: None),
+                      # No cluster is ever asked: a refusal keeps the
+                      # members' logs, by kubectl, which answers nothing.
+                      mock.patch.object(run, "kubectl", Unanswered()),
+                      mock.patch.object(run, "STORE_LOGS_KEPT", set())):
             self.stack.enter_context(patch)
         return self
 
@@ -464,6 +476,72 @@ class RefusedBetweenMoves(unittest.TestCase):
             "REFUSED order 3 999000 20 status=UNAVAILABLE",
             "REFUSED order 4 1030000 20 status=UNAVAILABLE"])
         self.assertTrue(ok, what)
+
+
+class Members:
+    """kubectl as `keep_store_logs` calls it: the lake's and the book's
+    members listed by name, and each one's logs; every call kept."""
+
+    MEMBERS = ("pod/lake-0", "pod/lake-group-1-0", "pod/bor-0", "pod/bor-group-1-0")
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, input=None, check=True, quiet=False):
+        import subprocess
+        self.calls.append(args)
+        if args[:2] == ("get", "pods"):
+            said = "\n".join(self.MEMBERS)
+        elif args[0] == "logs":
+            said = f"{args[1]} said its lines"
+        else:
+            raise AssertionError(f"kubectl {' '.join(args)} was not expected")
+        return subprocess.CompletedProcess(args, 0, said.encode(), b"")
+
+
+class StoreLogsKept(unittest.TestCase):
+    """PR CI 45225932982: the rebalance class upgraded and rolled every
+    lake and book member for two databases before any log was taken, and
+    the book's logs of the refused order were lost with them."""
+
+    def kept(self, then):
+        """`then()` run with kubectl stood in for: its calls, and the store
+        logs' file as it was left."""
+        members = Members()
+        with Driven(), mock.patch.object(run, "kubectl", members):
+            then()
+            said = open(run.STORE_LOGS).read() if os.path.exists(run.STORE_LOGS) else ""
+        return members.calls, said
+
+    def test_every_member_s_logs_are_kept_each_call_bounded(self):
+        calls, said = self.kept(lambda: run.keep_store_logs("a moment"))
+        listed = next(c for c in calls if c[:2] == ("get", "pods"))
+        for component in ("lake", "bor", "lake-group-1", "bor-group-1"):
+            self.assertIn(component, " ".join(listed))
+        for member in Members.MEMBERS:
+            self.assertIn(f"{member} said its lines", said)
+        self.assertIn("a moment", said)
+        for call in calls:
+            self.assertTrue(any(a.startswith("--request-timeout=") for a in call), call)
+        self.assertTrue(run.STORE_LOGS.startswith(".e2e-"), "the job's failure upload keeps .e2e-*.log")
+
+    def test_a_class_s_first_refused_write_keeps_them_once(self):
+        def refused_twice():
+            refusal = "REFUSED order 9 1000300 20 status=UNAVAILABLE"
+            with mock.patch.object(run, "driver_lines", lambda path: [refusal.split()] if "refused" in path else []):
+                run.window_held(Checks(), "a move", 1_000_000, 1_001_000)
+                run.refused_between(Checks(), "a phase", [(999_000, 999_500), (1_001_000, 1_002_000)])
+        calls, said = self.kept(refused_twice)
+        self.assertEqual(sum(1 for c in calls if c[:2] == ("get", "pods")), 1, calls)
+        self.assertIn("rebalance: the first refused write", said)
+
+    def test_each_upgrade_of_the_class_keeps_them_first(self):
+        order = []
+        with mock.patch.object(run, "keep_store_logs", lambda when: order.append(("kept", when))), \
+                mock.patch.object(run, "upgrade", lambda *sets: order.append(("upgraded", sets))):
+            run.upgrade_kept("lake.databases=2", "bor.databases=2")
+        self.assertEqual([what for what, _ in order], ["kept", "upgraded"], order)
+        self.assertIn("lake.databases=2", order[0][1])
 
 
 if __name__ == "__main__":
