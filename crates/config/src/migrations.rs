@@ -231,7 +231,87 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0034_launch_ran_shared.sql"),
         then: None,
     },
+    Migration {
+        version: 35,
+        name: "each_group_change_its_own_record",
+        sql: include_str!("../migrations/0035_each_group_change_its_own_record.sql"),
+        then: Some(groups_held_when_records_began),
+    },
 ];
+
+/// Migration 35 (decision 47, decisions/031): each user group and account
+/// group standing as it runs given one backfilled record, the group as it
+/// stood, who made it not known, at `at_ns`, the moment it ran. A group given
+/// one already is left as it is, so it runs once.
+fn groups_held_when_records_began(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+    use crate::groups::{
+        described_account_group, described_user_group, GroupChangeKind, GroupKind,
+        HELD_WHEN_RECORDS_BEGAN,
+    };
+    let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
+    let mut held: Vec<(GroupKind, String, String)> = tx
+        .query(
+            "SELECT user_group_id, name, directory_groups, logins FROM config_user_group
+              ORDER BY user_group_id",
+            &[],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| {
+            let group = meridian_domain::v1::UserGroup {
+                user_group_id: row.get(0),
+                name: row.get(1),
+                directory_groups: row.get(2),
+                logins: row.get(3),
+            };
+            (
+                GroupKind::User,
+                group.user_group_id.clone(),
+                described_user_group(&group),
+            )
+        })
+        .collect();
+    held.extend(
+        tx.query(
+            "SELECT account_group_id, name, account_ids, built_in FROM config_account_group
+              ORDER BY account_group_id",
+            &[],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| {
+            let group = meridian_domain::v1::AccountGroup {
+                account_group_id: row.get(0),
+                name: row.get(1),
+                account_ids: row.get(2),
+                built_in: row.get(3),
+            };
+            (
+                GroupKind::Account,
+                group.account_group_id.clone(),
+                described_account_group(&group),
+            )
+        }),
+    );
+    for (group, id, became) in held {
+        tx.execute(
+            "INSERT INTO config_group_change
+                    (group_kind, group_id, kind, became, changed_at_ns, backfilled, note)
+             VALUES ($1, $2, $3, $4, $5, true, $6)
+             ON CONFLICT (group_kind, group_id) WHERE kind = 3 DO NOTHING",
+            &[
+                &group.code(),
+                &id,
+                &GroupChangeKind::HeldWhenRecordsBegan.code(),
+                &became,
+                &at_ns,
+                &HELD_WHEN_RECORDS_BEGAN,
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    Ok(())
+}
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding
 /// `connectivity` the store knows -- reported, or launched -- recorded as

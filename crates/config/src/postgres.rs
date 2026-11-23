@@ -23,6 +23,9 @@ use meridian_domain::v1::{
 use meridian_pb::v1::{PluginDeclaration, RecordMoveRequest, SettingDeclaration, StoredSpan};
 use prost::Message;
 
+use crate::groups::{
+    account_group_change, user_group_change, GroupChangeKind, GroupChangeRecord, GroupKind,
+};
 use crate::migrations;
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
@@ -73,6 +76,7 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
         "config_dataset_licence_change",
         "config_external_account_link",
         "config_fx_pivot_change",
+        "config_group_change",
         "config_hold_change",
         "config_known_plugin",
         "config_licensed_schemes_change",
@@ -327,6 +331,9 @@ impl PostgresStore {
             ],
         )
         .map_err(unavailable)?;
+        if let Some(record) = user_group_change(None, group, author, at_ns) {
+            insert_group_change(&mut tx, &record)?;
+        }
         for permission in permissions {
             insert_permission(&mut tx, permission)?;
             insert_access_change(&mut tx, &permission_change(permission, true, author, at_ns))?;
@@ -869,36 +876,72 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn put_user_group(&self, group: &UserGroup) -> Result<()> {
-        self.conn()?
-            .execute(
-                "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (user_group_id) DO UPDATE
-                    SET name = excluded.name, directory_groups = excluded.directory_groups,
-                        logins = excluded.logins",
-                &[
-                    &group.user_group_id,
-                    &group.name,
-                    &group.directory_groups,
-                    &group.logins,
-                ],
+    fn put_user_group(&self, group: &UserGroup, author: &Author, at_ns: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // The group as it stood, read and held in the transaction that
+        // replaces it, so its record says what it was.
+        let before = tx
+            .query_opt(
+                "SELECT name, directory_groups, logins FROM config_user_group
+                  WHERE user_group_id = $1 FOR UPDATE",
+                &[&group.user_group_id],
             )
-            .map_err(unavailable)?;
-        Ok(())
+            .map_err(unavailable)?
+            .map(|row| UserGroup {
+                user_group_id: group.user_group_id.clone(),
+                name: row.get(0),
+                directory_groups: row.get(1),
+                logins: row.get(2),
+            });
+        tx.execute(
+            "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (user_group_id) DO UPDATE
+                SET name = excluded.name, directory_groups = excluded.directory_groups,
+                    logins = excluded.logins",
+            &[
+                &group.user_group_id,
+                &group.name,
+                &group.directory_groups,
+                &group.logins,
+            ],
+        )
+        .map_err(unavailable)?;
+        if let Some(record) = user_group_change(before.as_ref(), group, author, at_ns) {
+            insert_group_change(&mut tx, &record)?;
+        }
+        tx.commit().map_err(unavailable)
     }
 
-    fn put_account_group(&self, group: &AccountGroup) -> Result<()> {
-        self.conn()?
-            .execute(
-                "INSERT INTO config_account_group (account_group_id, name, account_ids)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (account_group_id) DO UPDATE
-                    SET name = excluded.name, account_ids = excluded.account_ids",
-                &[&group.account_group_id, &group.name, &group.account_ids],
+    fn put_account_group(&self, group: &AccountGroup, author: &Author, at_ns: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let before = tx
+            .query_opt(
+                "SELECT name, account_ids, built_in FROM config_account_group
+                  WHERE account_group_id = $1 FOR UPDATE",
+                &[&group.account_group_id],
             )
-            .map_err(unavailable)?;
-        Ok(())
+            .map_err(unavailable)?
+            .map(|row| AccountGroup {
+                account_group_id: group.account_group_id.clone(),
+                name: row.get(0),
+                account_ids: row.get(1),
+                built_in: row.get(2),
+            });
+        tx.execute(
+            "INSERT INTO config_account_group (account_group_id, name, account_ids)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (account_group_id) DO UPDATE
+                SET name = excluded.name, account_ids = excluded.account_ids",
+            &[&group.account_group_id, &group.name, &group.account_ids],
+        )
+        .map_err(unavailable)?;
+        if let Some(record) = account_group_change(before.as_ref(), group, author, at_ns) {
+            insert_group_change(&mut tx, &record)?;
+        }
+        tx.commit().map_err(unavailable)
     }
 
     fn put_access_group(&self, group: &AccessGroup, author: &Author, at_ns: i64) -> Result<()> {
@@ -1108,6 +1151,39 @@ impl Store for PostgresStore {
                                  WHERE s.directory_groups && g.directory_groups))
               LIMIT 1",
         )
+    }
+
+    fn group_changes(&self, group: GroupKind, group_id: &str) -> Result<Vec<GroupChangeRecord>> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT kind, was, became, changed_by, through_delegation, changed_at_ns,
+                        backfilled, note
+                   FROM config_group_change
+                  WHERE group_kind = $1 AND group_id = $2
+                  ORDER BY change_id",
+                &[&group.code(), &group_id],
+            )
+            .map_err(unavailable)?;
+        rows.iter()
+            .map(|row| {
+                let kind: i16 = row.get(0);
+                Ok(GroupChangeRecord {
+                    group,
+                    group_id: group_id.to_string(),
+                    kind: GroupChangeKind::from_code(kind).ok_or_else(|| {
+                        StoreError::Unavailable(format!("a group change of kind {kind}"))
+                    })?,
+                    was: row.get(1),
+                    became: row.get(2),
+                    by: row.get(3),
+                    delegation: row.get(4),
+                    at_ns: row.get(5),
+                    backfilled: row.get(6),
+                    note: row.get(7),
+                })
+            })
+            .collect()
     }
 
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {
@@ -3333,6 +3409,34 @@ pub(crate) fn read_access_group(
 }
 
 /// One access change's own record (decisions/031).
+/// One user-group or account-group change's record (decision 47).
+fn insert_group_change(
+    client: &mut impl postgres::GenericClient,
+    record: &GroupChangeRecord,
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO config_group_change
+                    (group_kind, group_id, kind, was, became, changed_by, through_delegation,
+                     changed_at_ns, backfilled, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &record.group.code(),
+                &record.group_id,
+                &record.kind.code(),
+                &record.was,
+                &record.became,
+                &record.by,
+                &record.delegation,
+                &record.at_ns,
+                &record.backfilled,
+                &record.note,
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(())
+}
+
 pub(crate) fn insert_access_change(
     client: &mut impl postgres::GenericClient,
     record: &AccessChangeRecord,

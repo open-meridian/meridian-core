@@ -44,7 +44,10 @@ use crate::in_flight::{kind, InFlightStore, Marked};
 use crate::session::token;
 use crate::terminal::{hashed, same, unreserved, url_safe, verifies, Person, Unavailable};
 
+pub mod record;
 mod store;
+pub use record::DelegationChange;
+pub(crate) use store::held_when_records_began;
 pub use store::{CallsOf, DelegationStore, InMemory, InPostgres};
 
 pub const DAY_NS: i64 = 24 * HOUR_NS;
@@ -351,7 +354,7 @@ pub async fn rewrite_once_records_are_read(
 ) {
     loop {
         if let Ok(read) = records.current(clock.now_ns()) {
-            match rewrite_recorded_rows(&delegations, &read).await {
+            match rewrite_recorded_rows(&delegations, &read, clock.now_ns()).await {
                 Ok(0) => {}
                 Ok(rewritten) => tracing::info!(
                     rewritten,
@@ -375,13 +378,14 @@ pub async fn rewrite_once_records_are_read(
 pub async fn rewrite_recorded_rows(
     delegations: &Delegations,
     records: &AccessRecords,
+    now_ns: i64,
 ) -> Result<usize, Unavailable> {
     let mut rewritten = 0;
     for delegation in delegations.narrowed().await? {
         let Some(covers) = rewrite_rows(&delegation.covers, records) else {
             continue;
         };
-        delegations.rewrite(&delegation.id, &covers).await?;
+        delegations.rewrite(&delegation.id, &covers, now_ns).await?;
         tracing::info!(
             delegation = delegation.id,
             subject = delegation.subject,
@@ -1372,10 +1376,19 @@ impl Delegations {
         self.stored(|store| store.narrowed()).await
     }
 
-    /// A delegation's rows as rewritten once to name each plugin's role.
-    pub async fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), Unavailable> {
+    /// A delegation's rows as rewritten once to name each plugin's role, at
+    /// `now_ns`.
+    pub async fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), Unavailable> {
         let (id, covers) = (id.to_string(), covers.clone());
-        self.stored(move |store| store.rewrite(&id, &covers)).await
+        self.stored(move |store| store.rewrite(&id, &covers, now_ns))
+            .await
+    }
+
+    /// Every change recorded for one delegation, in the order recorded
+    /// (decision 47).
+    pub async fn changes(&self, id: &str) -> Result<Vec<DelegationChange>, Unavailable> {
+        let id = id.to_string();
+        self.stored(move |store| store.changes(&id)).await
     }
 
     /// A delegation narrowed before v18, its consented tools filled in once

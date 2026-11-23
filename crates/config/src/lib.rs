@@ -27,6 +27,7 @@
 pub mod archive;
 pub mod connectivity;
 pub mod data;
+pub mod groups;
 pub mod ids;
 pub mod migrations;
 pub mod plugins;

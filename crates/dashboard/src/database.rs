@@ -7,8 +7,9 @@
 //!
 //! - the accounts this deployment holds itself ([`crate::accounts`]), used
 //!   only where the firm has no directory of its own;
-//! - clients, the delegations people make to them, and their tokens by
-//!   fingerprint ([`crate::delegation`], decisions/029), for the same reason;
+//! - clients, the delegations people make to them, their tokens by
+//!   fingerprint, and each delegation change's record ([`crate::delegation`],
+//!   decisions/029, decision 47), for the same reason;
 //! - tickets, their references and notes, notices and each reader's place
 //!   in a person's inbox ([`crate::tickets`], contract v13);
 //! - prepared changes, the admins' levels and a person's own settings
@@ -145,6 +146,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "the_inbox_in_commit_order",
         sql: include_str!("../migrations/0015_the_inbox_in_commit_order.sql"),
         then: None,
+    },
+    Migration {
+        version: 16,
+        name: "each_delegation_change_its_own_record",
+        sql: include_str!("../migrations/0016_each_delegation_change_its_own_record.sql"),
+        then: Some(crate::delegation::held_when_records_began),
     },
 ];
 

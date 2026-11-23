@@ -1285,3 +1285,206 @@ fn a_place_this_release_moved_is_never_read_again_by_the_release_before() {
     assert_eq!(store.cursor("local|ada", "DLG-2").unwrap(), 5);
     assert!(read_before(&mut raw, "DLG-2").is_empty());
 }
+
+// ── Each delegation change, its own record (decision 47) ───────────────────
+
+/// Roadmap v31a item 13 (decisions/031): made, renewed -- the dates and the
+/// covers it replaced kept on the renewal's record, not lost --, revoked one
+/// by one and all of a person's, and removed by the sweep: each its own
+/// record, naming who and when, and the records outlive the delegation.
+#[test]
+fn every_delegation_change_is_its_own_record_and_outlives_the_sweep() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("delegation_changes");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let narrowed = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        account_groups: ["AG-1".to_string()].into(),
+        ..Covers::default()
+    };
+    let made = store
+        .grant(&granting("mdc_a", narrowed, T0 + 30 * DAY_NS), T0)
+        .unwrap();
+    let later = T0 + 20 * DAY_NS;
+    store
+        .grant(
+            &granting("mdc_a", Covers::everything(), later + 90 * DAY_NS),
+            later,
+        )
+        .unwrap();
+    assert!(store
+        .revoke(&made.id, "local|root", "left the desk", later + 1)
+        .unwrap());
+    assert!(
+        !store
+            .revoke(&made.id, "local|root", "again", later + 2)
+            .unwrap(),
+        "revoked already: nothing changed, nothing recorded"
+    );
+    let other = store
+        .grant(
+            &granting("mdc_b", Covers::everything(), later + DAY_NS),
+            later,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .revoke_person("local|ada", "local|root", "left", later + 3)
+            .unwrap(),
+        1
+    );
+
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.at_ns, r.backfilled))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", T0, false),
+            (ChangeKind::Renewed, "local|ada", later, false),
+            (ChangeKind::Revoked, "local|root", later + 1, false),
+        ]
+    );
+    assert!(records
+        .iter()
+        .all(|r| r.subject == "local|ada" && r.client_id == "mdc_a"));
+    assert_eq!(records[0].was, "");
+    assert_eq!(
+        records[0].became,
+        "covers deployment admin no; plugins oms-1 oms read; account groups AG-1; \
+         made 2026-09-26T00:00:00Z; renewed 2026-09-26T00:00:00Z; expires 2026-10-26T00:00:00Z"
+    );
+    assert_eq!(
+        records[1].was, records[0].became,
+        "the renewal keeps what it replaced, the dates among it"
+    );
+    assert_eq!(
+        records[1].became,
+        "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+         renewed 2026-10-16T00:00:00Z; expires 2027-01-14T00:00:00Z"
+    );
+    assert_eq!(records[2].was, records[1].became);
+    assert!(
+        records[2]
+            .became
+            .ends_with("; revoked 2026-10-16T00:00:00Z by local|root: left the desk"),
+        "{}",
+        records[2].became
+    );
+    let others = store.changes(&other.id).unwrap();
+    assert_eq!(
+        others.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked]
+    );
+    assert!(others[1].became.ends_with("by local|root: left"));
+
+    store.sweep(later + 2 * DAY_NS + 31 * DAY_NS).unwrap();
+    assert_eq!(count(&url, "dashboard_delegation"), 0);
+    let records = store.changes(&made.id).unwrap();
+    assert_eq!(records.len(), 4, "every record kept after the sweep");
+    assert_eq!(records[3].kind, ChangeKind::Removed);
+    assert_eq!(records[3].by, "");
+    assert_eq!(records[3].was, records[2].became);
+    assert_eq!(records[3].became, "");
+    assert_eq!(records[3].note, delegation::record::REMOVED);
+}
+
+struct At(i64);
+impl meridian_clock::Clock for At {
+    fn now_ns(&self) -> i64 {
+        self.0
+    }
+}
+
+/// Migration 16 (decision 47, decisions/031): each delegation standing
+/// before it, revoked or not, gets one backfilled record at the moment the
+/// migration ran, saying it as it stood -- its dates, and a revocation's
+/// who and why -- and that the rest is not known; run again, nothing more.
+#[test]
+fn delegations_standing_before_their_records_began_are_backfilled_once() {
+    use delegation::record::{ChangeKind, HELD_WHEN_RECORDS_BEGAN};
+    let url = scratch("delegation_backfill");
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(
+        "CREATE TABLE dashboard_schema_migration (
+             version bigint PRIMARY KEY, name text NOT NULL, applied_at_ns bigint NOT NULL)",
+    )
+    .unwrap();
+    for (version, name, sql) in meridian_dashboard::database::migrations()
+        .into_iter()
+        .filter(|(version, _, _)| *version <= 15)
+    {
+        db.batch_execute(sql).unwrap();
+        db.execute(
+            "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
+             VALUES ($1, $2, 1)",
+            &[&version, &name],
+        )
+        .unwrap();
+    }
+    let renewed = T0 + 20 * DAY_NS;
+    db.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_a', 'meridian on mdc_a', '{}', 'meridian-cli', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+         VALUES ('DLG-LIVE', 'local|ada', 'Ada Park', 'mdc_a', true, $1, $2, $3, $1)",
+        &[&T0, &renewed, &(renewed + 90 * DAY_NS)],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns,
+              revoked_at_ns, revoked_by, revoked_why)
+         VALUES ('DLG-GONE', 'local|ada', 'Ada Park', 'mdc_a', true, $1, $1, $2, $1,
+                 $1, 'local|root', 'left')",
+        &[&T0, &(T0 + DAY_NS)],
+    )
+    .unwrap();
+
+    let database = Database::connect(&url, 2).unwrap();
+    database.migrate(&At(1_000)).unwrap();
+    database
+        .migrate(&At(2_000))
+        .expect("migrating twice is a no-op");
+    let store = delegation::InPostgres::on(database);
+    for (id, became) in [
+        (
+            "DLG-LIVE",
+            "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+             renewed 2026-10-16T00:00:00Z; expires 2027-01-14T00:00:00Z",
+        ),
+        (
+            "DLG-GONE",
+            "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+             renewed 2026-09-26T00:00:00Z; expires 2026-09-27T00:00:00Z; \
+             revoked 2026-09-26T00:00:00Z by local|root: left",
+        ),
+    ] {
+        let records = store.changes(id).unwrap();
+        assert_eq!(records.len(), 1, "{id}: {records:?}");
+        let held = &records[0];
+        assert_eq!(held.kind, ChangeKind::HeldWhenRecordsBegan);
+        assert_eq!(held.became, became);
+        assert_eq!(held.was, "");
+        assert_eq!(held.by, "", "{id}: who made each change is not known");
+        assert!(held.backfilled);
+        assert_eq!(held.at_ns, 1_000, "{id}: the migration's own time");
+        assert_eq!(held.note, HELD_WHEN_RECORDS_BEGAN);
+        assert_eq!(
+            (held.subject.as_str(), held.client_id.as_str()),
+            ("local|ada", "mdc_a")
+        );
+    }
+}

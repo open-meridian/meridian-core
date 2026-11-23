@@ -11,9 +11,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
+use super::record::{
+    change, ChangeKind, ACTING_FILLED, HELD_WHEN_RECORDS_BEGAN, REMOVED, REWRITTEN,
+};
 use super::{
-    Client, Covers, Delegation, Grant, Kind, Revoked, Token, ToolCall, CALLS_KEPT_NS, KEPT_NS,
-    UNCONSENTED_NS,
+    Client, Covers, Delegation, DelegationChange, Grant, Kind, Revoked, Token, ToolCall,
+    CALLS_KEPT_NS, KEPT_NS, UNCONSENTED_NS,
 };
 use crate::database::{said, Database};
 use crate::session::token;
@@ -74,7 +77,12 @@ pub trait DelegationStore: Send + Sync {
 
     /// Replace a delegation's rows with the same rows rewritten to name each
     /// plugin's role (W6.17, contract v15); nothing else about it changes.
-    fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), String>;
+    fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), String>;
+
+    /// Every change recorded for one delegation, its backfilled record
+    /// included, in the order recorded (decision 47); kept after the
+    /// delegation itself is swept.
+    fn changes(&self, id: &str) -> Result<Vec<DelegationChange>, String>;
 
     fn groups_read(&self, id: &str, groups: &[String], now_ns: i64) -> Result<(), String>;
 
@@ -124,6 +132,9 @@ struct Kept {
     delegations: HashMap<String, Delegation>,
     tokens: HashMap<String, Token>,
     calls: Vec<ToolCall>,
+    /// Each delegation change's own record (decision 47), kept after the
+    /// delegation is swept.
+    changes: Vec<DelegationChange>,
 }
 
 impl Kept {
@@ -139,11 +150,21 @@ impl Kept {
     fn revoke(&mut self, id: &str, by: &str, why: &str, now_ns: i64) -> bool {
         match self.delegations.get_mut(id) {
             Some(delegation) if delegation.revoked.is_none() => {
+                let before = delegation.clone();
                 delegation.revoked = Some(Revoked {
                     at_ns: now_ns,
                     by: by.to_string(),
                     why: why.to_string(),
                 });
+                let after = delegation.clone();
+                self.changes.push(change(
+                    ChangeKind::Revoked,
+                    Some(&before),
+                    Some(&after),
+                    by,
+                    now_ns,
+                    "",
+                ));
                 true
             }
             _ => false,
@@ -213,6 +234,7 @@ impl DelegationStore for InMemory {
             Some(id) => {
                 kept.tokens.retain(|_, t| t.delegation_id != id);
                 let delegation = kept.delegations.get_mut(&id).expect("found above");
+                let before = delegation.clone();
                 delegation.display_name = grant.display_name.clone();
                 delegation.covers = grant.covers.clone();
                 delegation.renewed_at_ns = now_ns;
@@ -220,7 +242,16 @@ impl DelegationStore for InMemory {
                 delegation.directory_groups = grant.directory_groups.clone();
                 delegation.groups_read_at_ns = now_ns;
                 delegation.acting_backfilled_at_ns = None;
-                delegation.clone()
+                let after = delegation.clone();
+                kept.changes.push(change(
+                    ChangeKind::Renewed,
+                    Some(&before),
+                    Some(&after),
+                    &grant.subject,
+                    now_ns,
+                    "",
+                ));
+                after
             }
             None => {
                 let delegation = Delegation {
@@ -242,6 +273,14 @@ impl DelegationStore for InMemory {
                 };
                 kept.delegations
                     .insert(delegation.id.clone(), delegation.clone());
+                kept.changes.push(change(
+                    ChangeKind::Made,
+                    None,
+                    Some(&delegation),
+                    &grant.subject,
+                    now_ns,
+                    "",
+                ));
                 delegation
             }
         };
@@ -344,10 +383,21 @@ impl DelegationStore for InMemory {
     }
 
     fn backfill_acting(&self, id: &str, acting: &[String], now_ns: i64) -> Result<(), String> {
-        if let Some(delegation) = self.lock().delegations.get_mut(id) {
+        let mut kept = self.lock();
+        if let Some(delegation) = kept.delegations.get_mut(id) {
             if delegation.covers.acting.is_none() && !delegation.covers.everything {
+                let before = delegation.clone();
                 delegation.covers.acting = Some(acting.iter().cloned().collect());
                 delegation.acting_backfilled_at_ns = Some(now_ns);
+                let after = delegation.clone();
+                kept.changes.push(change(
+                    ChangeKind::ActingFilled,
+                    Some(&before),
+                    Some(&after),
+                    "",
+                    now_ns,
+                    ACTING_FILLED,
+                ));
             }
         }
         Ok(())
@@ -365,10 +415,33 @@ impl DelegationStore for InMemory {
         Ok(narrowed)
     }
 
-    fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), String> {
-        if let Some(delegation) = self.lock().delegations.get_mut(id) {
+    fn changes(&self, id: &str) -> Result<Vec<DelegationChange>, String> {
+        Ok(self
+            .lock()
+            .changes
+            .iter()
+            .filter(|change| change.delegation_id == id)
+            .cloned()
+            .collect())
+    }
+
+    fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), String> {
+        let mut kept = self.lock();
+        if let Some(delegation) = kept.delegations.get_mut(id) {
+            let before = delegation.clone();
             delegation.covers.plugins = covers.plugins.clone();
             delegation.covers.unmatched = covers.unmatched.clone();
+            let after = delegation.clone();
+            if before != after {
+                kept.changes.push(change(
+                    ChangeKind::Rewritten,
+                    Some(&before),
+                    Some(&after),
+                    "",
+                    now_ns,
+                    REWRITTEN,
+                ));
+            }
         }
         Ok(())
     }
@@ -398,15 +471,31 @@ impl DelegationStore for InMemory {
         let mut kept = self.lock();
         kept.tokens
             .retain(|_, t| now_ns <= t.expires_at_ns + TOKEN_KEPT_NS);
-        kept.delegations.retain(|_, d| {
-            let ended = d
-                .revoked
+        let ended = |d: &Delegation| {
+            d.revoked
                 .as_ref()
                 .map(|r| r.at_ns)
                 .unwrap_or(d.expires_at_ns)
-                .min(d.expires_at_ns);
-            now_ns <= ended + KEPT_NS
-        });
+                .min(d.expires_at_ns)
+        };
+        let mut removed: Vec<Delegation> = kept
+            .delegations
+            .values()
+            .filter(|d| now_ns > ended(d) + KEPT_NS)
+            .cloned()
+            .collect();
+        removed.sort_by(|a, b| a.id.cmp(&b.id));
+        for gone in &removed {
+            kept.delegations.remove(&gone.id);
+            kept.changes.push(change(
+                ChangeKind::Removed,
+                Some(gone),
+                None,
+                "",
+                now_ns,
+                REMOVED,
+            ));
+        }
         let delegations: BTreeSet<String> = kept.delegations.keys().cloned().collect();
         kept.tokens
             .retain(|_, t| delegations.contains(&t.delegation_id));
@@ -573,7 +662,128 @@ fn token_of(row: &postgres::Row) -> Token {
     }
 }
 
+/// One delegation change's record (decision 47), in the transaction that
+/// made the change.
+fn record(
+    conn: &mut impl postgres::GenericClient,
+    change: &DelegationChange,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO dashboard_delegation_change
+             (delegation_id, subject, client_id, kind, was, became, changed_by, changed_at_ns,
+              backfilled, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        &[
+            &change.delegation_id,
+            &change.subject,
+            &change.client_id,
+            &change.kind.name(),
+            &change.was,
+            &change.became,
+            &change.by,
+            &change.at_ns,
+            &change.backfilled,
+            &change.note,
+        ],
+    )
+    .map_err(said)?;
+    Ok(())
+}
+
+/// Migration 16's records (decision 47, decisions/031): each delegation
+/// standing as it runs, revoked or not, said as it stood at `at_ns`, the
+/// moment it ran, backfilled; one given one already is left, so it runs
+/// once.
+pub(crate) fn held_when_records_began(
+    tx: &mut postgres::Transaction<'_>,
+    at_ns: i64,
+) -> Result<(), String> {
+    let standing = tx
+        .query(
+            &format!(
+                "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
+                   JOIN dashboard_oauth_client c USING (client_id)
+                  WHERE NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
+                                     WHERE r.delegation_id = d.delegation_id
+                                       AND r.kind = 'held_when_records_began')
+                  ORDER BY d.delegation_id"
+            ),
+            &[],
+        )
+        .map_err(said)?;
+    for row in &standing {
+        let delegation = delegation_of(row);
+        record(
+            tx,
+            &DelegationChange {
+                backfilled: true,
+                ..change(
+                    ChangeKind::HeldWhenRecordsBegan,
+                    None,
+                    Some(&delegation),
+                    "",
+                    at_ns,
+                    HELD_WHEN_RECORDS_BEGAN,
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
 impl InPostgres {
+    /// One delegation, its row held until the transaction ends, so the
+    /// record of a change to it says what it was.
+    fn held(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<Option<Delegation>, String> {
+        Ok(tx
+            .query_opt(
+                &format!(
+                    "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
+                       JOIN dashboard_oauth_client c USING (client_id)
+                      WHERE d.delegation_id = $1
+                        FOR UPDATE OF d"
+                ),
+                &[&id],
+            )
+            .map_err(said)?
+            .as_ref()
+            .map(delegation_of))
+    }
+
+    /// Revoke one delegation in `tx` if it is not already, and record it:
+    /// true when this revoked it.
+    fn revoke_held(
+        tx: &mut postgres::Transaction<'_>,
+        id: &str,
+        by: &str,
+        why: &str,
+        now_ns: i64,
+    ) -> Result<bool, String> {
+        let Some(before) = Self::held(tx, id)?.filter(|d| d.revoked.is_none()) else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE dashboard_delegation
+                SET revoked_at_ns = $2, revoked_by = $3, revoked_why = $4
+              WHERE delegation_id = $1 AND revoked_at_ns IS NULL",
+            &[&id, &now_ns, &by, &why],
+        )
+        .map_err(said)?;
+        let after = Self::find(tx, id)?.ok_or("the delegation just revoked is gone")?;
+        record(
+            tx,
+            &change(
+                ChangeKind::Revoked,
+                Some(&before),
+                Some(&after),
+                by,
+                now_ns,
+                "",
+            ),
+        )?;
+        Ok(true)
+    }
+
     fn find(
         conn: &mut impl postgres::GenericClient,
         id: &str,
@@ -665,6 +875,27 @@ impl DelegationStore for InPostgres {
         if consented == 0 {
             return Err(format!("no client {}", grant.client_id));
         }
+        // One consent of this person's to this client at a time, so the
+        // standing one read here is the one the statement below renews, or
+        // there is none and it makes one (decision 47: its record says
+        // which, and what it replaced).
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('dashboard_delegation:' || $1 || ' ' || $2))",
+            &[&grant.subject, &grant.client_id],
+        )
+        .map_err(said)?;
+        let standing: Option<String> = tx
+            .query_opt(
+                "SELECT delegation_id FROM dashboard_delegation
+                  WHERE subject = $1 AND client_id = $2 AND revoked_at_ns IS NULL",
+                &[&grant.subject, &grant.client_id],
+            )
+            .map_err(said)?
+            .map(|row| row.get(0));
+        let before = match &standing {
+            Some(id) => Self::held(&mut tx, id)?,
+            None => None,
+        };
         let plugins = plugins_of(&grant.covers);
         let groups: Vec<String> = grant.covers.account_groups.iter().cloned().collect();
         let acting: Option<Vec<String>> = grant
@@ -723,6 +954,22 @@ impl DelegationStore for InPostgres {
         )
         .map_err(said)?;
         let delegation = Self::find(&mut tx, &id)?.ok_or("the delegation just made is gone")?;
+        let before = before.filter(|before| before.id == delegation.id);
+        let kind = match before {
+            Some(_) => ChangeKind::Renewed,
+            None => ChangeKind::Made,
+        };
+        record(
+            &mut tx,
+            &change(
+                kind,
+                before.as_ref(),
+                Some(&delegation),
+                &grant.subject,
+                now_ns,
+                "",
+            ),
+        )?;
         tx.commit().map_err(said)?;
         Ok(delegation)
     }
@@ -782,17 +1029,11 @@ impl DelegationStore for InPostgres {
     }
 
     fn revoke(&self, id: &str, by: &str, why: &str, now_ns: i64) -> Result<bool, String> {
-        let revoked = self
-            .database
-            .conn()?
-            .execute(
-                "UPDATE dashboard_delegation
-                    SET revoked_at_ns = $2, revoked_by = $3, revoked_why = $4
-                  WHERE delegation_id = $1 AND revoked_at_ns IS NULL",
-                &[&id, &now_ns, &by, &why],
-            )
-            .map_err(said)?;
-        Ok(revoked == 1)
+        let mut conn = self.database.conn()?;
+        let mut tx = conn.transaction().map_err(said)?;
+        let revoked = Self::revoke_held(&mut tx, id, by, why, now_ns)?;
+        tx.commit().map_err(said)?;
+        Ok(revoked)
     }
 
     fn revoke_person(
@@ -802,17 +1043,26 @@ impl DelegationStore for InPostgres {
         why: &str,
         now_ns: i64,
     ) -> Result<usize, String> {
-        let revoked = self
-            .database
-            .conn()?
-            .execute(
-                "UPDATE dashboard_delegation
-                    SET revoked_at_ns = $2, revoked_by = $3, revoked_why = $4
-                  WHERE subject = $1 AND revoked_at_ns IS NULL",
-                &[&subject, &now_ns, &by, &why],
+        let mut conn = self.database.conn()?;
+        let mut tx = conn.transaction().map_err(said)?;
+        let theirs: Vec<String> = tx
+            .query(
+                "SELECT delegation_id FROM dashboard_delegation
+                  WHERE subject = $1 AND revoked_at_ns IS NULL ORDER BY delegation_id",
+                &[&subject],
             )
-            .map_err(said)?;
-        Ok(revoked as usize)
+            .map_err(said)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let mut revoked = 0;
+        for id in &theirs {
+            if Self::revoke_held(&mut tx, id, by, why, now_ns)? {
+                revoked += 1;
+            }
+        }
+        tx.commit().map_err(said)?;
+        Ok(revoked)
     }
 
     fn of_person(&self, subject: &str, now_ns: i64) -> Result<Vec<Delegation>, String> {
@@ -881,15 +1131,31 @@ impl DelegationStore for InPostgres {
     }
 
     fn backfill_acting(&self, id: &str, acting: &[String], now_ns: i64) -> Result<(), String> {
-        self.database
-            .conn()?
+        let mut conn = self.database.conn()?;
+        let mut tx = conn.transaction().map_err(said)?;
+        let before = Self::held(&mut tx, id)?;
+        let filled = tx
             .execute(
                 "UPDATE dashboard_delegation SET covers_acting = $2, acting_backfilled_at_ns = $3
                   WHERE delegation_id = $1 AND covers_acting IS NULL AND NOT covers_everything",
                 &[&id, &acting, &now_ns],
             )
             .map_err(said)?;
-        Ok(())
+        if filled == 1 {
+            let after = Self::find(&mut tx, id)?.ok_or("the delegation just filled is gone")?;
+            record(
+                &mut tx,
+                &change(
+                    ChangeKind::ActingFilled,
+                    before.as_ref(),
+                    Some(&after),
+                    "",
+                    now_ns,
+                    ACTING_FILLED,
+                ),
+            )?;
+        }
+        tx.commit().map_err(said)
     }
 
     fn narrowed(&self) -> Result<Vec<Delegation>, String> {
@@ -909,15 +1175,64 @@ impl DelegationStore for InPostgres {
         Ok(rows.iter().map(delegation_of).collect())
     }
 
-    fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), String> {
-        self.database
+    fn changes(&self, id: &str) -> Result<Vec<DelegationChange>, String> {
+        let rows = self
+            .database
             .conn()?
-            .execute(
-                "UPDATE dashboard_delegation SET covers_plugins = $2 WHERE delegation_id = $1",
-                &[&id, &plugins_of(covers)],
+            .query(
+                "SELECT delegation_id, subject, client_id, kind, was, became, changed_by,
+                        changed_at_ns, backfilled, note
+                   FROM dashboard_delegation_change
+                  WHERE delegation_id = $1 ORDER BY change_id",
+                &[&id],
             )
             .map_err(said)?;
-        Ok(())
+        rows.iter()
+            .map(|row| {
+                let kind: String = row.get(3);
+                Ok(DelegationChange {
+                    delegation_id: row.get(0),
+                    subject: row.get(1),
+                    client_id: row.get(2),
+                    kind: ChangeKind::from_name(&kind)
+                        .ok_or_else(|| format!("a delegation change of kind {kind}"))?,
+                    was: row.get(4),
+                    became: row.get(5),
+                    by: row.get(6),
+                    at_ns: row.get(7),
+                    backfilled: row.get(8),
+                    note: row.get(9),
+                })
+            })
+            .collect()
+    }
+
+    fn rewrite(&self, id: &str, covers: &Covers, now_ns: i64) -> Result<(), String> {
+        let mut conn = self.database.conn()?;
+        let mut tx = conn.transaction().map_err(said)?;
+        let Some(before) = Self::held(&mut tx, id)? else {
+            return Ok(());
+        };
+        tx.execute(
+            "UPDATE dashboard_delegation SET covers_plugins = $2 WHERE delegation_id = $1",
+            &[&id, &plugins_of(covers)],
+        )
+        .map_err(said)?;
+        let after = Self::find(&mut tx, id)?.ok_or("the delegation just rewritten is gone")?;
+        if after != before {
+            record(
+                &mut tx,
+                &change(
+                    ChangeKind::Rewritten,
+                    Some(&before),
+                    Some(&after),
+                    "",
+                    now_ns,
+                    REWRITTEN,
+                ),
+            )?;
+        }
+        tx.commit().map_err(said)
     }
 
     fn groups_read(&self, id: &str, groups: &[String], now_ns: i64) -> Result<(), String> {
@@ -951,13 +1266,34 @@ impl DelegationStore for InPostgres {
             &[&now_ns, &TOKEN_KEPT_NS],
         )
         .map_err(said)?;
-        conn.execute(
-            "DELETE FROM dashboard_delegation
-              WHERE least(coalesce(revoked_at_ns, expires_at_ns), expires_at_ns) + $2::bigint
-                    < $1::bigint",
-            &[&now_ns, &KEPT_NS],
-        )
-        .map_err(said)?;
+        // Each delegation removed, its record written with the removal.
+        let mut tx = conn.transaction().map_err(said)?;
+        let ended = tx
+            .query(
+                &format!(
+                    "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
+                       JOIN dashboard_oauth_client c USING (client_id)
+                      WHERE least(coalesce(d.revoked_at_ns, d.expires_at_ns), d.expires_at_ns)
+                            + $2::bigint < $1::bigint
+                      ORDER BY d.delegation_id
+                        FOR UPDATE OF d"
+                ),
+                &[&now_ns, &KEPT_NS],
+            )
+            .map_err(said)?;
+        for row in &ended {
+            let gone = delegation_of(row);
+            tx.execute(
+                "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+                &[&gone.id],
+            )
+            .map_err(said)?;
+            record(
+                &mut tx,
+                &change(ChangeKind::Removed, Some(&gone), None, "", now_ns, REMOVED),
+            )?;
+        }
+        tx.commit().map_err(said)?;
         conn.execute(
             "DELETE FROM dashboard_oauth_client
               WHERE NOT consented AND registered_at_ns + $2::bigint < $1::bigint",

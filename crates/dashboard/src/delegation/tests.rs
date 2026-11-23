@@ -673,6 +673,91 @@ async fn registrations_are_capped_making_room_from_the_oldest_unconsented() {
     );
 }
 
+/// Decision 47 (roadmap v31a item 13): in memory as in Postgres, each change
+/// to a delegation is its own record -- made, renewed with what it replaced,
+/// its rows rewritten and its tools filled in by an upgrade, revoked, and
+/// removed by the sweep -- and the records outlive it.
+#[tokio::test]
+async fn every_delegation_change_is_its_own_record_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    store
+        .register(
+            &Client {
+                client_id: "mdc_a".into(),
+                name: "client a".into(),
+                redirect_uris: vec![BACK.into()],
+                software_id: String::new(),
+                registered_at_ns: T0,
+                consented: false,
+            },
+            10,
+        )
+        .unwrap();
+    let grant = |covers: Covers, until: i64| Grant {
+        subject: "local|ada".into(),
+        display_name: "Ada Park".into(),
+        client_id: "mdc_a".into(),
+        covers,
+        directory_groups: vec![],
+        expires_at_ns: until,
+    };
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let made = store.grant(&grant(old_rows, T0 + DAY_NS), T0).unwrap();
+    let renewed_at = T0 + 1_000;
+    store
+        .grant(&grant(made.covers.clone(), T0 + 2 * DAY_NS), renewed_at)
+        .unwrap();
+    let rewritten = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    store.rewrite(&made.id, &rewritten, T0 + 2_000).unwrap();
+    store
+        .backfill_acting(&made.id, &["place_order".to_string()], T0 + 3_000)
+        .unwrap();
+    store
+        .backfill_acting(&made.id, &["place_order".to_string()], T0 + 3_500)
+        .unwrap();
+    assert!(store
+        .revoke(&made.id, "local|ada", "done", T0 + 4_000)
+        .unwrap());
+    store.sweep(T0 + 2 * DAY_NS + KEPT_NS + 1).unwrap();
+    assert!(store.delegation(&made.id).unwrap().is_none());
+
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (Made, "local|ada", T0),
+            (Renewed, "local|ada", renewed_at),
+            (Rewritten, "", T0 + 2_000),
+            (ActingFilled, "", T0 + 3_000),
+            (Revoked, "local|ada", T0 + 4_000),
+            (Removed, "", T0 + 2 * DAY_NS + KEPT_NS + 1),
+        ]
+    );
+    assert!(records[1].was.contains("expires 2026-09-27T00:00:00Z"));
+    assert!(records[1].became.contains("expires 2026-09-28T00:00:00Z"));
+    assert!(records[2].was.contains("oms-1 read (unmatched)"));
+    assert!(records[2].became.contains("plugins oms-1 oms read"));
+    assert!(records[3].became.contains("acting place_order"));
+    for pair in records.windows(2) {
+        assert_eq!(
+            pair[1].was, pair[0].became,
+            "{:?} follows {:?}",
+            pair[1].kind, pair[0].kind
+        );
+    }
+}
+
 // ── Narrowing ────────────────────────────────────────────────────────────
 
 fn records() -> AccessRecords {

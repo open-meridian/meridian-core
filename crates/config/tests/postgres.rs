@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use meridian_changes::scratch::Scratch;
 use meridian_config::store::{
-    ChangeKind, Ending, Held, KnownPlugin, SettingChange, SettingsAuthor, Store, Withdrawal,
+    Author, ChangeKind, Ending, Held, KnownPlugin, SettingChange, SettingsAuthor, Store, Withdrawal,
 };
 use meridian_config::{PostgresStore, SettingsKey, DEPLOYMENT_ADMIN};
 use meridian_domain::v1::{
@@ -130,14 +130,16 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
         })
         .unwrap();
     let group = user_group("UG-1", "ada");
-    store.put_user_group(&group).unwrap();
+    store.put_user_group(&group, &Author::default(), 1).unwrap();
     let accounts = AccountGroup {
         account_group_id: "AG-1".into(),
         name: "Growth".into(),
         account_ids: vec!["ACC-1".into()],
         built_in: false,
     };
-    store.put_account_group(&accounts).unwrap();
+    store
+        .put_account_group(&accounts, &Author::default(), 1)
+        .unwrap();
     let access = AccessGroup {
         access_group_id: "AX-1".into(),
         name: "Trading".into(),
@@ -251,14 +253,20 @@ fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
 #[test]
 fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
     let (_schema, store) = store_at("shape");
-    store.put_user_group(&user_group("UG-1", "ada")).unwrap();
     store
-        .put_account_group(&AccountGroup {
-            account_group_id: "AG-1".into(),
-            name: "g".into(),
-            account_ids: vec![],
-            built_in: false,
-        })
+        .put_user_group(&user_group("UG-1", "ada"), &Author::default(), 1)
+        .unwrap();
+    store
+        .put_account_group(
+            &AccountGroup {
+                account_group_id: "AG-1".into(),
+                name: "g".into(),
+                account_ids: vec![],
+                built_in: false,
+            },
+            &Author::default(),
+            1,
+        )
         .unwrap();
     let with_accounts = Permission {
         account_group_id: "AG-1".into(),
@@ -392,7 +400,7 @@ fn two_concurrent_withdrawals_cannot_leave_no_admin() {
     let store = Arc::new(store);
     for n in 0..2 {
         let group = user_group(&format!("UG-{n}"), &format!("person-{n}"));
-        store.put_user_group(&group).unwrap();
+        store.put_user_group(&group, &Author::default(), 1).unwrap();
         store
             .add_permission(
                 &admin_permission(&format!("PRM-{n}"), &group.user_group_id),
@@ -1602,12 +1610,16 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
     // Its level column takes admin now, and either built-in access group
     // still names no account group, whoever writes it.
     store
-        .put_account_group(&AccountGroup {
-            account_group_id: "AG-1".into(),
-            name: "g".into(),
-            account_ids: vec![],
-            built_in: false,
-        })
+        .put_account_group(
+            &AccountGroup {
+                account_group_id: "AG-1".into(),
+                name: "g".into(),
+                account_ids: vec![],
+                built_in: false,
+            },
+            &Author::default(),
+            1,
+        )
         .unwrap();
     let naming = Permission {
         permission_id: "PRM-2".into(),
@@ -2797,7 +2809,11 @@ fn a_follower_that_reloaded_and_is_given_the_log_in_any_page_split_builds_the_st
             })
             .unwrap();
         store
-            .put_user_group(&user_group(&format!("UG-{n}"), "ada"))
+            .put_user_group(
+                &user_group(&format!("UG-{n}"), "ada"),
+                &Author::default(),
+                1,
+            )
             .unwrap();
     }
     let followed = meridian_config::postgres::CHANGES
@@ -3286,4 +3302,186 @@ fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded_in_postgres() {
 fn the_storage_copy_is_recorded_once_in_postgres() {
     let (_schema, store) = store_with_version("storage_copied");
     a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(&store);
+}
+
+/// Decision 47 (roadmap v31a item 13, decisions/031): each user-group and
+/// account-group change is its own record in the store, written with the
+/// change, and kept when the group changes again.
+#[test]
+fn each_user_group_and_account_group_change_is_its_own_record() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind};
+    let (_schema, store) = store_at("group_changes");
+    let ada = Author {
+        by: "local|ada".into(),
+        delegation: "DLG-7".into(),
+        ..Author::default()
+    };
+    let mut group = user_group("UG-1", "ada");
+    store.put_user_group(&group, &ada, 10).unwrap();
+    group.logins.push("grace".into());
+    store.put_user_group(&group, &ada, 20).unwrap();
+    store
+        .put_user_group(&group, &ada, 30)
+        .expect("saved unchanged");
+    let records = store.group_changes(GroupKind::User, "UG-1").unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| {
+            (
+                r.kind,
+                r.by.as_str(),
+                r.delegation.as_str(),
+                r.at_ns,
+                r.backfilled,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (GroupChangeKind::Defined, "local|ada", "DLG-7", 10, false),
+            (GroupChangeKind::Changed, "local|ada", "DLG-7", 20, false),
+        ]
+    );
+    assert_eq!(records[0].was, "");
+    assert_eq!(
+        records[0].became,
+        "\"UG-1\": directory groups desk; logins ada"
+    );
+    assert_eq!(records[1].was, records[0].became);
+    assert_eq!(
+        records[1].became,
+        "\"UG-1\": directory groups desk; logins ada, grace"
+    );
+
+    let mut accounts = AccountGroup {
+        account_group_id: "AG-1".into(),
+        name: "Growth".into(),
+        account_ids: vec!["ACC-1".into()],
+        built_in: false,
+    };
+    store.put_account_group(&accounts, &ada, 40).unwrap();
+    accounts.account_ids.clear();
+    store.put_account_group(&accounts, &ada, 50).unwrap();
+    let records = store.group_changes(GroupKind::Account, "AG-1").unwrap();
+    let said: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.was.as_str(), r.became.as_str(), r.at_ns))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (
+                GroupChangeKind::Defined,
+                "",
+                "\"Growth\": accounts ACC-1",
+                40
+            ),
+            (
+                GroupChangeKind::Changed,
+                "\"Growth\": accounts ACC-1",
+                "\"Growth\": accounts none",
+                50
+            ),
+        ]
+    );
+    assert!(store
+        .group_changes(GroupKind::User, "AG-1")
+        .unwrap()
+        .is_empty());
+}
+
+/// Migration 35 (decision 47, decisions/031): each user group and account
+/// group standing before it gets one backfilled record, at the moment the
+/// migration ran, saying it as it stood and that who made it is not known;
+/// run again, nothing more; a change since is recorded from what it held.
+#[test]
+fn groups_standing_before_their_records_began_are_backfilled_once() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind, HELD_WHEN_RECORDS_BEGAN};
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("config_group_backfill_{seq}_{}", unique());
+    let url = Scratch::schema(&base_url(), &name);
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 34)
+    {
+        db.batch_execute(migration.sql).unwrap();
+        db.execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+            &[&migration.version, &migration.name],
+        )
+        .unwrap();
+    }
+    db.batch_execute(
+        "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+         VALUES ('UG-1', 'Admins', '{admins}', '{ada}');
+         INSERT INTO config_account_group (account_group_id, name, account_ids)
+         VALUES ('AG-1', 'Growth', '{ACC-1,ACC-2}');",
+    )
+    .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&At(1_000)).unwrap();
+    store
+        .migrate(&At(2_000))
+        .expect("migrating twice is a no-op");
+
+    for (group, id, became) in [
+        (
+            GroupKind::User,
+            "UG-1",
+            "\"Admins\": directory groups admins; logins ada",
+        ),
+        (
+            GroupKind::Account,
+            "AG-1",
+            "\"Growth\": accounts ACC-1, ACC-2",
+        ),
+        (
+            GroupKind::Account,
+            "all-accounts",
+            "\"All accounts\": every account (built in)",
+        ),
+    ] {
+        let records = store.group_changes(group, id).unwrap();
+        assert_eq!(records.len(), 1, "{id}: {records:?}");
+        let held = &records[0];
+        assert_eq!(held.kind, GroupChangeKind::HeldWhenRecordsBegan, "{id}");
+        assert_eq!(held.became, became);
+        assert_eq!(held.was, "");
+        assert_eq!(held.by, "", "{id}: who made it is not known");
+        assert!(held.backfilled, "{id}");
+        assert_eq!(held.at_ns, 1_000, "{id}: the migration's own time");
+        assert_eq!(held.note, HELD_WHEN_RECORDS_BEGAN);
+    }
+
+    // A change since: recorded whole, from what the group held.
+    let ada = Author {
+        by: "local|ada".into(),
+        ..Author::default()
+    };
+    store
+        .put_user_group(
+            &UserGroup {
+                user_group_id: "UG-1".into(),
+                name: "Admins".into(),
+                directory_groups: vec!["admins".into()],
+                logins: vec![],
+            },
+            &ada,
+            3_000,
+        )
+        .unwrap();
+    let records = store.group_changes(GroupKind::User, "UG-1").unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].kind, GroupChangeKind::Changed);
+    assert_eq!(records[1].was, records[0].became);
+    assert_eq!(
+        records[1].became,
+        "\"Admins\": directory groups admins; logins none"
+    );
+    assert!(!records[1].backfilled);
 }
