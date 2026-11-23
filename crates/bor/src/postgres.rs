@@ -4149,6 +4149,22 @@ impl PostgresStore {
         tip_of(&mut *conn, partition)
     }
 
+    /// This database's head of `partition`: its sequence, and whether it is
+    /// written here -- never a move's pointer, where a move let it go
+    /// (its epoch `POINTER_EPOCH`); none where it holds no head of it. The
+    /// head row alone, for a read that asks before every answer
+    /// ([`crate::spread::Spread`]).
+    pub fn head_at(&self, partition: &str) -> Result<Option<(u64, bool)>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT sequence, epoch <> -1 FROM book_partition_head WHERE partition = $1",
+                &[&partition],
+            )
+            .map_err(unavailable)?
+            .map(|row| (row.get::<_, i64>(0).max(0) as u64, row.get(1))))
+    }
+
     /// The accounts this database places in `partition`.
     pub fn accounts_in(&self, partition: &str) -> Result<Vec<String>> {
         Ok(self

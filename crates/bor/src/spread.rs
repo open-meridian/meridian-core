@@ -313,6 +313,52 @@ impl Spread {
             .retain(|(held, _)| held != partition);
     }
 
+    /// `partition`'s owner read again from its heads, and the partition
+    /// routed again, where this member's view of it was read before a move
+    /// (step 3d; sections 5 and 6.4; merge-queue run 45104369464, Elle): the
+    /// database the view sends a read to has let it go -- its head there a
+    /// move's pointer -- or another's head of it is further on. A member
+    /// reads the writer groups at its start, every few seconds and on each
+    /// write handed back to it, and a reader is handed none: until its next
+    /// look, a read naming an account went by the view to the partition's
+    /// source, which holds what it closed with until it lets its accounts
+    /// go, while the read's `read_after` had passed on the target's head.
+    /// So a read naming an account asks first, as a write routes again on
+    /// being handed back ([`Self::route_again`]). A head that cannot be
+    /// read changes nothing: the read says so itself.
+    fn follow_owner(&self, partition: &str) {
+        if self.stores.len() == 1 || partition == crate::store::CONTROL_PARTITION {
+            return;
+        }
+        let sent = self.of(partition) as usize;
+        let mut heads = Vec::with_capacity(self.stores.len());
+        for store in &self.stores {
+            match store.head_at(partition) {
+                Ok(head) => heads.push(head),
+                Err(_) => return,
+            }
+        }
+        let (here, written) = heads[sent].unwrap_or((0, true));
+        let further = heads
+            .iter()
+            .enumerate()
+            .any(|(d, head)| d != sent && head.is_some_and(|(there, _)| there > here));
+        if written && !further {
+            return;
+        }
+        // By the head furthest on over every database, into the view this
+        // member's stores share.
+        if self.stores[sent].read_owner(partition).is_ok() {
+            self.route_again(partition);
+        }
+    }
+
+    /// The partition `account_id` is placed in, else its first.
+    fn partition_or_first(&self, account_id: &str) -> String {
+        self.partition_of(account_id)
+            .unwrap_or_else(|| crate::store::first_partition_of(account_id).to_string())
+    }
+
     /// Each database's partitions, those it writes: each partition at the
     /// database [`Self::of`] names, `control` at database 0.
     fn written(&self) -> Vec<Vec<String>> {
@@ -388,9 +434,7 @@ impl Spread {
     /// The store holding `account_id`'s partition: where it is placed, else
     /// the database its first partition is in.
     fn holding(&self, account_id: &str) -> &Arc<PostgresStore> {
-        let partition = self
-            .partition_of(account_id)
-            .unwrap_or_else(|| crate::store::first_partition_of(account_id).to_string());
+        let partition = self.partition_or_first(account_id);
         let placed = self.database(self.of(&partition));
         // Between its move's close and its open across databases, its new
         // database holds nothing of it yet: read where it is held, whole
@@ -421,10 +465,13 @@ impl Spread {
         account_id: &str,
         read: impl Fn(&PostgresStore) -> Result<T>,
     ) -> Result<T> {
-        let mut store = self.holding(account_id);
         if self.stores.len() == 1 {
-            return read(store);
+            return read(self.holding(account_id));
         }
+        // Its partition moved since this member last read the writer
+        // groups: by its heads, not the view.
+        self.follow_owner(&self.partition_or_first(account_id));
+        let mut store = self.holding(account_id);
         for _ in 0..READ_AGAIN {
             // What a test arms to move the account between the two.
             if let Err(stopped) =
@@ -725,6 +772,9 @@ impl Store for Spread {
         if self.stores.len() == 1 {
             return self.home().journal(account_id);
         }
+        // Its partition moved since this member last read the writer
+        // groups: by its heads, not the view.
+        self.follow_owner(&self.partition_or_first(account_id));
         let written = self.written();
         let mut entries = Vec::new();
         for (store, partitions) in self.stores.iter().zip(&written) {
