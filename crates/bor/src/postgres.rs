@@ -214,9 +214,10 @@ pub struct PostgresStore {
 }
 
 /// How long a read waits for a connection to ask a database a partition's
-/// head ([`PostgresStore::head_at`]): a constant, short beside the pool's
-/// own 30 s, so a database out of reach holds no read that long (the review
-/// of 2026-11-23, finding 4).
+/// head, where it is not the database the read is sent to
+/// ([`PostgresStore::head_at`]): a constant, short beside the pool's own
+/// 30 s, so a database out of reach holds no read of a partition another
+/// writes that long (the review of 2026-11-23, finding 4).
 const HEAD_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl PostgresStore {
@@ -4169,20 +4170,26 @@ impl PostgresStore {
     /// written here -- never a move's pointer, where a move let it go
     /// (its epoch `POINTER_EPOCH`); none where it holds no head of it. The
     /// head row alone, for a read that asks before every answer
-    /// ([`crate::spread::Spread`]), on a connection waited for
-    /// [`HEAD_CHECKOUT`] at most: it commits nothing, so follows no
-    /// timeline first.
+    /// ([`crate::spread::Spread`]): it commits nothing, so follows no
+    /// timeline first. Asked on a connection waited for as any read's is
+    /// where the read is `sent` here -- it reads here next, and a pool busy
+    /// for a moment refuses nothing (the review of 2026-11-23 of this
+    /// routing, finding 2) -- and for [`HEAD_CHECKOUT`] at most in any
+    /// other database.
     ///
     /// INTERIM(v32): asked before every read naming an account only because
     /// a member's view of the writer groups is read on a timer; gone when
     /// v32 holds that a read with `read_after` is never answered from a
     /// copy a move let go.
-    pub fn head_at(&self, partition: &str) -> Result<Option<(u64, bool)>> {
+    pub fn head_at(&self, partition: &str, sent: bool) -> Result<Option<(u64, bool)>> {
         self.head_asks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(self
-            .pool
-            .get_timeout(HEAD_CHECKOUT)
+        let conn = if sent {
+            self.pool.get()
+        } else {
+            self.pool.get_timeout(HEAD_CHECKOUT)
+        };
+        Ok(conn
             .map_err(unavailable)?
             .query_opt(
                 "SELECT sequence, epoch <> -1 FROM book_partition_head WHERE partition = $1",

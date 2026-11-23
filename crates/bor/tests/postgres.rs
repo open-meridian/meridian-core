@@ -8855,6 +8855,60 @@ async fn a_head_left_written_behind_a_moves_pointers_is_never_read_as_the_partit
     blocking(move || drop(h));
 }
 
+/// A read waits for a connection to its own database as any read does (the
+/// review of 2026-11-23 of this routing, finding 2): the short wait a head
+/// is asked within is for the other databases, whose outage must hold no
+/// read of a partition they do not write. Held to it in the database the
+/// read is sent to as well, a read was refused UNAVAILABLE whenever that
+/// database's pool was busy for a second -- under load, or reconnecting
+/// after a failover -- where before it waited and was answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_waits_for_a_connection_to_the_database_it_is_sent_to_as_any_read_does() {
+    use meridian_changes::groups::Groups;
+    let h = blocking(two_databases);
+    let partition = partition_of(0, 0);
+    let account = accounts_in("ACC-BUSY", &partition, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    blocking(|| {
+        // A reader member, two connections to each database.
+        let groups = Groups::new(0, 2).unwrap();
+        let stores = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&stores).unwrap();
+        let view = meridian_bor::spread::Spread::new(stores.clone(), groups);
+        assert_eq!(Store::book(&view, &account).unwrap().entries.len(), 1);
+        // Both of database 0's taken for a second and a half: each waiting
+        // on a lock held here.
+        let mut admin = postgres::Client::connect(&h.urls[0], postgres::NoTls).unwrap();
+        admin
+            .batch_execute("BEGIN; LOCK TABLE book_partition_head IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let held: Vec<_> = (0..2)
+            .map(|_| {
+                let (store, partition) = (stores[0].clone(), partition.clone());
+                std::thread::spawn(move || drop(store.tip(&partition)))
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let freed = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+            admin.batch_execute("ROLLBACK").unwrap();
+        });
+        let started = std::time::Instant::now();
+        let read = Store::book(&view, &account).map(|book| book.entries.len());
+        let took = started.elapsed();
+        freed.join().unwrap();
+        for holder in held {
+            holder.join().unwrap();
+        }
+        assert!(
+            matches!(read, Ok(1)),
+            "a read of a partition written in a database whose pool was busy: {read:?} after {took:?}"
+        );
+    });
+    blocking(move || drop(h));
+}
+
 /// A write that finds its partition between two databases -- its source
 /// let go, its target not yet opened -- longer than its caller waits is
 /// answered OVERLOADED with a retry-after while the caller still waits

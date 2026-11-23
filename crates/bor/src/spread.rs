@@ -324,14 +324,14 @@ impl Spread {
     /// read's `read_after` had passed on the target's head.
     ///
     /// - **One head asked** where the database the view names writes the
-    ///   partition: there.
+    ///   partition: there. On that database's pool's own wait, as the read
+    ///   itself is (the review of 2026-11-23 of this routing, finding 2).
     /// - **Every other's** only where that head is a move's pointer, or the
     ///   database has not begun the partition: the written head furthest
     ///   on, where it is at or past every pointer read with it; else the
     ///   view's. A head left written behind a move's pointers -- a move
     ///   home whose source's commit failed leaves one for good -- is never
-    ///   the partition's (the review of 2026-11-23 of this routing,
-    ///   finding 1).
+    ///   the partition's (the same review, finding 1).
     /// - **Refused UNAVAILABLE** where a database that may write it cannot
     ///   be asked within [`crate::postgres::PostgresStore::head_at`]'s
     ///   bound: never answered from a copy a move let go, nor held for a
@@ -351,11 +351,13 @@ impl Spread {
             return Ok(sent);
         }
         let head = |d: u32| {
-            self.database(d).head_at(partition).map_err(|failed| {
-                StoreError::Unavailable(format!(
-                    "partition {partition}'s head in database {d}, which may write it, could not be read ({failed}): ask again"
-                ))
-            })
+            self.database(d)
+                .head_at(partition, d == sent)
+                .map_err(|failed| {
+                    StoreError::Unavailable(format!(
+                        "partition {partition}'s head in database {d}, which may write it, could not be read ({failed}): ask again"
+                    ))
+                })
         };
         // The furthest pointer read: where a move let the partition go.
         let mut pointed = match head(sent)? {
