@@ -931,7 +931,8 @@ jobs:
         working-directory: workspace/meridian-core
         run: timeout 10 tools/ci-watchdog.sh proof gave-up "$RUNNER_TEMP/make.log"
 
-      - name: "Proof: the kernel logged no blocked task or netlink fault"
+      # Red only where it matched a stall line; unreadable is a warning.
+      - name: "Proof: the kernel logged no stall"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         working-directory: workspace/meridian-core
@@ -1374,7 +1375,8 @@ jobs:
         working-directory: workspace/meridian-core
         run: timeout 10 tools/ci-watchdog.sh proof gave-up "$RUNNER_TEMP/make.log"
 
-      - name: "Proof: the kernel logged no blocked task or netlink fault"
+      # Red only where it matched a stall line; unreadable is a warning.
+      - name: "Proof: the kernel logged no stall"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         working-directory: workspace/meridian-core

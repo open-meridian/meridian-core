@@ -53,7 +53,10 @@
 #                                 as the step's result. gave-up: which of
 #                                 the make's `ready` waits gave up; kernel:
 #                                 the kernel's blocked-task, hung-task,
-#                                 netlink and unregister_netdevice lines;
+#                                 RCU-stall, unregister_netdevice and
+#                                 netlink-fault lines, said as matched,
+#                                 clean or unreadable (a ::warning::, and
+#                                 the step passes: only matched is red);
 #                                 answers: whether `ip -o link` and `docker
 #                                 ps` each answer within 3 s, said to the
 #                                 step's outputs as stalled=true|false.
@@ -463,8 +466,15 @@ case $cmd in
         ;;
       kernel)
         # As root where it can be, since dmesg is root's on GitHub's runners;
-        # the journal's kernel lines where dmesg says nothing.
-        pattern='blocked for more than|hung_task|INFO: task |netlink|unregister_netdevice'
+        # the journal's kernel lines where dmesg says nothing. Three
+        # outcomes, each said in words and as kernel=<it> in the step's
+        # outputs: matched, the step's only red, so a red means a stall
+        # line; clean; and unreadable, a warning on a passing step, since
+        # nothing was found either way. The lines a stall writes, and
+        # netlink only beside an error, a timeout or "stuck": a bare
+        # `netlink` matched every boot's "NET: Registered PF_NETLINK" and
+        # "audit: initializing netlink subsys" lines.
+        pattern='blocked for more than|hung_task|unregister_netdevice: waiting|rcu_sched self-detected stall|INFO: task .* blocked|netlink.*(error|timeout|stuck)|(error|timeout|stuck).*netlink'
         read_by=""
         # Each try's seconds first, 8 in all, inside the step's 10: sudo can
         # itself wait on a name lookup.
@@ -473,15 +483,19 @@ case $cmd in
           if within $how && [ "$within_rc" = 0 ] && [ -n "$within_out" ]; then read_by=${how#* }; break; fi
         done
         if [ -z "$read_by" ]; then
-          echo "sudo -n dmesg (4 s), dmesg (2 s) and journalctl -k (2 s) gave nothing" | say error "the kernel's log could not be read"
-          exit 1
+          [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=unreadable" >>"$GITHUB_OUTPUT"
+          echo "sudo -n dmesg (4 s), dmesg (2 s) and journalctl -k (2 s) gave nothing: whether the kernel logged a stall is not known" \
+            | say warning "kernel: unreadable, its log could not be read"
+          exit 0
         fi
         found=$(printf '%s\n' "$within_out" | grep -i -E "$pattern" | tail -n 30 || true)
         if [ -n "$found" ]; then
-          printf '%s\n' "$found" | say error "the kernel logged $(printf '%s\n' "$found" | grep -c .) blocked-task, hung-task, netlink or unregister_netdevice lines"
+          [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=matched" >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$found" | say error "kernel: matched, $(printf '%s\n' "$found" | grep -c .) blocked-task, hung-task, RCU-stall, unregister_netdevice or netlink-fault lines"
           exit 1
         fi
-        echo "$(printf '%s\n' "$within_out" | grep -c .) lines read by $read_by" | say notice "the kernel logged no blocked task, hung task, netlink or unregister_netdevice line"
+        [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=clean" >>"$GITHUB_OUTPUT"
+        echo "$(printf '%s\n' "$within_out" | grep -c .) lines read by $read_by" | say notice "kernel: clean, no blocked task, hung task, RCU stall, unregister_netdevice wait or netlink fault"
         ;;
       answers)
         stalled=false
