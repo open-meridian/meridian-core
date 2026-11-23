@@ -14449,8 +14449,7 @@ fn a_long_history_written_under_reads_stays_within_its_lock_budget() {
     let made = databases(1);
     let named = |name: &str| {
         let joined = if made[0].contains('?') { "&" } else { "?" };
-        PostgresStore::connect(&format!("{}{joined}application_name={name}", &*made[0]), 2)
-            .unwrap()
+        PostgresStore::connect(&format!("{}{joined}application_name={name}", &*made[0]), 2).unwrap()
     };
     let (writer, rows, latest) = (named("llb_write"), named("llb_rows"), named("llb_latest"));
     let dataset = unique("lockbudget");
@@ -14498,11 +14497,18 @@ fn a_long_history_written_under_reads_stays_within_its_lock_budget() {
     };
     let readers = vec![
         reading(Box::new(move || {
-            rows.rows_in_force().err().map(|failed| format!("{failed:?}"))
+            rows.rows_in_force()
+                .err()
+                .map(|failed| format!("{failed:?}"))
         })),
         reading({
             let query = latest_query(&dataset, "INS-1", true);
-            Box::new(move || latest.read(&query).err().map(|failed| format!("{failed:?}")))
+            Box::new(move || {
+                latest
+                    .read(&query)
+                    .err()
+                    .map(|failed| format!("{failed:?}"))
+            })
         }),
     ];
 
@@ -14534,11 +14540,20 @@ fn a_long_history_written_under_reads_stays_within_its_lock_budget() {
         )
         .unwrap()
         .get(0);
-    assert!(leaves >= 360, "the history is {leaves} months, short of 30 years");
+    assert!(
+        leaves >= 360,
+        "the history is {leaves} months, short of 30 years"
+    );
     refused.truncate(3);
-    assert!(refused.is_empty(), "refused under its own locks: {refused:?}");
+    assert!(
+        refused.is_empty(),
+        "refused under its own locks: {refused:?}"
+    );
     assert_eq!(
-        writer.read(&latest_query(&dataset, "INS-1", false)).unwrap().len() as i64,
+        writer
+            .read(&latest_query(&dataset, "INS-1", false))
+            .unwrap()
+            .len() as i64,
         MONTHS,
         "every month's row is kept"
     );
@@ -14565,7 +14580,14 @@ fn a_batch_of_many_months_is_recorded_its_months_made_before_it() {
     let dataset = unique("manymonths");
     let month_ns = 2_629_800_i64 * 1_000_000_000;
     let rows: Vec<Observation> = (0..40)
-        .map(|m| trade(&dataset, &format!("m{m}"), "INS-1", (240 + m) * month_ns + 14 * 86_400 * 1_000_000_000))
+        .map(|m| {
+            trade(
+                &dataset,
+                &format!("m{m}"),
+                "INS-1",
+                (240 + m) * month_ns + 14 * 86_400 * 1_000_000_000,
+            )
+        })
         .collect();
     assert_eq!(store.record(&dataset, rows, 1).unwrap().recorded, 40);
     let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
@@ -14578,9 +14600,15 @@ fn a_batch_of_many_months_is_recorded_its_months_made_before_it() {
         )
         .unwrap()
         .get(0);
-    assert!(leaves >= 39, "{leaves} months made for 40 rows a month apart");
+    assert!(
+        leaves >= 39,
+        "{leaves} months made for 40 rows a month apart"
+    );
     assert_eq!(
-        store.read(&latest_query(&dataset, "INS-1", false)).unwrap().len(),
+        store
+            .read(&latest_query(&dataset, "INS-1", false))
+            .unwrap()
+            .len(),
         40
     );
 }
@@ -14664,8 +14692,7 @@ fn a_statement_holds_its_own_months_locks_beside_a_long_history() {
     let made = databases(1);
     let named = |name: &str| {
         let joined = if made[0].contains('?') { "&" } else { "?" };
-        PostgresStore::connect(&format!("{}{joined}application_name={name}", &*made[0]), 2)
-            .unwrap()
+        PostgresStore::connect(&format!("{}{joined}application_name={name}", &*made[0]), 2).unwrap()
     };
     let (long, short) = (unique("lockbudget-long"), unique("lockbudget-short"));
     // 2_629_800 s is a mean month, from 1990-01-15.
@@ -14690,7 +14717,10 @@ fn a_statement_holds_its_own_months_locks_beside_a_long_history() {
         )
         .unwrap()
         .get(0);
-    assert!(leaves >= 360, "the history is {leaves} months, short of 30 years");
+    assert!(
+        leaves >= 360,
+        "the history is {leaves} months, short of 30 years"
+    );
 
     let done = Arc::new(AtomicBool::new(false));
     let sampler = most_locks_held(&made[0], &done);
@@ -14712,11 +14742,18 @@ fn a_statement_holds_its_own_months_locks_beside_a_long_history() {
     );
     let readers = vec![
         reading(Box::new(move || {
-            rows.rows_in_force().err().map(|failed| format!("{failed:?}"))
+            rows.rows_in_force()
+                .err()
+                .map(|failed| format!("{failed:?}"))
         })),
         reading({
             let query = latest_query(&short, "INS-1", true);
-            Box::new(move || latest.read(&query).err().map(|failed| format!("{failed:?}")))
+            Box::new(move || {
+                latest
+                    .read(&query)
+                    .err()
+                    .map(|failed| format!("{failed:?}"))
+            })
         }),
         reading({
             // The long history's first month, and no other.

@@ -1117,9 +1117,7 @@ pub trait Store: Send + Sync {
         Ok(self
             .quality_counts()?
             .into_iter()
-            .map(|(dataset, (valid, suspicious, invalid))| {
-                (dataset, valid + suspicious + invalid)
-            })
+            .map(|(dataset, (valid, suspicious, invalid))| (dataset, valid + suspicious + invalid))
             .collect())
     }
 

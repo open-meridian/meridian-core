@@ -941,14 +941,16 @@ fn latest_of_each<'a>(
         if at.is_empty() {
             Ok(Vec::new())
         } else {
-            let column = |n: usize| at.iter().map(|row| row.get::<_, i64>(n)).collect::<Vec<i64>>();
-            let (types, keys): (Vec<i16>, Vec<String>) =
-                at
+            let column = |n: usize| {
+                at.iter()
+                    .map(|row| row.get::<_, i64>(n))
+                    .collect::<Vec<i64>>()
+            };
+            let (types, keys): (Vec<i16>, Vec<String>) = at
                 .iter()
                 .map(|row| (row.get::<_, i16>(0), row.get::<_, String>(1)))
                 .unzip();
-            let (ranges, anchors): (Vec<String>, Vec<i32>) =
-                at
+            let (ranges, anchors): (Vec<String>, Vec<i32>) = at
                 .iter()
                 .map(|row| (row.get::<_, String>(2), row.get::<_, i32>(5)))
                 .unzip();
@@ -2427,10 +2429,7 @@ impl PostgresStore {
                 if self.groups.several() && self.groups.owner_by(&partition, dataset) != mine {
                     continue;
                 }
-                needed.insert((
-                    partition.into_owned(),
-                    Month::of(row.meta().valid_from_ns),
-                ));
+                needed.insert((partition.into_owned(), Month::of(row.meta().valid_from_ns)));
             }
         }
         needed.retain(|need| !self.made.lock().expect("made poisoned").contains(need));
@@ -2440,14 +2439,19 @@ impl PostgresStore {
         let mut made_ranges = std::collections::BTreeMap::new();
         for (partition, _) in &needed {
             if !made_ranges.contains_key(partition) {
-                let made = crate::leaves::range_made(&mut **conn, partition).map_err(unavailable)?;
+                let made =
+                    crate::leaves::range_made(&mut **conn, partition).map_err(unavailable)?;
                 made_ranges.insert(partition.clone(), made);
             }
         }
         needed.retain(|(partition, _)| made_ranges[partition]);
         let made = crate::leaves::make_months(&mut **conn, &needed).map_err(unavailable)?;
         if made > 0 {
-            tracing::info!(dataset, made, "the lake made month tables before their batch");
+            tracing::info!(
+                dataset,
+                made,
+                "the lake made month tables before their batch"
+            );
         }
         self.unanalysed
             .lock()
