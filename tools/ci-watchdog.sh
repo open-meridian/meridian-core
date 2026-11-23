@@ -12,7 +12,9 @@
 #
 #   ci-watchdog.sh start <file>   start the sampler, detached, and return;
 #                                 a notice names the runner's image, kernel
-#                                 and host
+#                                 and host, and GitHub's API's address is
+#                                 kept in <file>.api, which the evidence
+#                                 and the beacon give curl (--resolve)
 #   ci-watchdog.sh tail <file>    the file's last 40 lines
 #   ci-watchdog.sh make-tail <make-log> <out>
 #                                 the make's last 200 lines and the e2e's
@@ -272,10 +274,15 @@ check_send() {
     | jq -Rs --arg name "watchdog: ${CHECK_NAME:-a cluster job}" --arg sha "$CHECK_SHA" \
         '{name: $name, head_sha: $sha, status: "completed", conclusion: "neutral",
           output: {title: "What a failed cluster job knew", summary: "tools/ci-watchdog.sh evidence: the make and the sampler from its files first, then the network and the cluster, then a beacon.", text: .}}')
-  curl -sS -m 10 -X "$method" "$url" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+  # The API's address as the watchdog's start found it, where it did: no
+  # name is looked up after a failure.
+  local resolve=()
+  if [ -s "${watch:-}.api" ]; then resolve=(--resolve "$(api_host):443:$(head -n 1 "$watch.api")"); fi
+  curl -sS -m 10 ${resolve[@]+"${resolve[@]}"} -X "$method" "$url" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' -d "$body"
 }
 check_api() { echo "${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/check-runs"; }
+api_host() { local h=${GITHUB_API_URL:-https://api.github.com}; h=${h#*://}; echo "${h%%/*}"; }
 
 case $cmd in
   start)
@@ -284,6 +291,17 @@ case $cmd in
     # versions, and their kernel and host were never known.
     echo "::notice title=the runner::image ${ImageOS:-?} ${ImageVersion:-?}, kernel $(uname -r 2>/dev/null || echo '?'), host $(hostname 2>/dev/null || echo '?'), runner ${RUNNER_NAME:-?}"
     mkdir -p "$(dirname "$file")"
+    # The API's address, looked up now while names resolve, kept beside the
+    # sampler's file for the failure's check run (curl --resolve): on the
+    # runs that died every new process touching the network hung after the
+    # make, and a lookup then is one more chance to.
+    addr=$(timeout 4 getent ahostsv4 "$(api_host)" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+    if [ -n "$addr" ]; then
+      echo "$addr" >"$file.api"
+      echo "ci-watchdog: $(api_host) is $addr, kept in $file.api for the failure's check run"
+    else
+      echo "::warning::ci-watchdog: $(api_host) did not resolve in 4 s; the failure's check run will look it up"
+    fi
     # Made by this user, so the upload after it can read what root appends.
     : >"$file"
     sudo_=""
