@@ -1666,7 +1666,9 @@ fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
 /// Review-core-3 3 (ruling 1084, as config migration 30): every record the
 /// dashboard keeps of a change is kept as written. Each dashboard_*_change
 /// table refuses an update and a removal, but a settled prepared change's
-/// steps, removed with it by the sweep once kept (W6.28).
+/// steps, removed with it by the sweep once kept its 90 days (W6.28;
+/// review-core-3b A: by the deployment's time named on the connection,
+/// else the database's), and when one settled is kept as written.
 #[test]
 fn every_dashboard_change_record_is_kept_as_written() {
     let (url, database) = migrated("append_only");
@@ -1716,15 +1718,24 @@ fn every_dashboard_change_record_is_kept_as_written() {
     );
     refused(&mut raw, "DELETE FROM dashboard_delegation_change");
 
-    raw.batch_execute(
+    // Settled a day ago, by the database's own clock (review-core-3b A).
+    let yesterday = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+        - DAY_NS;
+    raw.batch_execute(&format!(
         "INSERT INTO dashboard_prepared_call
              (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
               prepared_at_ns, settled_at_ns)
-         VALUES ('PC-PENDING', 'dashboard__set_hold', '{}', 'local|ada', 1, 1, NULL),
-                ('PC-SETTLED', 'dashboard__set_hold', '{}', 'local|ada', 4, 1, 2);
+         VALUES ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, 1, NULL),
+                ('PC-SETTLED', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 2),
+                ('PC-AT-90-DAYS', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 3),
+                ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday});
          INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
-         VALUES ('PC-PENDING', 1, 1), ('PC-SETTLED', 1, 1), ('PC-SETTLED', 4, 2);",
-    )
+         VALUES ('PC-PENDING', 1, 1), ('PC-SETTLED', 1, 1), ('PC-SETTLED', 4, 2),
+                ('PC-AT-90-DAYS', 4, 3), ('PC-YESTERDAY', 4, {yesterday});"
+    ))
     .unwrap();
     refused(
         &mut raw,
@@ -1734,10 +1745,44 @@ fn every_dashboard_change_record_is_kept_as_written() {
         &mut raw,
         "DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-PENDING'",
     );
+    // Settled, but not kept its 90 days: refused, whoever asks.
+    refused(
+        &mut raw,
+        "DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-YESTERDAY'",
+    );
+    // When one settled is kept as written once set, so it cannot be moved
+    // back to let its steps go early.
+    refused(
+        &mut raw,
+        "UPDATE dashboard_prepared_call SET settled_at_ns = 1 WHERE prepared_call_id = 'PC-YESTERDAY'",
+    );
+    // The boundary, by the deployment's time named on the connection: at
+    // exactly 90 days after it settled, kept; a nanosecond past, removable.
+    let kept = meridian_dashboard::prepared::KEPT_AFTER_SETTLING_NS;
+    refused(
+        &mut raw,
+        &format!(
+            "BEGIN;
+             SELECT set_config('meridian.dashboard_now_ns', '{}', true);
+             DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-AT-90-DAYS';",
+            3 + kept
+        ),
+    );
+    raw.batch_execute("ROLLBACK").unwrap();
     use meridian_dashboard::prepared::store::PreparedStore as _;
     let prepared = meridian_dashboard::prepared::store::InPostgres::on(database);
     assert_eq!(prepared.sweep(3).unwrap(), 1, "the settled one swept");
-    assert_eq!(count(&url, "dashboard_prepared_call_change"), 1);
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 3);
+    raw.batch_execute(&format!(
+        "BEGIN;
+         SELECT set_config('meridian.dashboard_now_ns', '{}', true);
+         DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-AT-90-DAYS';
+         ROLLBACK;",
+        3 + kept + 1
+    ))
+    .expect("kept its 90 days: removable");
+    assert_eq!(prepared.sweep(4).unwrap(), 1, "kept its 90 days, swept");
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
 }
 
 /// Review-core-3 4: the one-time rewrite is worked out from rows read

@@ -783,6 +783,13 @@ impl PreparedStore for InPostgres {
     fn sweep(&self, before_ns: i64) -> Result<usize, String> {
         let mut conn = self.database.conn()?;
         let mut tx = conn.transaction().map_err(said)?;
+        // The deployment's time, named for migration 17's guard: a step is
+        // removed only once its change was kept its 90 days by it.
+        tx.execute(
+            "SELECT set_config('meridian.dashboard_now_ns', $1, true)",
+            &[&(before_ns + super::KEPT_AFTER_SETTLING_NS).to_string()],
+        )
+        .map_err(said)?;
         let gone: Vec<String> = tx
             .query(
                 "SELECT prepared_call_id FROM dashboard_prepared_call
