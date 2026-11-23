@@ -8434,7 +8434,7 @@ async fn a_read_naming_an_account_follows_its_partition_past_a_stale_view_of_its
     };
     // Read where its owner's home is, database 0, from here on.
     assert_eq!(blocking(|| orders(&reader)), 1);
-    assert_eq!(view.of(&partition), 0);
+    assert_eq!(blocking(|| view.of(&partition)), 0);
     // A move's warm and switch, as the mover makes them; the source's
     // accounts not let go yet.
     let switched = blocking(|| {
@@ -8905,6 +8905,89 @@ async fn a_read_waits_for_a_connection_to_the_database_it_is_sent_to_as_any_read
             matches!(read, Ok(1)),
             "a read of a partition written in a database whose pool was busy: {read:?} after {took:?}"
         );
+    });
+    blocking(move || drop(h));
+}
+
+/// [`a_database_out_of_reach_slows_no_read_of_a_partition_written_in_another`]
+/// for a member's first read of a partition (the review of 2026-11-23 of
+/// this routing, finding 3): that test read each account once before the
+/// outage, and a partition found at its owner's home is read there from
+/// then on. Before that, where the read is sent was found by asking every
+/// database where the partition stands, each on its pool's own 30 s wait:
+/// one database out of reach held a member's first read of every partition
+/// that long. A read naming an account now starts from its owner's home by
+/// the view and asks its head there, as it does once found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_database_out_of_reach_slows_no_first_read_of_a_partition_written_in_another() {
+    use meridian_bor::store::StoreError;
+    use meridian_changes::groups::Groups;
+    let h = blocking(two_databases);
+    let (stays, moves) = (partition_of(0, 0), partition_of(0, 1));
+    assert_ne!(stays, moves);
+    let here = accounts_in("ACC-FIRST", &stays, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    let gone = accounts_in("ACC-FIRST-GONE", &moves, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    accounts_in(
+        "ACC-FIRST-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    blocking(|| {
+        // A reader member, started before the move: its view of the writer
+        // groups read once, and no account read yet.
+        let groups = Groups::new(0, 2).unwrap();
+        let stores = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&stores).unwrap();
+        let view = meridian_bor::spread::Spread::new(stores.clone(), groups);
+        switched_to_one(&h, &moves);
+        // Database 1 out of this member's reach: both connections of its
+        // pool taken, each waiting on a lock held here.
+        let mut admin = postgres::Client::connect(&h.urls[1], postgres::NoTls).unwrap();
+        admin
+            .batch_execute("BEGIN; LOCK TABLE book_partition_head IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let held: Vec<_> = (0..2)
+            .map(|_| {
+                let (store, partition) = (stores[1].clone(), moves.clone());
+                std::thread::spawn(move || drop(store.tip(&partition)))
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let read = Store::book(&view, &here).map(|book| book.entries.len());
+        let took = started.elapsed();
+        assert_eq!(read.ok(), Some(1));
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "a first read of a partition database 0 writes waited {took:?} on database 1"
+        );
+        // Its partition's head in database 0 a move's pointer, and the
+        // database it may have gone to not read: refused, within the bound.
+        let started = std::time::Instant::now();
+        let refused = Store::book(&view, &gone).map(|book| book.entries.len());
+        let took = started.elapsed();
+        assert!(
+            matches!(refused, Err(StoreError::Unavailable(_))),
+            "{refused:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "refused only after {took:?}"
+        );
+        admin.batch_execute("ROLLBACK").unwrap();
+        for holder in held {
+            holder.join().unwrap();
+        }
+        // In reach again: read where it is written, the view as it was.
+        assert_eq!(Store::book(&view, &gone).unwrap().entries.len(), 1);
+        assert_eq!(groups.owner(&moves), 0);
     });
     blocking(move || drop(h));
 }

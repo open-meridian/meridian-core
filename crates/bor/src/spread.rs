@@ -323,15 +323,20 @@ impl Spread {
     /// holds what it closed with until it lets its accounts go, while the
     /// read's `read_after` had passed on the target's head.
     ///
-    /// - **One head asked** where the database the view names writes the
-    ///   partition: there. On that database's pool's own wait, as the read
-    ///   itself is (the review of 2026-11-23 of this routing, finding 2).
+    /// - **One head asked** where the partition's owner's home, by the
+    ///   view, writes it: there. On that database's pool's own wait, as
+    ///   the read itself is (the review of 2026-11-23 of this routing,
+    ///   finding 2).
     /// - **Every other's** only where that head is a move's pointer, or the
     ///   database has not begun the partition: the written head furthest
     ///   on, where it is at or past every pointer read with it; else the
-    ///   view's. A head left written behind a move's pointers -- a move
-    ///   home whose source's commit failed leaves one for good -- is never
-    ///   the partition's (the same review, finding 1).
+    ///   owner's home. A head left written behind a move's pointers -- a
+    ///   move home whose source's commit failed leaves one for good -- is
+    ///   never the partition's (the same review, finding 1).
+    /// - **Never by [`Self::of`]**, which asks every database where the
+    ///   partition stands, each on its pool's 30 s, until it is found at
+    ///   its owner's home: a member's first read of a partition waited
+    ///   that long on a database out of reach (the same review, finding 3).
     /// - **Refused UNAVAILABLE** where a database that may write it cannot
     ///   be asked within [`crate::postgres::PostgresStore::head_at`]'s
     ///   bound: never answered from a copy a move let go, nor held for a
@@ -346,10 +351,11 @@ impl Spread {
     /// with `read_after` is never answered from a copy a move let go, and a
     /// move during a read is refused or read again.
     fn follow_owner(&self, partition: &str) -> Result<u32> {
-        let sent = self.of(partition);
         if self.stores.len() == 1 || partition == crate::store::CONTROL_PARTITION {
-            return Ok(sent);
+            return Ok(self.of(partition));
         }
+        let sent =
+            meridian_changes::databases::of_group(self.groups.owner(partition), self.count());
         let head = |d: u32| {
             self.database(d)
                 .head_at(partition, d == sent)
