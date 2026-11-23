@@ -293,10 +293,37 @@ fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<cra
     Ok(open)
 }
 
+/// [`open_ranges_taken`]'s statement: a dataset's open ranges ($1), each
+/// with the group, the head and whether the epoch is a move's pointer ($2)
+/// of the row taken, and whether it was taken. Named for the test that
+/// reads it across a switch committing between its snapshot and its take.
+pub const OPEN_RANGES_TAKEN: &str =
+    "SELECT p.dataset, p.lo, p.hi, l.writer_group, l.taken IS NOT NULL,
+            coalesce(l.head, p.head), coalesce(l.epoch = $2, false)
+       FROM lake_partition p
+       LEFT JOIN LATERAL (SELECT true AS taken, q.writer_group, q.head, q.epoch
+                            FROM lake_partition q
+                           WHERE q.dataset = p.dataset
+                             FOR UPDATE SKIP LOCKED) AS l ON true
+      WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
+        AND p.closed_at IS NULL";
+
 /// [`open_ranges`], each range's row taken for the rest of `tx` where no
 /// move's switch holds it (step 3d; section 6.8), skipped where one does:
 /// with the group each names and whether `tx` holds it. Under the
 /// dataset's lock, so the ranges stand still.
+///
+/// The group, the head and the epoch are the taken row's own (`l`), never
+/// the statement's snapshot's (`p`): a switch takes the row alone, not the
+/// dataset's lock, and one that commits between this statement's snapshot
+/// and its take leaves the snapshot naming the group the range was, on a
+/// row taken that names the other. Read from the snapshot, the batch went
+/// on as the range's owner to the head's epoch check, and its write was
+/// refused as fenced by a newer writer where it is the other group's to
+/// commit (main's ha range-move flake: "this writer's 2, the partition's
+/// 1"). A row not taken is held by a switch, or was deleted since the
+/// snapshot by a move between databases (`moved_in`), and its parts wait
+/// whatever it named.
 #[allow(clippy::type_complexity)]
 fn open_ranges_taken(
     client: &mut impl GenericClient,
@@ -307,14 +334,7 @@ fn open_ranges_taken(
 )> {
     let rows = client
         .query(
-            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head,
-                    p.epoch = $2
-               FROM lake_partition p
-               LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
-                                   WHERE q.dataset = p.dataset
-                                     FOR UPDATE SKIP LOCKED) AS l ON true
-              WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
-                AND p.closed_at IS NULL",
+            OPEN_RANGES_TAKEN,
             &[&dataset, &meridian_changes::moves::POINTER_EPOCH],
         )
         .map_err(unavailable)?;
@@ -702,6 +722,18 @@ impl PostgresStore {
         }
     }
 
+    /// The group that owns `partition` by what its row's `writer_group`
+    /// names, as just read under the row's lock: that group where the store
+    /// has it, else its dataset's rendezvous owner. What
+    /// [`meridian_changes::groups::Groups::owner_by`] answers from the
+    /// member's view, answered from the row.
+    fn named_owner(&self, partition: &str, named: Option<u32>) -> u32 {
+        let count = self.groups.count();
+        named.filter(|group| *group < count).unwrap_or_else(|| {
+            meridian_changes::groups::owner(crate::range::dataset_of(partition), count)
+        })
+    }
+
     /// Refused where another writer group owns `dataset` (step 3d): its
     /// writes are handed to that group's writer, never committed here.
     fn owned(&self, partition: &str) -> Result<()> {
@@ -773,6 +805,16 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// The head a batch would number `partition` from, taken in a
+    /// transaction of its own and let go: for the tests of what
+    /// [`Self::head`] refuses, and as what.
+    #[doc(hidden)]
+    pub fn head_taken(&self, partition: &str) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        self.head(&mut tx, partition)
+    }
+
     /// The partition's head, taken under its lock, its epoch checked against
     /// the writer's (step 3a): a batch commits only while the head row's
     /// epoch is its own. A dataset begun here takes the writer's epoch, the
@@ -786,7 +828,8 @@ impl PostgresStore {
         self.epoch_now()?;
         let held = |tx: &mut Transaction<'_>| {
             tx.query_opt(
-                "SELECT head, epoch, closed_at FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+                "SELECT head, epoch, closed_at, writer_group FROM lake_partition
+                  WHERE dataset = $1 FOR UPDATE",
                 &[&dataset],
             )
             .map_err(unavailable)
@@ -825,6 +868,22 @@ impl PostgresStore {
                 })?
             }
         };
+        // The group the row names, read under its lock, before its epoch
+        // is checked: another group's epoch is never this writer's fence.
+        // `owned` above read this member's view, which a read of the owners
+        // from before a switch can set back (the review of c503f16d,
+        // finding 1); the write is the group's the row names.
+        if self.groups.several() {
+            let named = row.get::<_, Option<i32>>(3).map(|group| group as u32);
+            let group = self.named_owner(dataset, named);
+            if group != self.groups.mine() {
+                meridian_bus::owners::hand_to(group);
+                return Err(StoreError::NotOwned {
+                    partition: dataset.to_string(),
+                    group,
+                });
+            }
+        }
         // A move's pointer: never written under, never a fence (C3).
         if row.get::<_, i64>(1) == meridian_changes::moves::POINTER_EPOCH {
             return Err(StoreError::Held(format!(
@@ -2191,8 +2250,14 @@ impl PostgresStore {
                     "range {partition} is switching to another writer group: ask again in a moment"
                 ))),
                 Some((named, true, here, pointer)) => {
+                    // The group by the row taken, never by this member's
+                    // view read back: a read of the owners from before a
+                    // switch, written between the two, set it back, and
+                    // the batch went on as the owner to be fenced at the
+                    // head (the review of c503f16d, finding 1). The view
+                    // is only told.
                     self.groups.assign(partition, *named);
-                    let group = self.groups.owner_by(partition, dataset);
+                    let group = self.named_owner(partition, *named);
                     if group != mine || self.headed_elsewhere(partition, *here) {
                         Some(StoreError::NotOwned {
                             partition: partition.clone(),
