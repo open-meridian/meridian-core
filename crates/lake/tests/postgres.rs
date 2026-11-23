@@ -13855,3 +13855,55 @@ fn a_takeover_ended_by_a_deadlock_is_tried_again() {
         "the takeover ended by a deadlock was given up on: {took:?}"
     );
 }
+
+/// A range moved to another database between a read's routing and its
+/// rows is never answered without the range's rows (the review of
+/// 2026-11-23, finding 1): the source, read after it let the range go,
+/// answers nothing of it, and the read was sent nowhere else -- rows
+/// committed long before the move lost, whatever the member's view. The
+/// read is refused UNAVAILABLE, and asked again answers whole.
+#[test]
+fn a_range_moved_under_a_read_is_never_answered_without_its_rows() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::moves::points;
+    use meridian_lake::store::StoreError;
+    let urls = two_databases();
+    let m = Arc::new(members(&urls));
+    let dataset = owned_by_zero("coinbase-1:u");
+    let (low, high) = halves_of("lake-under");
+    let lower = halved(&m, &dataset, &low, &high);
+    let groups = Groups::new(0, 2).unwrap();
+    let reader = meridian_lake::spread::Spread::new(stores_of(&urls, groups, 2), groups);
+    reader.read_owners_again().unwrap();
+    assert_eq!(latest_keys(&reader, &dataset, &low).unwrap(), ["l0", "l1"]);
+    // Between the read's routing and its rows, once: the range moves.
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (mover, range, once) = (m.clone(), lower.clone(), moved.clone());
+    points::arm(
+        "lake.read.routed",
+        &dataset,
+        Arc::new(move |_| {
+            if !once.swap(true, Ordering::SeqCst) {
+                moved_to_one(&mover, &range);
+            }
+            Ok(())
+        }),
+    );
+    let read = latest_keys(&reader, &dataset, &low);
+    points::disarm("lake.read.routed", &dataset);
+    assert!(
+        moved.load(Ordering::SeqCst),
+        "the range moved under the read"
+    );
+    match read {
+        Err(StoreError::Unavailable(_)) => {}
+        Ok(keys) => assert_eq!(
+            keys,
+            ["l0", "l1"],
+            "a read a move went by answered without the range's rows"
+        ),
+        Err(failed) => panic!("{failed:?}"),
+    }
+    assert_eq!(latest_keys(&reader, &dataset, &low).unwrap(), ["l0", "l1"]);
+    assert_eq!(groups.owner_by(&lower, &dataset), 0, "the view, as it was");
+}
