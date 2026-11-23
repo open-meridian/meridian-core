@@ -4154,9 +4154,24 @@ def not_answered(began_ms, ended_ms):
     T's review, finding 7)."""
     found = []
     for p in driver_lines("/tmp/refused"):
-        if len(p) >= 5 and p[3].isdigit() and began_ms <= int(p[3]) <= ended_ms:
-            found.append((int(p[3]), p[1], " ".join(p[4:])))
+        said = refusal(p)
+        if said and began_ms <= said[1] <= ended_ms:
+            found.append((said[1], said[2], said[3]))
     return sorted(found)
+
+
+def refusal(p):
+    """A driver's refusal line (`REFUSED <kind> <id> <unix ms refused> <ms
+    taken> <words>`, driver.py) as (when its write began, when it was
+    refused, its kind, its words), or None for a line that is not one. A
+    line with no time taken (a driver from before PR CI 45225932982) began
+    when it was refused."""
+    if len(p) < 4 or not p[3].isdigit():
+        return None
+    at = int(p[3])
+    if len(p) >= 5 and p[4].isdigit():
+        return at - int(p[4]), at, p[1], " ".join(p[5:])
+    return at, at, p[1], " ".join(p[4:])
 
 
 # Two writes not answered this far apart or nearer are one stretch: the
@@ -6103,7 +6118,9 @@ def window_held(s, what, began_ms, ended_ms):
     "None ms of 0 writes"), so the window is at least the hold."""
     until_ms = max(ended_ms, began_ms + HOLD_SECONDS * 1000) + 1000
     # Each write by when it began (its answer's time less its own), never
-    # by its answer alone: a write begun in the window and answered after it
+    # by its answer alone, refused or answered alike (PR CI 45225932982: an
+    # order begun before a move's window, timed out 5 s later inside it,
+    # was charged to it): a write begun in the window and answered after it
     # is counted with its whole time (CI 43636763392, ha: "None ms of 0
     # writes" through a range's move -- writes answered past the window's
     # end were not counted at all). Read once the window's writes had the
@@ -6115,7 +6132,7 @@ def window_held(s, what, began_ms, ended_ms):
                   if len(p) == 4 and p[2].isdigit() and p[3].isdigit()
                   and began_ms <= int(p[2]) - int(p[3]) <= until_ms)
     refused = [p for p in driver_lines("/tmp/refused")
-               if len(p) >= 4 and p[3].isdigit() and began_ms <= int(p[3]) <= until_ms]
+               if refusal(p) and began_ms <= refusal(p)[0] <= until_ms]
     p99 = took[min(len(took) - 1, int(len(took) * 0.99))] if took else None
     s.check(bool(took) and p99 <= HOLD_SECONDS * 1000,
             f"rebalance: {what}: the driver's p99 write time while it moved within moves.holdSeconds "

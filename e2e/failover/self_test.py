@@ -375,5 +375,64 @@ class CommittedBefore(unittest.TestCase):
                 self.assertFalse(ok, what)
 
 
+class Driven:
+    """The driver's scratch as `driver_lines` reads it: its writes' times
+    (`TOOK <kind> <answered ms> <ms taken>`) and its refusals (`REFUSED
+    <kind> <id> <refused ms> <ms taken> <words>`), and the run's clock and
+    files stood in for, in a directory of its own."""
+
+    def __init__(self, took=(), refused=()):
+        self.lines = {"/tmp/took": [line.split() for line in took],
+                      "/tmp/refused": [line.split() for line in refused]}
+
+    def __enter__(self):
+        import contextlib
+        import tempfile
+        self.stack = contextlib.ExitStack()
+        here = self.stack.enter_context(tempfile.TemporaryDirectory())
+        was = os.getcwd()
+        os.chdir(here)
+        self.stack.callback(os.chdir, was)
+        for patch in (mock.patch.object(run, "driver_lines", lambda path: self.lines.get(path, [])),
+                      mock.patch.object(run.time, "sleep", lambda _: None),
+                      mock.patch.object(run, "claim", lambda *_: None)):
+            self.stack.enter_context(patch)
+        return self
+
+    def __exit__(self, *_):
+        self.stack.close()
+
+
+def held(window, took, refused):
+    """`window_held` over one window (began, ended ms), the driver's lines
+    given: whether its "no write refused" held, and its words."""
+    said = Checks()
+    with Driven(took, refused):
+        run.window_held(said, "a move", *window)
+    return next((ok, what) for ok, what in said.said if "no write refused" in what)
+
+
+class RefusedByWhenItBegan(unittest.TestCase):
+    """PR CI 45225932982 (failover, tolerant): an order begun at 17:41:18.69
+    timed out at the client 5 s later, never committed, and was charged to
+    the next move's window (an account's, begun about 17:41:22.6), though it
+    began before it. A write is in a window by when it began, refused or
+    answered alike."""
+
+    B = (1_000_000, 1_004_000)
+
+    def test_a_refusal_stamped_in_a_window_whose_write_began_before_it_is_not_of_it(self):
+        at = self.B[0] + 1_100
+        ok, what = held(self.B, [f"TOOK order {self.B[0] + 500} 20"],
+                        [f"REFUSED order 1003172 {at} 5000 status=DEADLINE_EXCEEDED detail=Deadline Exceeded"])
+        self.assertTrue(ok, what)
+
+    def test_a_refusal_whose_write_began_in_the_window_is_of_it(self):
+        at = self.B[0] + 5_600
+        ok, what = held(self.B, [f"TOOK order {self.B[0] + 500} 20"],
+                        [f"REFUSED order 1003173 {at} 5000 status=DEADLINE_EXCEEDED detail=Deadline Exceeded"])
+        self.assertFalse(ok, what)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
