@@ -14392,6 +14392,171 @@ fn a_view_read_again_under_a_read_refuses_nothing() {
     );
 }
 
+/// The lake's lock budget (v31a.17; the proposal of 2026-11-23): Postgres
+/// takes a lock a relation a statement touches and holds it to commit, a
+/// month's table is 14 relations, and the lock table is the whole
+/// cluster's, 64 a connection unless the database is told otherwise. So a
+/// statement whose locks grow with the months a dataset keeps fails every
+/// other statement beside it once the history is long enough: dev's lake
+/// answered 53200, out of shared memory, at a fund's 29 years.
+///
+/// A history of 32 years of months is written here as a backfill sends it,
+/// a few months a batch, while the lake's own month-less reads run beside
+/// it: its rows per dataset, read on retention's timer, and the subject's
+/// latest. Nothing is refused, and the most locks a backend of each
+/// statement class held is read from `pg_locks`:
+///
+/// - the rows per dataset hold the catalogue's alone, whatever the
+///   history's length (they read every month of every dataset before, and
+///   were the first refused on dev);
+/// - the write and the latest read are KNOWN GAPS, held here to what they
+///   take today so neither grows. A write reads its subject's last
+///   sequence across its range's every month (`previous_of_each`; M4's
+///   subject head, v32). The latest read looks in the rows of every month
+///   for a row naming the subject after its first: `lake_latest` keeps no
+///   later subject, so a split into places and bodies bounds nothing yet.
+///   Each is 14 relations a month of history, where its budget is the
+///   leaves it touches.
+///
+/// On a database of its own: the budget is read from `pg_locks` by
+/// database, and the lock table it would exhaust is the cluster's.
+///
+/// Ignored until the two gaps close (run it alone with `-- --ignored`):
+/// beside the suite's other tests, on one cluster, the write's and the
+/// latest read's locks together fill the lock table, and it -- or a test
+/// beside it -- is answered 53200. That is the failure it is here to show.
+/// What holds today whatever the history's length is asserted, not
+/// ignored, by `a_statement_holds_its_own_months_locks_beside_a_long_history`.
+#[test]
+#[ignore = "known gaps (v31a.17): the write's subject read and the latest read lock every month"]
+fn a_long_history_written_under_reads_stays_within_its_lock_budget() {
+    use std::sync::atomic::AtomicBool;
+    // A month's table, its TOAST table and index, and its 13 indexes, each
+    // under the two modes a write that makes it takes.
+    const A_LEAF: i64 = 2 * 16;
+    // The catalogue's tables and their indexes a statement reads beside.
+    const BESIDE: i64 = 80;
+    // A write makes and writes at most eight months a transaction.
+    const A_WRITE: i64 = 8 * A_LEAF + BESIDE;
+    // The rows per dataset are the catalogue's figures: no leaf.
+    const ROWS: i64 = BESIDE;
+    // A subject's latest is one row of one month.
+    const LATEST: i64 = A_LEAF + BESIDE;
+    // A known gap's read: a month's table and its 13 indexes, each month.
+    const A_MONTH_READ: i64 = 14;
+    const MONTHS: i64 = 384;
+
+    let made = databases(1);
+    let named = |name: &str| {
+        let joined = if made[0].contains('?') { "&" } else { "?" };
+        PostgresStore::connect(&format!("{}{joined}application_name={name}", &*made[0]), 2)
+            .unwrap()
+    };
+    let (writer, rows, latest) = (named("llb_write"), named("llb_rows"), named("llb_latest"));
+    let dataset = unique("lockbudget");
+    let done = Arc::new(AtomicBool::new(false));
+
+    // Each class's backends' most locks held at once, sampled while the
+    // history is written.
+    let sampler = {
+        let (url, done) = (made[0].to_string(), done.clone());
+        std::thread::spawn(move || {
+            let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let mut most: std::collections::BTreeMap<String, i64> = Default::default();
+            while !done.load(Ordering::SeqCst) {
+                for row in raw
+                    .query(
+                        "SELECT a.application_name, max(l.held)
+                           FROM (SELECT pid, count(*) AS held FROM pg_locks
+                                  WHERE locktype = 'relation'
+                                    AND database = (SELECT oid FROM pg_database
+                                                     WHERE datname = current_database())
+                                  GROUP BY pid) l
+                           JOIN pg_stat_activity a USING (pid)
+                          WHERE a.application_name LIKE 'llb_%'
+                          GROUP BY 1",
+                        &[],
+                    )
+                    .unwrap()
+                {
+                    let at = most.entry(row.get(0)).or_default();
+                    *at = (*at).max(row.get::<_, i64>(1));
+                }
+            }
+            most
+        })
+    };
+    let reading = |read: Box<dyn Fn() -> Option<String> + Send>| {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut refused = Vec::new();
+            while !done.load(Ordering::SeqCst) {
+                refused.extend(read());
+            }
+            refused
+        })
+    };
+    let readers = vec![
+        reading(Box::new(move || {
+            rows.rows_in_force().err().map(|failed| format!("{failed:?}"))
+        })),
+        reading({
+            let query = latest_query(&dataset, "INS-1", true);
+            Box::new(move || latest.read(&query).err().map(|failed| format!("{failed:?}")))
+        }),
+    ];
+
+    // One row a month, six months a batch, oldest first: 2_629_800 s is a
+    // mean month, from 1990-01-15.
+    let month_ns = 2_629_800_i64 * 1_000_000_000;
+    let from_ns = 631_152_000_i64 * 1_000_000_000 + 14 * 86_400 * 1_000_000_000;
+    let mut refused = Vec::new();
+    for batch in 0..MONTHS / 6 {
+        let rows = (batch * 6..batch * 6 + 6)
+            .map(|m| trade(&dataset, &format!("m{m}"), "INS-1", from_ns + m * month_ns))
+            .collect();
+        if let Err(failed) = writer.record(&dataset, rows, 1) {
+            refused.push(format!("batch {batch}: {failed:?}"));
+        }
+    }
+    done.store(true, Ordering::SeqCst);
+    for reader in readers {
+        refused.extend(reader.join().unwrap());
+    }
+    let most = sampler.join().unwrap();
+    eprintln!("LOCKS lake: the most a backend held, by statement class: {most:?}");
+
+    let mut raw = postgres::Client::connect(&made[0], postgres::NoTls).unwrap();
+    let leaves: i64 = raw
+        .query_one(
+            "SELECT count(*) FROM pg_class WHERE relkind = 'r' AND relname ~ '^lake_row_[0-9a-f]{16}_'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(leaves >= 360, "the history is {leaves} months, short of 30 years");
+    refused.truncate(3);
+    assert!(refused.is_empty(), "refused under its own locks: {refused:?}");
+    assert_eq!(
+        writer.read(&latest_query(&dataset, "INS-1", false)).unwrap().len() as i64,
+        MONTHS,
+        "every month's row is kept"
+    );
+    let gap = leaves * A_MONTH_READ;
+    for (class, budget) in [
+        ("llb_rows", ROWS),
+        ("llb_write", A_WRITE + gap),
+        ("llb_latest", LATEST + gap),
+    ] {
+        let held = most.get(class).copied().unwrap_or(0);
+        assert!(
+            held <= budget,
+            "{class} held {held} locks at once over {leaves} months; it is held to {budget} \
+             ({most:?})"
+        );
+    }
+}
+
 /// A batch spanning more months than one transaction makes has them made
 /// before it, a few a transaction (v31a.17), and is recorded whole.
 #[test]
