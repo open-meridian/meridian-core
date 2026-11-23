@@ -39,7 +39,9 @@ pub enum ChangeKind {
     /// Lapsed at its expiry, unrevoked: found by the sweep, valid when it
     /// expired.
     Lapsed,
-    /// Removed from the list a month after it ended.
+    /// Removed from the list a month after it ended; or found removed by
+    /// a copy of the release before still serving as the upgrade ran
+    /// (backfilled: who and when not known).
     Removed,
     /// Found changed since its last record, by a copy of the release before
     /// still serving as the upgrade ran (backfilled): what it was and
@@ -160,6 +162,12 @@ pub const ACTING_FILLED_BACKFILLED: &str = "backfilled from the delegation's row
 pub const CHANGED_BY_AN_EARLIER_RELEASE: &str = "backfilled: changed by an earlier release \
      still serving as the upgrade ran, so no record was written with it; who changed it, and \
      when, are not known beyond what it became says";
+
+/// What a removal's gap record says: removed by a copy of the release
+/// before, still serving as the upgrade ran, which wrote no record.
+pub const REMOVED_BY_AN_EARLIER_RELEASE: &str = "backfilled: removed from the list by an \
+     earlier release still serving as the upgrade ran, so no record was written with it; what \
+     it was is its last record's, and who removed it, and when, are not known";
 
 /// What a backfilled revocation's record says.
 pub const REVOKED_BACKFILLED: &str = "backfilled from the delegation's row, which holds when \

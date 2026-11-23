@@ -2013,6 +2013,51 @@ fn a_rewrite_and_a_fill_each_leave_their_record_once_in_postgres() {
     }
 }
 
+/// Review-core-3b B (decisions/031): the release before, still serving as
+/// the upgrade ran, removes a delegation and writes no record. The sweep
+/// finds a delegation whose latest record is not its removal and which has
+/// no row, and gives it a backfilled removal: what it was, as its last
+/// record said; who and when not known; once.
+#[test]
+fn a_delegation_the_release_before_removed_is_given_its_removal_once() {
+    use delegation::record::{ChangeKind, REMOVED_BY_AN_EARLIER_RELEASE};
+    let (url, database) = migrated("removed_before");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    // The release before's sweep: the row removed, no record.
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .execute(
+            "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+            &[&made.id],
+        )
+        .unwrap();
+    store.sweep(T0 + 2).unwrap();
+    store.sweep(T0 + 3).unwrap();
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.at_ns, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", false, T0, Some(T0)),
+            (ChangeKind::Removed, "", true, T0 + 2, None),
+        ]
+    );
+    assert_eq!(records[1].note, REMOVED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(records[1].was, records[0].became, "the chain holds");
+    assert_eq!(records[1].became, "");
+    assert_eq!(
+        (records[1].subject.as_str(), records[1].client_id.as_str()),
+        ("local|ada", "mdc_a")
+    );
+}
+
 /// Review-core-3b C (decisions/031): a delegation past its expiry is no
 /// longer live whether or not the sweep has run. A revocation or a renewal
 /// landing after its expiry, before any sweep, first records the lapse,

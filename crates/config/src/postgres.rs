@@ -164,14 +164,65 @@ impl PostgresStore {
         Ok(self.fence.adopt_once(epoch))
     }
 
-    /// Each user group and account group with no record at all given its
-    /// backfilled record at `at_ns` (decision 47, decisions/031): one the
-    /// release before defined while the upgrade ran. Run by a conductor as
-    /// it starts to write; a group with any record is left as it is.
+    /// Every user group and account group compared with its latest record
+    /// at `at_ns` (decision 47, decisions/031; review-core-3b B and D): one
+    /// the release before defined while the upgrade ran, with no record, or
+    /// changed and nobody changed since, standing otherwise than its latest
+    /// record became, is given its gap record (kind 4). Run by a conductor
+    /// as it starts to write; a group as its records say is left as it is.
+    /// Each group is held, in order, and compared under its lock, so two
+    /// conductors starting at once write each record once.
     pub fn backfill_group_records(&self, at_ns: i64) -> Result<()> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        migrations::groups_held_when_records_began(&mut tx, at_ns)?;
+        let users: Vec<UserGroup> = tx
+            .query(
+                "SELECT user_group_id, name, directory_groups, logins FROM config_user_group
+                  ORDER BY user_group_id FOR UPDATE",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| UserGroup {
+                user_group_id: row.get(0),
+                name: row.get(1),
+                directory_groups: row.get(2),
+                logins: row.get(3),
+            })
+            .collect();
+        for group in &users {
+            caught_up(
+                &mut tx,
+                GroupKind::User,
+                &group.user_group_id,
+                &described_user_group(group),
+                at_ns,
+            )?;
+        }
+        let accounts: Vec<AccountGroup> = tx
+            .query(
+                "SELECT account_group_id, name, account_ids, built_in FROM config_account_group
+                  ORDER BY account_group_id FOR UPDATE",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| AccountGroup {
+                account_group_id: row.get(0),
+                name: row.get(1),
+                account_ids: row.get(2),
+                built_in: row.get(3),
+            })
+            .collect();
+        for group in &accounts {
+            caught_up(
+                &mut tx,
+                GroupKind::Account,
+                &group.account_group_id,
+                &described_account_group(group),
+                at_ns,
+            )?;
+        }
         tx.commit().map_err(unavailable)
     }
 
@@ -3469,13 +3520,13 @@ pub(crate) fn read_access_group(
     }))
 }
 
-/// Before a group's change is recorded, the record it is owed for what
-/// changed it unrecorded (decisions/031; review-core-3 1): the release
-/// before, still serving as the upgrade ran, writes no record. Compared with
-/// the group's latest record, the group as it stands, held in `tx`, is
-/// given one -- held when its records began, or changed by an earlier
-/// release -- where they differ, so each record's `was` is the one before's
-/// `became`.
+/// Before a group's change is recorded, or as the conductor starts, the
+/// record it is owed for what changed it unrecorded (decisions/031;
+/// review-core-3 1): the release before, still serving as the upgrade ran,
+/// writes no record. Compared with the group's latest record, the group as
+/// it stands, held in `tx`, is given one -- defined or changed by an
+/// earlier release -- where they differ, so each record's `was` is the one
+/// before's `became`.
 fn caught_up(
     tx: &mut postgres::Transaction<'_>,
     group: GroupKind,

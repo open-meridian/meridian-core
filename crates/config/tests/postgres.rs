@@ -3631,6 +3631,88 @@ fn two_puts_of_one_new_group_at_once_record_it_defined_once() {
     }
 }
 
+/// Review-core-3b B (decisions/031): a group the release before changed as
+/// the upgrade ran, and nobody changed again, is found at start: compared
+/// with its latest record, it is given one saying it was changed by an
+/// earlier release, once.
+#[test]
+fn a_group_the_release_before_changed_and_nobody_changed_again_is_found_at_start() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind, CHANGED_BY_AN_EARLIER_RELEASE};
+    let (schema, store) = store_at("found_at_start");
+    let ada = Author {
+        by: "local|ada".into(),
+        ..Author::default()
+    };
+    store
+        .put_user_group(&user_group("UG-1", "ada"), &ada, 10)
+        .unwrap();
+    store
+        .put_account_group(
+            &AccountGroup {
+                account_group_id: "AG-1".into(),
+                name: "Growth".into(),
+                account_ids: vec!["ACC-1".into()],
+                built_in: false,
+            },
+            &ada,
+            10,
+        )
+        .unwrap();
+    postgres::Client::connect(&schema, postgres::NoTls)
+        .unwrap()
+        .batch_execute(
+            "UPDATE config_user_group SET logins = '{ada,bea}' WHERE user_group_id = 'UG-1';
+             UPDATE config_account_group SET account_ids = '{ACC-1,ACC-2}'
+              WHERE account_group_id = 'AG-1';",
+        )
+        .unwrap();
+    store.backfill_group_records(50).unwrap();
+    store.backfill_group_records(60).unwrap();
+    for (kind, id, became) in [
+        (
+            GroupKind::User,
+            "UG-1",
+            "\"UG-1\": directory groups desk; logins ada, bea",
+        ),
+        (
+            GroupKind::Account,
+            "AG-1",
+            "\"Growth\": accounts ACC-1, ACC-2",
+        ),
+    ] {
+        let records = store.group_changes(kind, id).unwrap();
+        let seen: Vec<_> = records
+            .iter()
+            .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.at_ns, r.valid_at_ns))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (GroupChangeKind::Defined, "local|ada", false, 10, Some(10)),
+                (
+                    GroupChangeKind::ChangedByAnEarlierRelease,
+                    "",
+                    true,
+                    50,
+                    None
+                ),
+            ],
+            "{id}"
+        );
+        assert_eq!(records[1].note, CHANGED_BY_AN_EARLIER_RELEASE);
+        assert_eq!(records[1].was, records[0].became, "{id}: the chain holds");
+        assert_eq!(records[1].became, became);
+    }
+    assert_eq!(
+        store
+            .group_changes(GroupKind::Account, "all-accounts")
+            .unwrap()
+            .len(),
+        1,
+        "a group as its records say is left as it is"
+    );
+}
+
 /// Review-core-3 8: on a store whose change log was installed by the release
 /// before, migration 35's backfilled records are written as it runs, before
 /// the log is installed again over the new table. Each is in the log, so a

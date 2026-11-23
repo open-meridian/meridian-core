@@ -26,8 +26,10 @@
 -- none (one it made), and before each change is recorded the delegation as
 -- it stands is compared with its latest record: one found otherwise is
 -- first given a record saying it was changed by an earlier release, from
--- what the last record said to what it is, who and when not known. Each
--- record's `was` is the one before's `became`.
+-- what the last record said to what it is, who and when not known. One it
+-- removed -- no row, its latest record not its removal -- is given by the
+-- sweep a backfilled removal, from what its last record said, who and when
+-- not known, once. Each record's `was` is the one before's `became`.
 CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     change_id     bigserial PRIMARY KEY,
     delegation_id text      NOT NULL,
@@ -51,7 +53,7 @@ CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     backfilled    boolean   NOT NULL DEFAULT false,
     note          text      NOT NULL DEFAULT '',
     CHECK (NOT backfilled OR kind IN ('made', 'renewed', 'acting_filled', 'revoked',
-                                      'changed_by_an_earlier_release')),
+                                      'changed_by_an_earlier_release', 'removed')),
     CHECK (backfilled OR kind <> 'changed_by_an_earlier_release')
 );
 
@@ -61,6 +63,10 @@ CREATE INDEX IF NOT EXISTS dashboard_delegation_change_by_delegation
 -- A delegation's records backfilled once.
 CREATE UNIQUE INDEX IF NOT EXISTS dashboard_delegation_change_backfill_once
     ON dashboard_delegation_change (delegation_id) WHERE backfilled AND kind = 'made';
+
+-- A delegation is removed once.
+CREATE UNIQUE INDEX IF NOT EXISTS dashboard_delegation_change_removed_once
+    ON dashboard_delegation_change (delegation_id) WHERE kind = 'removed';
 
 -- A delegation lapses once at each expiry.
 CREATE UNIQUE INDEX IF NOT EXISTS dashboard_delegation_change_lapsed_once

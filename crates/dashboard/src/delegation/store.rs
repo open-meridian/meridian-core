@@ -12,7 +12,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use super::record::{
-    backfilled, change, lapsed, owed_before_change, ChangeKind, ACTING_FILLED, REMOVED, REWRITTEN,
+    backfilled, change, lapsed, owed_before_change, ChangeKind, ACTING_FILLED, REMOVED,
+    REMOVED_BY_AN_EARLIER_RELEASE, REWRITTEN,
 };
 use super::{
     Client, Covers, Delegation, DelegationChange, Grant, Kind, Revoked, Token, ToolCall,
@@ -1485,6 +1486,29 @@ impl DelegationStore for InPostgres {
                 )?;
             }
         }
+        // Each the release before removed, still serving as the upgrade ran,
+        // with no record of it (review-core-3b B, decisions/031): whose
+        // latest record is not its removal and which has no row, given a
+        // backfilled removal -- what it was, as its last record said; who
+        // and when not known -- once.
+        tx.execute(
+            "INSERT INTO dashboard_delegation_change
+                 (delegation_id, subject, client_id, kind, was, became, changed_by,
+                  changed_at_ns, valid_at_ns, backfilled, note)
+             SELECT latest.delegation_id, latest.subject, latest.client_id, 'removed',
+                    latest.became, '', '', $1, NULL, true, $2
+               FROM (SELECT DISTINCT ON (r.delegation_id)
+                            r.delegation_id, r.subject, r.client_id, r.kind, r.became
+                       FROM dashboard_delegation_change r
+                      WHERE NOT EXISTS (SELECT 1 FROM dashboard_delegation d
+                                         WHERE d.delegation_id = r.delegation_id)
+                      ORDER BY r.delegation_id, r.change_id DESC) latest
+              WHERE latest.kind <> 'removed'
+              ORDER BY latest.delegation_id
+             ON CONFLICT (delegation_id) WHERE kind = 'removed' DO NOTHING",
+            &[&now_ns, &REMOVED_BY_AN_EARLIER_RELEASE],
+        )
+        .map_err(said)?;
         tx.commit().map_err(said)?;
         conn.execute(
             "DELETE FROM dashboard_oauth_client
