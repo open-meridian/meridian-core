@@ -2476,3 +2476,26 @@ fn a_migration_on_a_logged_store_leaves_its_rows_in_the_log() {
     CHANGES.install(&mut client).unwrap();
     CHANGES.check_follows(&mut client, &before).unwrap();
 }
+
+/// Review-core-3c N7: a follower's reload names the captured tables it
+/// read. One there then and gone now is found, even empty: the comparison
+/// would otherwise pass over it. One missing at both is passed over: a
+/// store a release before left, before the migration that makes it.
+#[test]
+fn a_captured_table_gone_since_the_reload_is_found() {
+    use meridian_street::postgres::CHANGES;
+    let (url, _store) = isolated();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let reloaded = CHANGES.snapshot(&mut client).unwrap();
+    client
+        .batch_execute("DROP TABLE street_cash_instrument")
+        .unwrap();
+    let failed = CHANGES
+        .check_follows(&mut client, &reloaded)
+        .expect_err("a captured table gone since the reload");
+    assert!(failed.contains("street_cash_instrument"), "{failed}");
+    let reloaded = CHANGES.snapshot(&mut client).unwrap();
+    CHANGES
+        .check_follows(&mut client, &reloaded)
+        .expect("missing at both: passed over");
+}

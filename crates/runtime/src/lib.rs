@@ -544,6 +544,35 @@ where
     }));
 }
 
+/// `attempt` tried until it succeeds: a failure said, and tried again after a
+/// pause that doubles from `first` to at most `most` (review-core-3c N7: a
+/// start's one-off work that failed was only warned of, and never done).
+/// Answers how many tries it took.
+pub async fn until_it_succeeds<F, A>(
+    what: &str,
+    first: Duration,
+    most: Duration,
+    mut attempt: F,
+) -> u32
+where
+    F: FnMut() -> A,
+    A: std::future::Future<Output = Result<(), String>>,
+{
+    let mut pause = first;
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match attempt().await {
+            Ok(()) => return tries,
+            Err(failed) => {
+                tracing::warn!(%failed, tries, retry_in_s = pause.as_secs_f64(), "{what}: tried again");
+            }
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(most);
+    }
+}
+
 /// A task a library started, kept to be ended with the component's own.
 pub fn keep(task: tokio::task::JoinHandle<()>) {
     let mut held = BACKGROUND
@@ -1694,6 +1723,35 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    /// Review-core-3c N7: a start's one-off work that fails is tried again,
+    /// each pause twice the last up to its most, until it succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn work_that_fails_is_tried_again_with_a_growing_pause() {
+        use std::time::Duration;
+        let started = tokio::time::Instant::now();
+        let mut failing = 4;
+        let tries = super::until_it_succeeds(
+            "the work",
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            || {
+                failing -= 1;
+                let left = failing;
+                async move {
+                    if left >= 0 {
+                        Err("not yet".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(tries, 5);
+        // 1 + 2 + 4 + 4 seconds of pauses.
+        assert_eq!(started.elapsed(), Duration::from_secs(11));
+    }
+
     /// Review finding 6, shown both ways: a SIGTERM that lands while
     /// nothing waits is heard by [`stopping`], asked once before; a
     /// [`shutdown`] first asked after it never hears it.

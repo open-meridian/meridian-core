@@ -267,12 +267,29 @@ fn run() -> Result<(), String> {
             tracing::info!(epoch, "the configuration store writes under its epoch");
             // A group the release before defined or changed while the
             // upgrade ran, and nobody changed since, given its gap record
-            // (decisions/031; review-core-3b B).
-            if let Err(failed) =
-                tokio::task::block_in_place(|| postgres.backfill_group_records(now_ns()))
-            {
-                tracing::warn!(%failed, "the groups could not be compared with their records");
-            }
+            // (decisions/031; review-core-3b B); tried again until it is
+            // done (review-core-3c N7).
+            let comparing = Arc::clone(postgres);
+            meridian_runtime::background(async move {
+                meridian_runtime::until_it_succeeds(
+                    "the groups could not be compared with their records",
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(60),
+                    || {
+                        let comparing = Arc::clone(&comparing);
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                comparing
+                                    .backfill_group_records(now_ns())
+                                    .map_err(|failed| failed.to_string())
+                            })
+                            .await
+                            .map_err(|failed| failed.to_string())?
+                        }
+                    },
+                )
+                .await;
+            });
             let watched = Arc::clone(postgres);
             let writing = Arc::clone(postgres);
             holding.keep(
