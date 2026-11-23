@@ -923,7 +923,10 @@ jobs:
           MAKE_FAILED: ${{ steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled' }}
           GH_TOKEN: ${{ github.token }}
           CHECK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          CHECK_${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }}: ${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }}
+          # The job's own name, so its evidence check run is named after it
+          # (the key was the name's text from 0b987dbe, so CHECK_NAME was
+          # never set and every run was "watchdog: a cluster job").
+          CHECK_NAME: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
         run: |
           tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
           tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
@@ -1300,7 +1303,7 @@ jobs:
           MAKE_FAILED: ${{ steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled' }}
           GH_TOKEN: ${{ github.token }}
           CHECK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          CHECK_e2e-cluster, arm64: e2e-cluster, arm64
+          CHECK_NAME: e2e-cluster-k3d (e2e-cluster, arm64)
         run: |
           tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
           tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
