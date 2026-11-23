@@ -276,6 +276,180 @@ fn kept_storage_is_mounted_again_by_the_same_plugin_and_never_by_another() {
     );
 }
 
+/// A version installed from a registry, as the conductor names its image:
+/// plugins/{listing} in the deployment's own registry, by digest (W8.10).
+fn listed(listing: &str) -> CreatePluginRequest {
+    let version = meridian_domain::v1::PluginVersion {
+        listing: listing.into(),
+        source_registry: "community".into(),
+        image_digest: format!("sha256:{}", "a".repeat(64)),
+        ..Default::default()
+    };
+    CreatePluginRequest {
+        instance_id: "ecb".into(),
+        image: format!(
+            "{REGISTRY}/{}@{}",
+            meridian_config::plugins::repository_of(&version),
+            version.image_digest
+        ),
+        roles: vec!["data".into()],
+        ..Default::default()
+    }
+}
+
+/// What Kubernetes takes as a label's value: at most 63 of letters, digits,
+/// `-`, `_` and `.`, a letter or digit at each end.
+fn is_label_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let edge = |b: &u8| b.is_ascii_alphanumeric();
+    bytes.len() <= 63
+        && bytes.first().is_none_or(edge)
+        && bytes.last().is_none_or(edge)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+#[test]
+fn a_plugin_installed_from_a_registry_launches_as_the_instance_chosen() {
+    let asked = listed("open-meridian/ecb");
+    assert_eq!(
+        asked.image,
+        format!(
+            "localhost:5000/plugins/open-meridian/ecb@sha256:{}",
+            "a".repeat(64)
+        )
+    );
+    assert_eq!(checked(&asked, REGISTRY), Ok(()));
+    let made = manifest(TEMPLATE, &asked).unwrap();
+    assert_eq!(made["metadata"]["name"], "r-plugin-ecb");
+    assert_eq!(
+        made["spec"]["template"]["spec"]["containers"][1]["image"],
+        asked.image
+    );
+    // A listing's parts may start with a digit, as the catalogue takes them.
+    assert_eq!(checked(&listed("0x/1inch"), REGISTRY), Ok(()));
+}
+
+#[test]
+fn the_instance_stays_a_bare_name_and_the_image_stays_under_plugins() {
+    let digest = "a".repeat(64);
+    let cases: Vec<(&str, CreatePluginRequest)> = vec![
+        (
+            "an instance named as a listing",
+            CreatePluginRequest {
+                instance_id: "open-meridian/ecb".into(),
+                ..listed("open-meridian/ecb")
+            },
+        ),
+        (
+            "a path deeper than organisation/plugin",
+            CreatePluginRequest {
+                image: format!("localhost:5000/plugins/a/b/c@sha256:{digest}"),
+                ..request()
+            },
+        ),
+        (
+            "a path that climbs out of plugins/",
+            CreatePluginRequest {
+                image: format!("localhost:5000/plugins/../ecb@sha256:{digest}"),
+                ..request()
+            },
+        ),
+        (
+            "an organisation with no plugin",
+            CreatePluginRequest {
+                image: format!("localhost:5000/plugins/open-meridian/@sha256:{digest}"),
+                ..request()
+            },
+        ),
+        (
+            "a plugin with no organisation",
+            CreatePluginRequest {
+                image: format!("localhost:5000/plugins//ecb@sha256:{digest}"),
+                ..request()
+            },
+        ),
+        (
+            "a listing that is not lower case",
+            CreatePluginRequest {
+                image: format!("localhost:5000/plugins/Open-Meridian/ecb@sha256:{digest}"),
+                ..request()
+            },
+        ),
+        (
+            "a listing that could break out of the template",
+            CreatePluginRequest {
+                image: format!("localhost:5000/plugins/open-meridian/e\"cb@sha256:{digest}"),
+                ..request()
+            },
+        ),
+    ];
+    for (case, asked) in cases {
+        assert!(checked(&asked, REGISTRY).is_err(), "{case}");
+    }
+}
+
+#[test]
+fn a_registry_plugins_storage_is_labelled_with_its_listing_as_a_label_takes_it() {
+    let asked = listed("open-meridian/ecb");
+    let made = claim(CLAIM, &asked).unwrap();
+    assert_eq!(made["metadata"]["name"], "r-storage-ecb");
+    let label = made["metadata"]["labels"][PLUGIN_LABEL].as_str().unwrap();
+    assert!(is_label_value(label), "{label}");
+    assert_eq!(label, "open-meridian.ecb");
+    // Kept, it is mounted again by the same listing, at a newer version too.
+    assert_eq!(reusable(&made, &asked), Ok(()));
+    let newer = CreatePluginRequest {
+        image: asked.image.replace(&"a".repeat(64), &"c".repeat(64)),
+        ..asked.clone()
+    };
+    assert_eq!(reusable(&made, &newer), Ok(()));
+    // And never by another organisation's plugin of that name, nor by a
+    // local plugin of that name, nor theirs by it.
+    let anothers = listed("acme/ecb");
+    let refused = reusable(&made, &anothers).unwrap_err();
+    assert!(
+        refused.contains("holds the records of open-meridian/ecb, not acme/ecb"),
+        "{refused}"
+    );
+    let local = CreatePluginRequest {
+        image: format!("localhost:5000/plugins/ecb@sha256:{}", "a".repeat(64)),
+        ..asked.clone()
+    };
+    let refused = reusable(&made, &local).unwrap_err();
+    assert!(
+        refused.contains("holds the records of open-meridian/ecb, not ecb"),
+        "{refused}"
+    );
+    let locals = claim(CLAIM, &local).unwrap();
+    assert_eq!(locals["metadata"]["labels"][PLUGIN_LABEL], "ecb");
+    let refused = reusable(&locals, &asked).unwrap_err();
+    assert!(
+        refused.contains("holds the records of ecb, not open-meridian/ecb"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_listing_longer_than_a_label_holds_is_refused_its_storage_and_said_why() {
+    // Each part of a listing is at most 39, so the two may pass a label's 63.
+    let long = format!("{}/{}", "o".repeat(39), "p".repeat(39));
+    let asked = listed(&long);
+    assert_eq!(checked(&asked, REGISTRY), Ok(()));
+    let refused = claim(CLAIM, &asked).unwrap_err();
+    assert!(refused.contains("63"), "{refused}");
+    assert!(refused.contains(&long), "{refused}");
+    // Refused where its template is chosen, before anything is made; and
+    // launched where it keeps no storage.
+    let refused = template_for(&asked, false, &shapes(true)).unwrap_err();
+    assert!(refused.contains("63"), "{refused}");
+    assert_eq!(
+        template_for(&asked, false, &shapes(false)),
+        chosen("plain", None)
+    );
+}
+
 const LOCAL_ARCHIVE: &str = r#"{"env":[{"name":"MERIDIAN_ARCHIVE_DIR","value":"/var/lib/meridian/archive"}],"volumeMounts":[{"mountPath":"/var/lib/meridian/archive","name":"archive","subPath":"__INSTANCE__"}],"volumes":[{"name":"archive","persistentVolumeClaim":{"claimName":"check-meridian-runtime-archive"}}]}"#;
 const BUCKET_ARCHIVE: &str = r#"{"env":[{"name":"MERIDIAN_ARCHIVE_BUCKET","value":"s3://firm/meridian/__INSTANCE__"}],"serviceAccountName":"archive-writer"}"#;
 
