@@ -58,15 +58,17 @@ verdict() {
 	grep -F "/w/$1" "$work/$1.said" | awk '{ print $NF }' | tail -n 1
 }
 # What elle-cli found, in full: its analysis with each anomaly's operations
-# (--verbose), where the verdict alone said only that one exists
+# (--output json), where the verdict alone said only that one exists
 # (merge-queue run 45104369464: the read and the appends it missed were
-# found by hand in the history). Said, never decided by: the verdict above
-# it is the check.
+# found by hand in the history). Not --verbose: 0.1.10 deprecated it for
+# --output json, and 0.1.11's main rewrites it to the one argument
+# "--output json", which is no option it knows. Said, never decided by: the
+# verdict above it is the check.
 anomalies() {
 	echo "elle-check: what elle-cli found in $1, its first 200 lines:" >&2
 	docker run --rm --network none -v "$work":/w:ro "$JVM" \
 		java --add-modules jdk.random -jar /w/elle-cli.jar --model list-append --consistency-models strict-serializable \
-		--verbose "/w/$1" 2>&1 | head -n 200 | cut -c1-4000 >&2 || true
+		--output json "/w/$1" 2>&1 | head -n 200 | cut -c1-4000 >&2 || true
 }
 said="$(verdict history.edn)"
 [ "$said" = true ] || { anomalies history.edn; echo "elle-check FAILED: the driver's history is not strict-serializable per key ($said)" >&2; exit 1; }
