@@ -1662,3 +1662,80 @@ fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
     );
     assert_eq!(records[1].was, records[0].became, "the chain holds");
 }
+
+/// Review-core-3 3 (ruling 1084, as config migration 30): every record the
+/// dashboard keeps of a change is kept as written. Each dashboard_*_change
+/// table refuses an update and a removal, but a settled prepared change's
+/// steps, removed with it by the sweep once kept (W6.28).
+#[test]
+fn every_dashboard_change_record_is_kept_as_written() {
+    let (url, database) = migrated("append_only");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let guarded: Vec<String> = raw
+        .query(
+            "SELECT c.relname::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+              WHERE t.tgname = 'dashboard_append_only'
+                AND c.relnamespace = to_regnamespace(current_schema())
+              ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let named: Vec<String> = raw
+        .query(
+            "SELECT tablename::text FROM pg_tables
+              WHERE schemaname = current_schema() AND tablename LIKE 'dashboard\\_%\\_change'
+              ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(guarded, named, "every change table is guarded");
+    assert_eq!(named.len(), 6, "{named:?}");
+
+    let refused = |raw: &mut postgres::Client, sql: &str| {
+        let failed = raw.batch_execute(sql).expect_err(sql);
+        assert_eq!(
+            failed.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{sql}: {failed}"
+        );
+    };
+    let store = delegation::InPostgres::on(database.clone());
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    refused(
+        &mut raw,
+        "UPDATE dashboard_delegation_change SET note = 'edited'",
+    );
+    refused(&mut raw, "DELETE FROM dashboard_delegation_change");
+
+    raw.batch_execute(
+        "INSERT INTO dashboard_prepared_call
+             (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+              prepared_at_ns, settled_at_ns)
+         VALUES ('PC-PENDING', 'dashboard__set_hold', '{}', 'local|ada', 1, 1, NULL),
+                ('PC-SETTLED', 'dashboard__set_hold', '{}', 'local|ada', 4, 1, 2);
+         INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+         VALUES ('PC-PENDING', 1, 1), ('PC-SETTLED', 1, 1), ('PC-SETTLED', 4, 2);",
+    )
+    .unwrap();
+    refused(
+        &mut raw,
+        "UPDATE dashboard_prepared_call_change SET note = 'edited' WHERE prepared_call_id = 'PC-SETTLED'",
+    );
+    refused(
+        &mut raw,
+        "DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-PENDING'",
+    );
+    use meridian_dashboard::prepared::store::PreparedStore as _;
+    let prepared = meridian_dashboard::prepared::store::InPostgres::on(database);
+    assert_eq!(prepared.sweep(3).unwrap(), 1, "the settled one swept");
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 1);
+}

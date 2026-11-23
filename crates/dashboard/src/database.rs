@@ -153,6 +153,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0016_each_delegation_change_its_own_record.sql"),
         then: Some(crate::delegation::held_when_records_began),
     },
+    Migration {
+        version: 17,
+        name: "append_only_records",
+        sql: include_str!("../migrations/0017_append_only_records.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 8's record (W6.29, decisions/031): every act at may make and
