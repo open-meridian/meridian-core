@@ -2381,3 +2381,104 @@ fn a_named_time_or_a_settle_dated_back_never_lets_a_step_go_early() {
     .expect("a settle by a clock a minute behind");
     assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
 }
+
+/// Review-core-3c N3: a sign-in updates every delegation of the person's;
+/// it holds them in ID order, as the sweep does, so the two never deadlock.
+/// DLG-1 (client 9, past its expiry) and DLG-3 (client 0, past its expiry)
+/// are lapsed by the sweep; DLG-2 (live) is held by another, so the sign-in
+/// waits holding what it took before it. Both finish.
+#[test]
+fn a_sign_in_and_the_sweep_hold_a_persons_delegations_in_one_order() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("sign_in_order");
+    let store = std::sync::Arc::new(delegation::InPostgres::on(database));
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_0', 'zero', '{}', '', $1, true), ('mdc_5', 'five', '{}', '', $1, true),
+                ('mdc_9', 'nine', '{}', '', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    // Added DLG-3, DLG-2, DLG-1: by client and as stored, DLG-3 comes first.
+    for (id, client, expires) in [
+        ("DLG-3", "mdc_0", T0 + DAY_NS),
+        ("DLG-2", "mdc_5", T0 + 40 * DAY_NS),
+        ("DLG-1", "mdc_9", T0 + DAY_NS),
+    ] {
+        raw.execute(
+            "INSERT INTO dashboard_delegation
+                 (delegation_id, subject, display_name, client_id, covers_everything,
+                  made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+             VALUES ($1, 'local|ada', 'Ada', $2, true, $3, $3, $4, $3)",
+            &[&id, &client, &T0, &expires],
+        )
+        .unwrap();
+    }
+    // Given their records first, so the sweep below only lapses.
+    store.sweep(T0 + 1).unwrap();
+
+    let mut holder = raw.transaction().unwrap();
+    holder
+        .batch_execute(
+            "SET LOCAL lock_timeout = '20s';
+             SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-2' FOR UPDATE",
+        )
+        .unwrap();
+    let mine: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let waiting_on = |watch: &mut postgres::Client, pid: i32| -> Option<i32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(row) = watch
+                .query_opt(
+                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+                      LIMIT 1",
+                    &[&pid],
+                )
+                .unwrap()
+            {
+                return Some(row.get(0));
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let signing_in = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || {
+            store.signed_in("local|ada", &["traders".to_string()], T0 + 2 * DAY_NS)
+        })
+    };
+    let signing = waiting_on(&mut watch, mine).expect("the sign-in waits on DLG-2");
+    let sweeping = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || store.sweep(T0 + 2 * DAY_NS))
+    };
+    waiting_on(&mut watch, signing).expect("the sweep waits on the sign-in");
+    holder.commit().unwrap();
+    signing_in
+        .join()
+        .unwrap()
+        .expect("the sign-in is not deadlocked");
+    sweeping
+        .join()
+        .unwrap()
+        .expect("the sweep is not deadlocked");
+    for (id, lapsed) in [("DLG-1", true), ("DLG-2", false), ("DLG-3", true)] {
+        let kinds: Vec<_> = store.changes(id).unwrap().iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds.contains(&ChangeKind::Lapsed),
+            lapsed,
+            "{id}: {kinds:?}"
+        );
+        let read = store.delegation(id).unwrap().unwrap();
+        assert_eq!(read.directory_groups, ["traders"], "{id}");
+    }
+}

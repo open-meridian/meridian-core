@@ -1410,15 +1410,25 @@ impl DelegationStore for InPostgres {
     }
 
     fn signed_in(&self, subject: &str, groups: &[String], now_ns: i64) -> Result<(), String> {
-        self.database
-            .conn()?
-            .execute(
-                "UPDATE dashboard_delegation SET directory_groups = $2, groups_read_at_ns = $3
-                  WHERE subject = $1 AND revoked_at_ns IS NULL",
-                &[&subject, &groups, &now_ns],
-            )
-            .map_err(said)?;
-        Ok(())
+        let mut conn = self.database.conn()?;
+        let mut tx = conn.transaction().map_err(said)?;
+        // Held in ID order first, as the sweep and revoke_person hold them,
+        // then updated: an update alone holds them in whatever order it
+        // finds them, and deadlocks with the sweep (review-core-3c N3).
+        tx.execute(
+            "SELECT 1 FROM dashboard_delegation
+              WHERE subject = $1 AND revoked_at_ns IS NULL
+              ORDER BY delegation_id FOR UPDATE",
+            &[&subject],
+        )
+        .map_err(said)?;
+        tx.execute(
+            "UPDATE dashboard_delegation SET directory_groups = $2, groups_read_at_ns = $3
+              WHERE subject = $1 AND revoked_at_ns IS NULL",
+            &[&subject, &groups, &now_ns],
+        )
+        .map_err(said)?;
+        tx.commit().map_err(said)
     }
 
     fn sweep(&self, now_ns: i64) -> Result<(), String> {
