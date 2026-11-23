@@ -986,7 +986,10 @@ jobs:
         continue-on-error: true
         run: timeout 90 k3d cluster delete "${E2E_K3D_CLUSTER:-meridian-e2e}" || true
 
-      - name: Keep what the watchdog saw
+      # The first upload, and the one that matters most after a failure:
+      # the make's own log, which no other upload holds, and the watchdog's
+      # files, its evidence and its beacon's lines among them.
+      - name: Keep the make's log and what the watchdog saw
         if: always()
         timeout-minutes: 2
         continue-on-error: true
@@ -994,13 +997,17 @@ jobs:
         with:
           name: ${{ matrix.target }}${{ matrix.profile && format('-{0}', matrix.profile) || '' }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-watchdog
           path: |
+            ${{ runner.temp }}/make.log
             ${{ runner.temp }}/watchdog.log
+            ${{ runner.temp }}/watchdog.log.evidence
+            ${{ runner.temp }}/watchdog.log.after
             ${{ runner.temp }}/make-tail.log
           if-no-files-found: warn
           retention-days: 14
 
       - name: Keep the failure classes' measurements
         if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
+        timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -1023,6 +1030,7 @@ jobs:
 
       - name: Keep the driver's history
         if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
+        timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -1036,6 +1044,7 @@ jobs:
       # part 3), kept for the claims ledger as the failover runs' are.
       - name: Keep the backup run's measurements
         if: matrix.target == 'e2e-cluster-backup' && !cancelled()
+        timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -1047,6 +1056,7 @@ jobs:
 
       - name: Keep this job's footprint peak
         if: matrix.target == 'e2e-cluster' && !cancelled()
+        timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -1074,7 +1084,8 @@ jobs:
           done
 
       - name: Keep what the cluster said
-        if: failure()
+        # And when the job's limit ends it, as the step above.
+        if: failure() || cancelled()
         # A slow artifact service held a failed run open to the job's limit
         # (2026-10-06); the step above has put what failed in the job's log,
         # so an upload that fails or times out never decides the run.
@@ -1325,7 +1336,10 @@ jobs:
         continue-on-error: true
         run: timeout 90 k3d cluster delete "${E2E_K3D_CLUSTER:-meridian-e2e}" || true
 
-      - name: Keep what the watchdog saw
+      # The first upload, and the one that matters most after a failure:
+      # the make's own log, which no other upload holds, and the watchdog's
+      # files, its evidence and its beacon's lines among them.
+      - name: Keep the make's log and what the watchdog saw
         if: always()
         timeout-minutes: 2
         continue-on-error: true
@@ -1333,7 +1347,10 @@ jobs:
         with:
           name: e2e-cluster-arm64-watchdog
           path: |
+            ${{ runner.temp }}/make.log
             ${{ runner.temp }}/watchdog.log
+            ${{ runner.temp }}/watchdog.log.evidence
+            ${{ runner.temp }}/watchdog.log.after
             ${{ runner.temp }}/make-tail.log
           if-no-files-found: warn
           retention-days: 14
@@ -1351,7 +1368,8 @@ jobs:
           done
 
       - name: Keep what the cluster said
-        if: failure()
+        # And when the job's limit ends it, as the step above.
+        if: failure() || cancelled()
         timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
