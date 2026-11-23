@@ -3,10 +3,11 @@
 -- review-core-3 3): a delegation's changes, a service account's, a prepared
 -- change's steps, what agents may do, a person's own settings and a
 -- professional status. The dashboard only ever adds to these tables; from
--- here the database refuses anything else, so a record is changed by nobody,
--- the dashboard's own roles included, short of a superuser dropping this
--- trigger. Every table named dashboard_*_change, and one added later, takes
--- it by running this again.
+-- here the database refuses anything else, whoever writes, the dashboard's
+-- own roles included -- short of the tables' owner (the role that migrates)
+-- or a superuser dropping this trigger, which either may (review-core-3b
+-- H). Every table named dashboard_*_change, and one added later, takes it
+-- by running this again.
 --
 -- One exception, and only a removal: a prepared change's steps are removed
 -- with it once it settled and was kept its 90 days (W6.28,
