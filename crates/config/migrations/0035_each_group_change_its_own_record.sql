@@ -14,19 +14,22 @@
 -- its valid time not known.
 --
 -- The release before keeps serving while this runs, and its changes write
--- no record. So the backfill runs again whenever the conductor starts to
--- write (a group with no record at all), and before each change is
--- recorded the group as it stands is compared with its latest record: one
--- found otherwise is first given a record (kind 4) saying it was changed by
--- an earlier release, from what the last record said to what it is, who and
--- when not known. Each record's `was` is the one before's `became`.
+-- no record. So whenever the conductor starts to write, and before each
+-- change is recorded, the group as it stands is compared with its latest
+-- record: one found otherwise is first given a record (kind 4) saying it was
+-- changed by an earlier release, from what the last record said to what it
+-- is, who and when not known; one with no record at all, defined by an
+-- earlier release after this ran, likewise, its `was` empty. Kind 3 is this
+-- migration's own run alone. Each record's `was` is the one before's
+-- `became`.
 CREATE TABLE IF NOT EXISTS config_group_change (
     change_id          bigserial PRIMARY KEY,
     -- 1 a user group, 2 an account group.
     group_kind         smallint  NOT NULL CHECK (group_kind IN (1, 2)),
     group_id           text      NOT NULL,
-    -- 1 defined, 2 changed, 3 held when the records began, 4 changed by an
-    -- earlier release as the upgrade ran (3 and 4 backfilled).
+    -- 1 defined, 2 changed, 3 held when the records began (this migration's
+    -- own run), 4 defined or changed by an earlier release as the upgrade
+    -- ran (3 and 4 backfilled).
     kind               smallint  NOT NULL CHECK (kind BETWEEN 1 AND 4),
     was                text      NOT NULL DEFAULT '',
     became             text      NOT NULL DEFAULT '',

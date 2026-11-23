@@ -3495,12 +3495,13 @@ fn groups_standing_before_their_records_began_are_backfilled_once() {
 /// Review-core-3 1 (decisions/031): the release before keeps serving while
 /// migration 35 runs, and its changes write no record. A group it changed is
 /// given a record saying so before the next change is recorded, and one it
-/// defined is given its backfilled record, at start or at its next change;
-/// each record's `was` is the one before's `became`.
+/// defined is given one saying it was defined by an earlier release, at
+/// start or at its next change; each record's `was` is the one before's
+/// `became`.
 #[test]
 fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
     use meridian_config::groups::{
-        GroupChangeKind, GroupKind, CHANGED_BY_AN_EARLIER_RELEASE, HELD_WHEN_RECORDS_BEGAN,
+        GroupChangeKind, GroupKind, CHANGED_BY_AN_EARLIER_RELEASE, DEFINED_BY_AN_EARLIER_RELEASE,
     };
     let (schema, store) = store_at("earlier_release");
     let ada = Author {
@@ -3548,7 +3549,9 @@ fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
         assert_eq!(pair[1].was, pair[0].became, "the chain holds");
     }
 
-    // One the release before defined: its backfilled record first.
+    // One the release before defined: its gap record first, defined by an
+    // earlier release (kind 4, its `was` empty; review-core-3b D). Kind 3 is
+    // the migration's own run only.
     let mut ops = UserGroup {
         user_group_id: "UG-2".into(),
         name: "Ops".into(),
@@ -3562,12 +3565,13 @@ fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
     assert_eq!(
         records.iter().map(|r| r.kind).collect::<Vec<_>>(),
         [
-            GroupChangeKind::HeldWhenRecordsBegan,
+            GroupChangeKind::ChangedByAnEarlierRelease,
             GroupChangeKind::Changed,
             GroupChangeKind::Changed
         ]
     );
-    assert_eq!(records[0].note, HELD_WHEN_RECORDS_BEGAN);
+    assert_eq!(records[0].note, DEFINED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(records[0].was, "");
     assert_eq!(
         records[0].became,
         "\"Ops\": directory groups ops; logins cy"
@@ -3582,7 +3586,9 @@ fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
     for (kind, id) in [(GroupKind::User, "UG-3"), (GroupKind::Account, "AG-9")] {
         let records = store.group_changes(kind, id).unwrap();
         assert_eq!(records.len(), 1, "{id}: {records:?}");
-        assert_eq!(records[0].kind, GroupChangeKind::HeldWhenRecordsBegan);
+        assert_eq!(records[0].kind, GroupChangeKind::ChangedByAnEarlierRelease);
+        assert_eq!(records[0].was, "", "{id}");
+        assert_eq!(records[0].note, DEFINED_BY_AN_EARLIER_RELEASE);
         assert_eq!(records[0].at_ns, 50);
     }
     assert_eq!(

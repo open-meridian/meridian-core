@@ -240,11 +240,12 @@ pub const MIGRATIONS: &[Migration] = &[
 ];
 
 /// Migration 35 (decision 47, decisions/031): each user group and account
-/// group with no record at all given one backfilled record, the group as it
-/// stood, who made it not known, at `at_ns`, the moment it ran. A group with
-/// any record is left as it is, so it may run again: the conductor runs it
-/// each time it starts to write, for a group the release before defined
-/// while the upgrade ran ([`crate::PostgresStore::backfill_group_records`]).
+/// group with no record at all given one backfilled record (kind 3), the
+/// group as it stood, who made it not known, at `at_ns`, the moment it ran.
+/// A group with any record is left as it is. Kind 3 is this run's alone: a
+/// group the release before defined or changed while the upgrade ran is
+/// found by the conductor as it starts to write
+/// ([`crate::PostgresStore::backfill_group_records`]), kind 4.
 pub fn groups_held_when_records_began(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
     use crate::groups::{
         described_account_group, described_user_group, GroupChangeKind, GroupKind,

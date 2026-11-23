@@ -39,17 +39,18 @@ impl GroupKind {
     }
 }
 
-/// A group defined anew, changed, held when its records began, or changed
-/// by an earlier release as an upgrade ran (the last two backfilled,
-/// decisions/031).
+/// A group defined anew, changed, held when its records began (migration
+/// 35's own run), or defined or changed by an earlier release as an upgrade
+/// ran (the last two backfilled, decisions/031).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupChangeKind {
     Defined,
     Changed,
     HeldWhenRecordsBegan,
-    /// Found changed since its last record, by a copy of the release before
-    /// still serving as the upgrade ran: what it was and became are known,
-    /// who changed it and when are not.
+    /// Found changed since its last record, or with none after migration 35
+    /// ran (its `was` empty), by a copy of the release before still serving
+    /// as the upgrade ran: what it was and became are known, who changed it
+    /// and when are not.
     ChangedByAnEarlierRelease,
 }
 
@@ -101,16 +102,24 @@ pub struct GroupChangeRecord {
     pub note: String,
 }
 
-/// What a group found with no record is given (migration 35, and again
-/// for one an earlier release defined as the upgrade ran).
-pub const HELD_WHEN_RECORDS_BEGAN: &str = "backfilled: the group as it stood when it was first \
-     found with no record, each user-group and account-group change its own record from \
-     migration 35; who defined it or last changed it, and when, is not known";
+/// What a group standing as migration 35 ran is given, by that run alone
+/// (kind 3). One found with no record later was defined by an earlier
+/// release ([`DEFINED_BY_AN_EARLIER_RELEASE`], kind 4; review-core-3b D).
+pub const HELD_WHEN_RECORDS_BEGAN: &str = "backfilled: the group as it stood when migration 35 \
+     ran, each user-group and account-group change its own record from there; who defined it \
+     or last changed it, and when, is not known";
 
 /// What a gap record says: the group changed since its last record by a copy
 /// of the release before, still serving while the upgrade ran.
 pub const CHANGED_BY_AN_EARLIER_RELEASE: &str = "backfilled: changed by an earlier release \
      still serving as the upgrade ran, so no record was written with it; who changed it, and \
+     when, are not known";
+
+/// What a gap record says of a group found with no record after migration
+/// 35 ran: defined by a copy of the release before, still serving while the
+/// upgrade ran (kind 4, its `was` empty; review-core-3b D).
+pub const DEFINED_BY_AN_EARLIER_RELEASE: &str = "backfilled: defined by an earlier release \
+     still serving as the upgrade ran, so no record was written with it; who defined it, and \
      when, are not known";
 
 /// A user group as a record says it: its name, its directory groups and its
@@ -189,11 +198,14 @@ pub fn account_group_change(
     ))
 }
 
-/// The record a group is owed before its change is recorded, found as it
-/// stands as `standing` (decisions/031): held when its records began where
-/// it has none, `latest` being None; changed by an earlier release where it
-/// stands otherwise than its latest record became; None where the records
-/// are whole.
+/// The record a group is owed before its change is recorded, or as the
+/// conductor starts, found as it stands as `standing` (decisions/031):
+/// where it has none, `latest` being None, one saying an earlier release
+/// defined it (kind 4, its `was` empty: migration 35's own run gave every
+/// group standing then its kind 3, so one with none was defined after;
+/// review-core-3b D); changed by an earlier release where it stands
+/// otherwise than its latest record became; None where the records are
+/// whole.
 pub fn owed_before_change(
     group: GroupKind,
     group_id: &str,
@@ -203,9 +215,9 @@ pub fn owed_before_change(
 ) -> Option<GroupChangeRecord> {
     let (kind, was, note) = match latest {
         None => (
-            GroupChangeKind::HeldWhenRecordsBegan,
+            GroupChangeKind::ChangedByAnEarlierRelease,
             String::new(),
-            HELD_WHEN_RECORDS_BEGAN,
+            DEFINED_BY_AN_EARLIER_RELEASE,
         ),
         Some(became) if became == standing => return None,
         Some(became) => (
