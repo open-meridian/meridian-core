@@ -352,9 +352,59 @@ impl Spread {
         best.1
     }
 
+    /// The ranges' owners read again from their rows, and `dataset`'s
+    /// routed again, where this member's view of it was read before a move
+    /// (step 3d; sections 5 and 6.4; the book's stale read of merge-queue
+    /// run 45104369464, the same shape here): the database the view sends
+    /// a read of the dataset, or of one of its ranges, to holds a move's
+    /// pointer of it, or another's row of it is further on. A member reads
+    /// the writer groups at its start, every few seconds and on a write
+    /// routed again, and a reader writes nothing: until its next look, a
+    /// read went by the view to the range's source, which answers nothing
+    /// of a range it let go, while the read's `read_after` had passed on
+    /// the target's head. So a read of a dataset asks first: its rows in
+    /// each database, one read of each. A row that cannot be read changes
+    /// nothing: the read says so itself.
+    fn follow_owners(&self, dataset: &str) {
+        if self.stores.len() == 1 || dataset == meridian_changes::CONTROL {
+            return;
+        }
+        // Each partition's head in each database, and whether written.
+        let mut rows: BTreeMap<String, Vec<Option<(u64, bool)>>> = BTreeMap::new();
+        for (d, store) in self.stores.iter().enumerate() {
+            let Ok(held) = store.rows_of(dataset) else {
+                return;
+            };
+            for (partition, head, written) in held {
+                rows.entry(partition)
+                    .or_insert_with(|| vec![None; self.stores.len()])[d] = Some((head, written));
+            }
+        }
+        let moved: Vec<&String> =
+            rows.iter()
+                .filter(|(partition, heads)| {
+                    let sent = self.of(partition) as usize;
+                    let (here, written) = heads[sent].unwrap_or((0, true));
+                    !written
+                        || heads.iter().enumerate().any(|(d, head)| {
+                            d != sent && head.is_some_and(|(there, _)| there > here)
+                        })
+                })
+                .map(|(partition, _)| partition)
+                .collect();
+        if moved.is_empty() || self.read_owners_again().is_err() {
+            return;
+        }
+        for partition in moved {
+            self.route_again(partition);
+        }
+    }
+
     /// Every database a read of `dataset` asks (step 3d): its own, and each
-    /// its ranges' groups write, as this member last read them.
+    /// its ranges' groups write, as this member last read them -- read
+    /// again first where a move has gone by ([`Self::follow_owners`]).
     fn databases_of(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
+        self.follow_owners(dataset);
         let mut out = std::collections::BTreeSet::from([self.of(dataset)]);
         for (range, _) in self.groups.ranges_of(dataset) {
             out.insert(self.of(&range));
