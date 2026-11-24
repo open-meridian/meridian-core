@@ -591,5 +591,64 @@ class StoreLogsKept(unittest.TestCase):
         self.assertIn("lake.databases=2", order[0][1])
 
 
+class Roll:
+    """kubectl as `jetstream_rolled` calls it: the broker's roll outlives
+    its first `rollout status` (exit 1) and finishes on the next; its
+    servers' previous containers have logs. Every call is recorded."""
+
+    def __init__(self):
+        self.calls, self.statuses = [], 0
+
+    def __call__(self, *args, input=None, check=True, quiet=False):
+        import json
+        import subprocess
+        self.calls.append(" ".join(args))
+        said, code = "", 0
+        if args[:2] == ("rollout", "status") and args[2].startswith("statefulset/"):
+            self.statuses += 1
+            code = 1 if self.statuses == 1 else 0
+        elif args[:2] == ("rollout", "status") or args[:2] == ("rollout", "restart"):
+            pass
+        elif args[:2] == ("get", "pods") and "meridian.dev/component=broker" in args[3]:
+            said = json.dumps({"items": [{"metadata": {"name": f"{run.FULL}-broker-{i}"}} for i in range(3)]})
+        elif args[:2] == ("get", "pods"):
+            said = json.dumps({"items": []})
+        elif args[0] == "get" and args[1].startswith("statefulset/"):
+            said = json.dumps({"spec": {"replicas": 3}, "status": {
+                "readyReplicas": 3, "updatedReplicas": 3, "currentRevision": "b", "updateRevision": "b"}})
+        elif args[0] == "logs" and "--previous" in args:
+            said = "[1] JetStream cluster not current with the meta leader\n"
+        else:
+            raise AssertionError(f"kubectl {' '.join(args)} was not expected")
+        return subprocess.CompletedProcess(args, code, said.encode(), b"")
+
+
+class BrokerRolledLate(unittest.TestCase):
+    """PR #147's scaled run: the broker's roll outlived its 300 s, the run
+    went straight on to the shard section, and the servers' previous logs
+    were lost. Now the check fails, then each server's previous lines and
+    health are printed and the run waits for the set rolled and ready
+    before anything after it."""
+
+    def test_a_roll_past_its_wait_fails_then_says_why_and_waits_for_it_rolled_and_ready(self):
+        roll, checks = Roll(), Checks()
+        asked = []
+        with mock.patch.object(run, "kubectl", roll), \
+                mock.patch.object(run, "monitored", lambda server, paths: asked.append(server) or {
+                    "/healthz": (503, '{"status":"unavailable"}')}), \
+                mock.patch.object(run.time, "sleep", lambda _: None):
+            run.jetstream_rolled(checks)
+        self.assertIn((False, "broker: its servers restarted one at a time"), checks.said)
+        previous = [c for c in roll.calls if c.startswith("logs ") and "--previous" in c]
+        self.assertEqual(len(previous), 3)
+        self.assertEqual(len(asked), 3)
+        statuses = [i for i, c in enumerate(roll.calls) if c.startswith("rollout status statefulset/")]
+        self.assertEqual(len(statuses), 2)
+        ready = max(i for i, c in enumerate(roll.calls) if c.startswith("get statefulset/"))
+        analytics = roll.calls.index(f"rollout restart deployment/{run.FULL}-analytics-coordinator")
+        self.assertLess(statuses[1], analytics)
+        self.assertLess(ready, analytics)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
