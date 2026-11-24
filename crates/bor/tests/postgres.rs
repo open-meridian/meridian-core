@@ -9917,9 +9917,9 @@ async fn a_write_between_a_cross_database_close_and_open_is_answered_and_never_h
         .unwrap()
         .expect("asked of the member of the group it left: written once it opens");
     let handed = h.broker.handed.load(Ordering::SeqCst) - handed;
-    assert!(
-        handed <= 2,
-        "two writes and the open, handed on {handed} times"
+    assert_eq!(
+        handed, 1,
+        "the write asked of the group it left, handed on by the record once"
     );
     blocking(move || drop(h));
 }
