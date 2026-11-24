@@ -1053,8 +1053,8 @@ K3D_READY = ready() { \
 # loadbalancer and tools images, the node image), as `docker events` heard
 # it from just before `k3d cluster create` until the cluster was ready: CI
 # loads each of them first (tools/ci-k3s-images.sh), and its cluster jobs
-# fail a run where this line or the kube-system one before it is not none
-# (tools/ci-watchdog.sh proof pulls). Run 45300919431 died making the
+# fail a run where this line is not none, and warn where the kube-system
+# one before it is not (tools/ci-watchdog.sh proof pulls). Run 45300919431 died making the
 # cluster when its runner could not pull k3d's images. The listener ends
 # with the cluster ready, or when making it fails.
 # Where kube-system did pull, who: each Pulling event's time, node and pod,

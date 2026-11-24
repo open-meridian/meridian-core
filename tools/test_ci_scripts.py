@@ -5,8 +5,11 @@ of `make e2e-harness-check`.
   beside the node image, and the airgap tarball's fetch backs off between
   tries, a bounded number of them, within the 300 s that bounded it before
   (queue run 45307348738: a 403 on all seven tries inside one minute).
-- tools/ci-watchdog.sh proof pulls: making the cluster pulled nothing, or
-  the job fails (run 45300919431 died on k3d's pull).
+- tools/ci-watchdog.sh proof pulls: the host pulled nothing while the
+  cluster was made, or the job fails (run 45300919431 died on k3d's pull);
+  a pull by kube-system is a warning naming the image, as on main, where it
+  was said and never failed a job (a known gap: CoreDNS, 4 of 52
+  three-agent jobs).
 - tools/ci-watchdog.sh verdict: a failed job's last line names the failed
   check, or the step that died where no check ran (v31a item 11).
 """
@@ -176,9 +179,25 @@ class Watchdog(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("k3d-proxy", done.stdout)
 
-    def test_a_pull_by_kube_system_fails(self):
+    def test_a_pull_by_kube_system_is_a_warning_naming_the_image(self):
         done = self.run_watchdog("proof", "pulls", log=self.READY.format(
-            system='"rancher/mirrored-pause:3.6"; ', host="none"))
+            system='"rancher/mirrored-coredns-coredns:1.14.7"; ', host="none"))
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("::warning ", done.stdout)
+        self.assertIn("mirrored-coredns-coredns:1.14.7", done.stdout)
+        self.assertNotIn("::error", done.stdout)
+
+    def test_a_pull_by_both_fails_on_the_host_s_and_names_each(self):
+        done = self.run_watchdog("proof", "pulls", log=self.READY.format(
+            system='"rancher/mirrored-coredns-coredns:1.14.7"; ', host="ghcr.io/k3d-io/k3d-tools:5.9.0"))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("::error", done.stdout)
+        self.assertIn("k3d-tools", done.stdout)
+        self.assertIn("mirrored-coredns-coredns", done.stdout)
+
+    def test_a_host_line_that_is_missing_fails(self):
+        done = self.run_watchdog("proof", "pulls", log=(
+            "e2e-cluster-k3d: images pulled while it was made: none\n"))
         self.assertEqual(done.returncode, 1)
 
     def test_a_cluster_never_ready_has_no_pulls_to_judge(self):

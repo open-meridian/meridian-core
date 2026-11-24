@@ -944,7 +944,8 @@ jobs:
       # k3s's, k3d's and the node's images were all loaded above, so making
       # the cluster pulls from no registry: the make says what kube-system
       # and the host pulled while it was made, and this fails the job where
-      # either is not none (run 45300919431 died on k3d's own pull).
+      # the host's is not none (run 45300919431 died on k3d's own pull). A
+      # pull by kube-system is a warning naming the image, as on main.
       - name: "Proof: making the cluster pulled nothing"
         id: pulls
         if: always() && (steps.make.outcome == 'success' || steps.make.outcome == 'failure')
@@ -1423,7 +1424,8 @@ jobs:
       # k3s's, k3d's and the node's images were all loaded above, so making
       # the cluster pulls from no registry: the make says what kube-system
       # and the host pulled while it was made, and this fails the job where
-      # either is not none (run 45300919431 died on k3d's own pull).
+      # the host's is not none (run 45300919431 died on k3d's own pull). A
+      # pull by kube-system is a warning naming the image, as on main.
       - name: "Proof: making the cluster pulled nothing"
         id: pulls
         if: always() && (steps.make.outcome == 'success' || steps.make.outcome == 'failure')

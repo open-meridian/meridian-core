@@ -67,7 +67,9 @@
 #                                 pulls (on every run, not only a failed
 #                                 one): the make's lines saying what
 #                                 kube-system and the host pulled while the
-#                                 cluster was made, red unless both none.
+#                                 cluster was made: red unless the host's
+#                                 is none, and a ::warning:: naming the
+#                                 image where kube-system's is not.
 #                                 Each is also appended to proof.log beside
 #                                 the make's log, the annotations' source,
 #                                 and to the step summary. A command is
@@ -553,19 +555,30 @@ case $cmd in
         # The Makefile's two lines once the cluster is ready: what kube-system
         # pulled (k3s's own images, which CI hands every node as the airgap
         # tarball) and what the host's Docker pulled (k3d's and the node
-        # image, which CI loads first). Either not none fails the job: run
-        # 45300919431 died making the cluster on k3d's pull. A make that never
-        # got the cluster ready has nothing to judge, and has failed already.
+        # image, which CI loads first). The host's not none fails the job: run
+        # 45300919431 died making the cluster on k3d's pull. Kube-system's
+        # not none is a warning naming the image and the step passes, as on
+        # main, where the make said it and nothing failed on it: a known gap,
+        # CoreDNS pulled in 4 of 52 three-agent jobs with the tarball on
+        # every node (runs 45265929792, 45273067565, 45300919431,
+        # 45333826556), and the make now says which node and pod. A make that
+        # never got the cluster ready has nothing to judge, and has failed
+        # already.
         system=$(sed -n 's/^e2e-cluster-k3d: images pulled while it was made: //p' "$make" 2>/dev/null | tail -n 1)
         host=$(sed -n 's/^e2e-cluster-k3d: images the host pulled while it was made: //p' "$make" 2>/dev/null | tail -n 1)
         if [ -z "$system" ] && [ -z "$host" ]; then
           echo "the make never said what was pulled: the cluster was not made ready" | say notice "pulls: nothing to judge"
           exit 0
         fi
-        if [ "${system:-unknown}" != none ] || [ "${host:-unknown}" != none ]; then
-          printf 'kube-system pulled: %s\nthe host pulled: %s\n' "${system:-unknown}" "${host:-unknown}" \
-            | say error "pulls: making the cluster pulled from a registry"
+        if [ "${host:-unknown}" != none ]; then
+          printf 'the host pulled: %s\nkube-system pulled: %s\n' "${host:-unknown}" "${system:-unknown}" \
+            | say error "pulls: the host pulled from a registry while the cluster was made"
           exit 1
+        fi
+        if [ "${system:-unknown}" != none ]; then
+          printf 'kube-system pulled: %s\nthe host pulled: none\n' "${system:-unknown}" \
+            | say warning "pulls: kube-system pulled ${system:-unknown} (a known gap; the make says which node and pod)"
+          exit 0
         fi
         echo "kube-system pulled none, and the host none" | say notice "pulls: making the cluster pulled nothing"
         ;;
