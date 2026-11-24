@@ -3490,6 +3490,18 @@ chart-check:
 		|| { echo "chart-check FAILED: the ha profile with a generated key was refused without saying why: $$said" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=warm 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: resilience.profile=warm rendered" >&2; exit 1; }; true
+	@# JetStream never syncs each write to disk (v31a item 5; PO 2026-11-20:
+	@# its cost measured, the exposure until v32 accepted): neither the
+	@# values nor either profile's render says sync_interval: always, or the
+	@# older sync_always. The broker's configuration refuses it too
+	@# (meridian-broker-config, never_syncs_always).
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	for profile in tolerant ha; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=$$profile 2>/dev/null)" \
+			|| { echo "chart-check FAILED: the $$profile profile did not render" >&2; exit 1; }; \
+		{ echo "$$said"; cat deploy/chart/values.yaml; } | tr -d ' "\t' | grep -qiE 'sync_interval[:=]always|sync_always[:=]true' \
+			&& { echo "chart-check FAILED: the $$profile profile or the values have JetStream sync every write (sync_interval: always), which is never set (PO 2026-11-20)" >&2; exit 1; }; \
+	done; true
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
 	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the ha profile did not render with the key in a Secret" >&2; exit 1; }; \
