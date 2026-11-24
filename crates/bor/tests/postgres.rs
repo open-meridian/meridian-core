@@ -6976,6 +6976,16 @@ fn two_databases_snapshotting(interval: Option<u64>) -> TwoDatabases {
 /// [`two_databases_snapshotting`] over `count` databases: the two groups'
 /// own, and past them databases neither group's home is in.
 fn databases(count: usize, interval: Option<u64>) -> TwoDatabases {
+    databases_reached(count, interval, &|_, _, url| url.to_string())
+}
+
+/// [`databases`], writer group `group`'s member reaching database `d`, at
+/// `url`, by the URL `reach(group, d, url)` gives.
+fn databases_reached(
+    count: usize,
+    interval: Option<u64>,
+    reach: &dyn Fn(u32, usize, &str) -> String,
+) -> TwoDatabases {
     use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
     use meridian_changes::groups::Groups;
     let urls: Vec<Scratch> = (0..count)
@@ -6995,8 +7005,9 @@ fn databases(count: usize, interval: Option<u64>) -> TwoDatabases {
         let groups = Groups::new(group, 2).unwrap();
         let stores: Vec<Arc<PostgresStore>> = urls
             .iter()
-            .map(|url| {
-                let store = PostgresStore::connect(url, 6)
+            .enumerate()
+            .map(|(d, url)| {
+                let store = PostgresStore::connect(&reach(group, d, url), 6)
                     .unwrap()
                     .with_groups(groups)
                     .with_partitions(8);
@@ -10454,4 +10465,276 @@ async fn a_move_back_over_a_row_not_let_go_opens() {
         Some(home.as_str())
     );
     blocking(move || drop(h));
+}
+
+/// A relay to the test database's server that can stop passing bytes on,
+/// its connections left open: a backend that is stopped, not gone (a
+/// paused container, a frozen process). The server sets no timeout such a
+/// backend keeps, and nothing closes the client's socket.
+struct Relay {
+    port: u16,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Relay {
+    fn to(url: &str) -> Relay {
+        use std::io::{Read, Write};
+        let host = url.split_once('@').unwrap().1.split_once('/').unwrap().0;
+        let server = if host.contains(':') {
+            host.to_string()
+        } else {
+            format!("{host}:5432")
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay = Relay {
+            port,
+            stopped: stopped.clone(),
+        };
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let (Ok(client), Ok(backend)) = (client, std::net::TcpStream::connect(&server))
+                else {
+                    continue;
+                };
+                let ways = [
+                    (client.try_clone().unwrap(), backend.try_clone().unwrap()),
+                    (backend, client),
+                ];
+                for (mut from, mut into) in ways {
+                    let stopped = stopped.clone();
+                    std::thread::spawn(move || {
+                        let mut bytes = [0u8; 16 * 1024];
+                        while let Ok(read @ 1..) = from.read(&mut bytes) {
+                            while stopped.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                            if into.write_all(&bytes[..read]).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = into.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        relay
+    }
+
+    /// `url`, reached through this relay.
+    fn of(&self, url: &str) -> String {
+        let (head, rest) = url.split_once('@').unwrap();
+        let tail = rest.split_once('/').unwrap().1;
+        format!("{head}@127.0.0.1:{}/{tail}", self.port)
+    }
+}
+
+/// The second review of #149, F4: another database's row is asked for
+/// within a bound of the asking member's own, whatever that database's
+/// backend does. Its connection's checkout and its statement were bounded;
+/// the checkout's own check of the connection, `BEGIN` and `SET LOCAL
+/// statement_timeout` were not, and a backend stopped with its connections
+/// open answers none of them. The act is refused to be asked again within
+/// the read's bound, never waited out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_database_whose_backend_is_stopped_holds_a_write_no_longer_than_the_reads_bound() {
+    // The member of the target's group reaches the source's database,
+    // group 0's, through the relay.
+    let relay = Arc::new(Relay::to(&url()));
+    let h = {
+        let relay = relay.clone();
+        blocking(move || {
+            databases_reached(2, None, &|group, d, url| {
+                if (group, d) == (1, 0) {
+                    relay.of(url)
+                } else {
+                    url.to_string()
+                }
+            })
+        })
+    };
+    let (from, to) = (partition_of(0, 2), partition_of(1, 2));
+    let (from_bus, from_spread) = member_of(&h, 0);
+    let (to_bus, to_spread) = member_of(&h, 1);
+    let account = accounts_in("ACC-STOPPED", &from, 1, &from_bus, from_spread.as_ref())
+        .await
+        .remove(0);
+    // The target's member has written its partition before: its epoch is
+    // adopted, and its act goes straight to its account's placement.
+    accounts_in("ACC-STOPPED-BY", &to, 1, &to_bus, to_spread.as_ref()).await;
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "stopped".into(),
+    };
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &from_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(stopped.is_err(), "stopped between its close and its open");
+    assert_eq!(
+        blocking(|| from_spread.of(&from)),
+        0,
+        "the source's database"
+    );
+    let store = blocking(|| to_spread.database(to_spread.of(&to)).clone());
+    store.learn_placement(&account, &to);
+    relay.stopped.store(true, Ordering::SeqCst);
+    let (said, heard) = std::sync::mpsc::channel();
+    {
+        let (store, account) = (store.clone(), account.clone());
+        std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            let reached = AtomicU64::new(0);
+            let acted = store.act(&account, "", "stopped", b"stopped", &mut |_, _| {
+                reached.store(1, Ordering::SeqCst);
+                Err(meridian_bor::store::StoreError::Invalid("decided".into()))
+            });
+            let _ = said.send((
+                reached.load(Ordering::SeqCst) == 1,
+                acted.err().map(|refused| refused.to_string()),
+                began.elapsed(),
+            ));
+        });
+    }
+    let answered = blocking(|| heard.recv_timeout(std::time::Duration::from_secs(4)));
+    relay.stopped.store(false, Ordering::SeqCst);
+    let (reached, refused, took) =
+        answered.expect("refused within the read's bound, never waited out");
+    let refused = refused.unwrap_or_default();
+    assert!(
+        !reached && refused.contains("ask again"),
+        "never decided, and asked again ({took:?}): {refused}"
+    );
+    blocking(move || {
+        drop(store);
+        drop(h)
+    });
+}
+
+/// A book of three writer groups over three databases: the stores of
+/// `group`'s member, and the databases, dropped after them.
+fn member_of_three(group: u32) -> (Arc<meridian_bor::spread::Spread>, Vec<Scratch>) {
+    let groups = meridian_changes::groups::Groups::new(group, 3).unwrap();
+    let urls: Vec<Scratch> = (0..3)
+        .map(|_| {
+            let (url, migrated) = isolated();
+            migrated.make_partitions(8).unwrap();
+            url
+        })
+        .collect();
+    let stores = urls
+        .iter()
+        .map(|url| {
+            Arc::new(
+                PostgresStore::connect(url, 4)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8),
+            )
+        })
+        .collect();
+    (
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups)),
+        urls,
+    )
+}
+
+/// `account`'s row in the database at `url`: naming `partition`, or gone.
+fn row_at(url: &str, account: &str, partition: Option<&str>) {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    match partition {
+        Some(partition) => admin.execute(
+            "INSERT INTO book_account (account_id, partition) VALUES ($1, $2)
+             ON CONFLICT (account_id) DO UPDATE SET partition = EXCLUDED.partition",
+            &[&account, &partition],
+        ),
+        None => admin.execute(
+            "DELETE FROM book_account WHERE account_id = $1",
+            &[&account],
+        ),
+    }
+    .unwrap();
+}
+
+/// `store`'s act on `account`, on a thread of its own: whether it was
+/// decided, and the group it was said to be another's to write.
+fn acted_apart(
+    store: &Arc<PostgresStore>,
+    account: &str,
+) -> std::sync::mpsc::Receiver<(bool, Option<u32>, String)> {
+    let (store, account) = (store.clone(), account.to_string());
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reached = AtomicU64::new(0);
+        let acted = store.act(&account, "", "apart", b"apart", &mut |_, _| {
+            reached.store(1, Ordering::SeqCst);
+            Err(meridian_bor::store::StoreError::Invalid("decided".into()))
+        });
+        let handed = match &acted {
+            Err(meridian_bor::store::StoreError::NotOwned { group, .. }) => Some(*group),
+            _ => None,
+        };
+        let _ = said.send((
+            reached.load(Ordering::SeqCst) == 1,
+            handed,
+            acted.err().map(|e| e.to_string()).unwrap_or_default(),
+        ));
+    });
+    heard
+}
+
+/// The second review of #149, F4's second part: with three databases, an
+/// account's act asked of a database holding no row of it is the one its
+/// home row names, whatever a database it plays no part in answers. The
+/// first database, asked before its home, answers nothing; the act is
+/// still handed to its home's group, never refused for that database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_database_an_account_plays_no_part_in_refuses_none_of_its_writes() {
+    let (member, urls) = blocking(|| member_of_three(2));
+    let home = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .find(|p| member.group_of_partition(p) == 1)
+        .expect("a partition of group 1's");
+    let account = unique("ACC-NO-PART");
+    let (first, second) = (urls[0].to_string(), urls[1].to_string());
+    blocking(|| row_at(&second, &account, Some(&home)));
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+    let locker = std::thread::spawn(move || {
+        let mut admin = postgres::Client::connect(&first, postgres::NoTls).unwrap();
+        admin
+            .batch_execute("BEGIN; LOCK TABLE book_account IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let _ = locked.send(());
+        let _ = released.recv();
+        let _ = admin.batch_execute("ROLLBACK");
+    });
+    blocking(|| is_locked.recv()).expect("the first database's accounts locked");
+    let store = member.database(2).clone();
+    store.learn_placement(&account, &home);
+    let heard = acted_apart(&store, &account);
+    let answered = blocking(|| heard.recv_timeout(std::time::Duration::from_secs(8)));
+    drop(release);
+    blocking(|| locker.join()).expect("the lock let go");
+    let (reached, handed, refused) = answered.expect("answered");
+    assert!(
+        !reached && handed == Some(1),
+        "handed to its home's group, never refused for another database: {refused}"
+    );
+    blocking(move || {
+        drop(store);
+        drop(member);
+        drop(urls)
+    });
 }

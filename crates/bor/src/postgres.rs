@@ -220,6 +220,11 @@ pub struct PostgresStore {
 /// writes that long (the review of 2026-11-23, finding 4).
 const HEAD_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a read asked of another database for an act is waited for in
+/// all, by the asking member's clock: its connection's checkout and its
+/// statement, [`HEAD_CHECKOUT`] each.
+const ASKED: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let config = meridian_changes::database_config(url).map_err(unavailable)?;
@@ -1803,18 +1808,28 @@ impl PostgresStore {
         }
         let others = self.other_databases();
         let Some(here) = here else {
-            // No row here: every other database is asked.
+            // No row here: the other databases are asked, up to the first
+            // whose row names a partition it is home to -- the account is
+            // placed or opened there, whatever a database it plays no part
+            // in holds or answers (the second review of #149, F4). With no
+            // such row, one that did not answer refuses the act.
             let mut held = Vec::new();
+            let mut unanswered = None;
             for other in &others {
-                if let Some(named) = other.account_row_asked(account_id)? {
-                    held.push((other, named));
+                match other.account_row_asked(account_id) {
+                    Ok(Some(named)) if other.is_home_of(&named) => {
+                        return Ok(Found::Elsewhere(named));
+                    }
+                    Ok(Some(named)) => held.push((other, named)),
+                    Ok(None) => {}
+                    Err(failed) => unanswered = unanswered.or(Some(failed)),
                 }
+            }
+            if let Some(failed) = unanswered {
+                return Err(failed);
             }
             if held.is_empty() {
                 return Ok(Found::Nowhere(first_partition_of(account_id).to_string()));
-            }
-            if let Some((_, named)) = held.iter().find(|(other, named)| other.is_home_of(named)) {
-                return Ok(Found::Elsewhere(named.clone()));
             }
             // Closes' rows alone: the one not opened is where it goes.
             if held.len() == 1 {
@@ -1887,32 +1902,60 @@ impl PostgresStore {
     /// 2026-11-24, findings 1 and 3): on a connection waited for
     /// [`HEAD_CHECKOUT`] at most, each statement given as long, and any
     /// failure the act's refusal to be asked again -- never an answer.
-    fn asked<T>(
+    ///
+    /// The whole of it -- the checkout and its check of the connection,
+    /// `BEGIN`, the statement's timeout being set, the read -- is waited
+    /// for [`ASKED`] at most, by this member's own clock (the second
+    /// review of #149, F4): a backend stopped with its connections open
+    /// answers none of them, and keeps no timeout the server was given.
+    /// So it is asked on a thread of its own, which ends when the
+    /// database answers or its connection breaks; until then it holds one
+    /// connection of this database's pool, so at most the pool's size
+    /// wait there, and the next is refused at its checkout.
+    fn asked<T: Send + 'static>(
         &self,
         account_id: &str,
-        read: impl FnOnce(&mut Transaction<'_>) -> std::result::Result<T, postgres::Error>,
+        read: impl FnOnce(&mut Transaction<'_>) -> std::result::Result<T, postgres::Error>
+            + Send
+            + 'static,
     ) -> Result<T> {
-        let failed = |failed: &dyn std::fmt::Display| unread(account_id, failed);
-        let mut conn = self
-            .pool
-            .get_timeout(HEAD_CHECKOUT)
-            .map_err(|refused| failed(&refused))?;
-        let mut tx = conn.transaction().map_err(|refused| failed(&refused))?;
-        tx.batch_execute(&format!(
-            "SET LOCAL statement_timeout = {}",
-            HEAD_CHECKOUT.as_millis()
-        ))
-        .map_err(|refused| failed(&refused))?;
-        read(&mut tx).map_err(|refused| failed(&refused))
+        let pool = self.pool.clone();
+        let (answer, answered) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("bor-asked".into())
+            .spawn(move || {
+                let asked = || -> std::result::Result<T, String> {
+                    let mut conn = pool
+                        .get_timeout(HEAD_CHECKOUT)
+                        .map_err(|refused| refused.to_string())?;
+                    let mut tx = conn.transaction().map_err(|refused| refused.to_string())?;
+                    tx.batch_execute(&format!(
+                        "SET LOCAL statement_timeout = {}",
+                        HEAD_CHECKOUT.as_millis()
+                    ))
+                    .map_err(|refused| refused.to_string())?;
+                    read(&mut tx).map_err(|refused| refused.to_string())
+                };
+                let _ = answer.send(asked());
+            })
+            .map_err(|failed| unread(account_id, failed))?;
+        match answered.recv_timeout(ASKED) {
+            Ok(read) => read.map_err(|failed| unread(account_id, failed)),
+            Err(_) => Err(unread(
+                account_id,
+                format_args!("a database gave no answer within {} ms", ASKED.as_millis()),
+            )),
+        }
     }
 
     /// [`Self::account_row`], asked for another database's act.
     fn account_row_asked(&self, account_id: &str) -> Result<Option<String>> {
-        self.asked(account_id, |tx| {
+        let account = account_id.to_string();
+        self.asked(account_id, move |tx| {
             Ok(tx
                 .query_opt(
                     "SELECT partition FROM book_account WHERE account_id = $1",
-                    &[&account_id],
+                    &[&account],
                 )?
                 .map(|row| row.get(0)))
         })
@@ -1925,12 +1968,13 @@ impl PostgresStore {
     /// its key's shape, which a caller's command kept before such keys
     /// were refused may have (the second review of #149, 2026-11-24).
     pub(crate) fn closed_unopened(&self, account_id: &str, partition: &str) -> Result<bool> {
-        let rows = self.asked(account_id, |tx| {
+        let account = account_id.to_string();
+        let rows = self.asked(account_id, move |tx| {
             tx.query(
                 &format!(
                     "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1 AND kind = $2"
                 ),
-                &[&account_id, &crate::journal::ACCOUNT_MOVED],
+                &[&account, &crate::journal::ACCOUNT_MOVED],
             )
         })?;
         let mut closes = Vec::new();
@@ -1955,12 +1999,13 @@ impl PostgresStore {
             let key = crate::moves::open_key(account_id, &from, closing);
             let mut opened = false;
             for database in &databases {
-                opened |= database.asked(account_id, |tx| {
+                let (account, key) = (account_id.to_string(), key.clone());
+                opened |= database.asked(account_id, move |tx| {
                     Ok(tx
                         .query_opt(
                             "SELECT 1 FROM book_entry
                               WHERE account_id = $1 AND idempotency_key = $2 AND kind = $3",
-                            &[&account_id, &key, &crate::journal::ACCOUNT_MOVED],
+                            &[&account, &key, &crate::journal::ACCOUNT_MOVED],
                         )?
                         .is_some())
                 })?;
