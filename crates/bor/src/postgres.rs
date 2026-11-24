@@ -1920,37 +1920,47 @@ impl PostgresStore {
 
     /// Whether this database holds a close of `account_id` toward
     /// `partition` that no database of the book holds the open of: the
-    /// account is between that close and its open.
+    /// account is between that close and its open. A close is an entry of
+    /// the account-moved kind, read by what it carries -- never told by
+    /// its key's shape, which a caller's command kept before such keys
+    /// were refused may have (the second review of #149, 2026-11-24).
     fn closed_unopened(&self, account_id: &str, partition: &str) -> Result<bool> {
-        let closes: Vec<(String, i64)> = self.asked(account_id, |tx| {
-            Ok(tx
-                .query(
-                    "SELECT c.partition, c.first_sequence FROM book_entry c
-                      WHERE c.account_id = $1
-                        AND (c.idempotency_key = 'account-move:' || $1 || ':' || c.partition || ':' || $2
-                             OR starts_with(c.idempotency_key,
-                                    'account-move:' || $1 || ':' || c.partition || ':' || $2 || ':'))
-                        AND NOT EXISTS (
-                            SELECT 1 FROM book_entry o
-                             WHERE o.account_id = c.account_id
-                               AND o.idempotency_key = 'account-open:' || c.account_id || ':'
-                                                       || c.partition || ':' || c.first_sequence)",
-                    &[&account_id, &partition],
-                )?
-                .iter()
-                .map(|row| (row.get(0), row.get(1)))
-                .collect())
+        let rows = self.asked(account_id, |tx| {
+            tx.query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1 AND kind = $2"
+                ),
+                &[&account_id, &crate::journal::ACCOUNT_MOVED],
+            )
         })?;
-        let others = self.other_databases();
+        let mut closes = Vec::new();
+        for row in &rows {
+            let entry = entry_of(row)?;
+            if crate::journal::closes(&entry).as_deref() != Some(partition) {
+                continue;
+            }
+            if let Some(moved) = crate::journal::moved_of(&entry) {
+                closes.push((moved.from_partition, moved.closing_sequence));
+            }
+        }
+        if closes.is_empty() {
+            return Ok(false);
+        }
+        let Some(linked) = self.databases.get() else {
+            return Ok(false);
+        };
+        let databases: Vec<Arc<PostgresStore>> =
+            linked.iter().filter_map(std::sync::Weak::upgrade).collect();
         for (from, closing) in closes {
-            let key = crate::moves::open_key(account_id, &from, closing.max(0) as u64);
+            let key = crate::moves::open_key(account_id, &from, closing);
             let mut opened = false;
-            for other in &others {
-                opened |= other.asked(account_id, |tx| {
+            for database in &databases {
+                opened |= database.asked(account_id, |tx| {
                     Ok(tx
                         .query_opt(
-                            "SELECT 1 FROM book_entry WHERE account_id = $1 AND idempotency_key = $2",
-                            &[&account_id, &key],
+                            "SELECT 1 FROM book_entry
+                              WHERE account_id = $1 AND idempotency_key = $2 AND kind = $3",
+                            &[&account_id, &key, &crate::journal::ACCOUNT_MOVED],
                         )?
                         .is_some())
                 })?;
