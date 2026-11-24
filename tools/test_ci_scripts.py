@@ -7,6 +7,8 @@ of `make e2e-harness-check`.
   (queue run 45307348738: a 403 on all seven tries inside one minute).
 - tools/ci-watchdog.sh proof pulls: making the cluster pulled nothing, or
   the job fails (run 45300919431 died on k3d's pull).
+- tools/ci-watchdog.sh verdict: a failed job's last line names the failed
+  check, or the step that died where no check ran (v31a item 11).
 """
 
 import hashlib
@@ -158,6 +160,11 @@ class Watchdog(unittest.TestCase):
         return subprocess.run(["bash", os.path.join(TOOLS, "ci-watchdog.sh"), *args, self.make],
                               capture_output=True, text=True, cwd=self.dir, env=env)
 
+    def last_line(self, *args, **kwargs):
+        done = self.run_watchdog("verdict", *args, **kwargs)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip().splitlines()[-1]
+
     def test_pulls_none_from_either_passes(self):
         done = self.run_watchdog("proof", "pulls", log=self.READY.format(system="none", host="none"))
         self.assertEqual(done.returncode, 0, done.stdout)
@@ -178,6 +185,48 @@ class Watchdog(unittest.TestCase):
         done = self.run_watchdog("proof", "pulls", log="e2e-cluster-k3d: gave up on x after 300s. It said:\n")
         self.assertEqual(done.returncode, 0)
         self.assertIn("nothing to judge", done.stdout)
+
+    def test_the_last_line_names_the_first_failed_check_and_how_many(self):
+        line = self.last_line(log="    ok: the API answers\n"
+                                  "    FAILED: broker: its servers restarted one at a time\n"
+                                  "    FAILED: analytics: every copy has JetStream's work queue\n"
+                                  "e2e-cluster-failover FAILED (ha): 2\n"
+                                  "make[1]: *** [Makefile:1300: e2e-cluster-failover] Error 1\n",
+                              steps={"make": {"outcome": "failure"}})
+        self.assertEqual(line, "FAILED: broker: its servers restarted one at a time (the first of 2 failed checks)")
+
+    def test_the_last_line_names_a_ready_wait_that_gave_up(self):
+        line = self.last_line(log="e2e-cluster-k3d: waiting for kube-system's deployments, at most 300s\n"
+                                  "e2e-cluster-k3d: gave up on kube-system's deployments to be available after 300s. It said:\n"
+                                  "make: *** [Makefile:1080: e2e-cluster-k3d] Error 1\n",
+                              steps={"make": {"outcome": "failure"}})
+        self.assertEqual(line, "FAILED: making the cluster: gave up on kube-system's deployments to be available after 300s")
+
+    def test_the_last_line_names_the_make_s_step_that_died_before_any_check(self):
+        line = self.last_line(log="e2e-cluster: installing the chart\n"
+                                  "Error: INSTALLATION FAILED: context deadline exceeded\n"
+                                  "make[1]: *** [Makefile:1500: e2e-cluster] Error 1\n"
+                                  "make: *** [Makefile:1093: e2e-cluster-k3d] Error 2\n",
+                              steps={"make": {"outcome": "failure"}})
+        self.assertEqual(line, "FAILED: the make's step Makefile:1500: e2e-cluster died before any check failed "
+                               "(Error 1); its last line: Error: INSTALLATION FAILED: context deadline exceeded")
+
+    def test_the_last_line_names_a_step_before_the_make(self):
+        line = self.last_line(log="", steps={"images-built": {"outcome": "success"},
+                                             "k3s-images": {"outcome": "failure"},
+                                             "make": {"outcome": "skipped"}})
+        self.assertEqual(line, "FAILED: the step k3s-images (failure), before the make ran")
+
+    def test_the_last_line_names_a_make_cut_off_by_the_job_s_limit(self):
+        line = self.last_line(log="e2e-cluster-failover: the driver writes\n",
+                              steps={"make": {"outcome": "cancelled"}})
+        self.assertEqual(line, "FAILED: the make was cancelled (the job's time limit) before any check failed; "
+                               "its last line: e2e-cluster-failover: the driver writes")
+
+    def test_the_last_line_names_a_step_after_the_make(self):
+        line = self.last_line(log=self.READY.format(system="none", host="x:1"),
+                              steps={"make": {"outcome": "success"}, "pulls": {"outcome": "failure"}})
+        self.assertEqual(line, "FAILED: the step pulls (failure), after the make")
 
 
 if __name__ == "__main__":

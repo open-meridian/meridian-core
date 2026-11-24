@@ -805,6 +805,7 @@ jobs:
       matrix: ${{ fromJSON(needs.tier.outputs.clusters) }}
     steps:
       - name: The images were built
+        id: images-built
         env:
           IMAGES: ${{ needs.images.result }}
         run: |
@@ -819,12 +820,14 @@ jobs:
       # preloaded images, which core never uses, so the gate's disk budget
       # meets the headroom it was set for (tools/free-runner-disk.sh).
       - name: Free the runner's disk
+        id: free-disk
         working-directory: workspace/meridian-core
         run: tools/free-runner-disk.sh
 
       # Said plainly, because without them the steps below fail with an
       # authentication error that reads like the platform is gone.
       - name: The platform's app credentials are there
+        id: credentials
         env:
           HELD: ${{ secrets.MERIDIAN_PLATFORM_APP_ID != '' && secrets.MERIDIAN_PLATFORM_APP_KEY != '' }}
         run: |
@@ -857,6 +860,7 @@ jobs:
       # The runtime and analytics images this run built, and for the backup
       # run the CLI's, which the images job built from meridian-cli's main.
       - uses: ./workspace/meridian-core/.github/actions/gate-images
+        id: gate-images
         with:
           artifacts: images cluster-images
           # The failover, reconfigure and scaled runs' write driver runs in
@@ -872,6 +876,7 @@ jobs:
           tools: ${{ matrix.target == 'e2e-cluster-failover' && matrix.profile == 'ha' && 'k3d elle-cli' || 'k3d' }}
 
       - name: k3d
+        id: k3d
         run: sudo install -m 0755 "$CI_TOOLS/k3d-linux-amd64" /usr/local/bin/k3d
 
       # Helm 4 for the upgrades: its --wait waits for every resource a
@@ -901,6 +906,7 @@ jobs:
       # 2026-11-17 gave up waiting on kube-system while its images came from
       # Docker Hub.
       - uses: ./workspace/meridian-core/.github/actions/k3s-images
+        id: k3s-images
         with:
           k3s: ${{ matrix.k3s }}
 
@@ -908,6 +914,7 @@ jobs:
       # job's log (tools/ci-watchdog.sh): three runs on 2026-11-19 lost a
       # runner six minutes into the make below, with no log text at all.
       - name: Start the watchdog
+        id: watchdog
         timeout-minutes: 1
         working-directory: workspace/meridian-core
         run: tools/ci-watchdog.sh start "$RUNNER_TEMP/watchdog.log"
@@ -1180,6 +1187,20 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Last, after any failure: one line naming the failed check, or the
+      # ready wait that gave up, or the step that died where no check ran
+      # (v31a item 11). From the make's log and the steps' outcomes alone.
+      - name: The failed assertion
+        if: failure() || cancelled()
+        timeout-minutes: 1
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          if [ -x workspace/meridian-core/tools/ci-watchdog.sh ]; then
+            cd workspace/meridian-core && timeout 10 tools/ci-watchdog.sh verdict "$RUNNER_TEMP/make.log"
+          else
+            echo "FAILED: the job's first steps: core was not checked out"
+          fi
 
   # The cluster runs the pull request's tier leaves to the merge queue, each
   # under its own name, as e2e-harness-left: running nothing, saying so,
@@ -1267,6 +1288,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Free the runner's disk
+        id: free-disk
         working-directory: workspace/meridian-core
         run: tools/free-runner-disk.sh
 
@@ -1306,6 +1328,7 @@ jobs:
       - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
 
       - name: make runtime-image analytics-image
+        id: build
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
@@ -1324,6 +1347,7 @@ jobs:
           echo "analytics=$(tools/release-candidate.sh pushed meridian-analytics:local "$REGISTRY/meridian-analytics")" >> "$GITHUB_OUTPUT"
 
       - name: The platform's app credentials are there
+        id: credentials
         env:
           HELD: ${{ secrets.MERIDIAN_PLATFORM_APP_ID != '' && secrets.MERIDIAN_PLATFORM_APP_KEY != '' }}
         run: |
@@ -1354,6 +1378,7 @@ jobs:
           tools: k3d
 
       - name: k3d
+        id: k3d
         run: sudo install -m 0755 "$CI_TOOLS/k3d-linux-arm64" /usr/local/bin/k3d
 
       - uses: azure/setup-helm@v4
@@ -1368,6 +1393,7 @@ jobs:
       # 2026-11-17 gave up waiting on kube-system while its images came from
       # Docker Hub.
       - uses: ./workspace/meridian-core/.github/actions/k3s-images
+        id: k3s-images
         with:
           k3s: ''
 
@@ -1375,6 +1401,7 @@ jobs:
       # job's log (tools/ci-watchdog.sh): three runs on 2026-11-19 lost a
       # runner six minutes into the make below, with no log text at all.
       - name: Start the watchdog
+        id: watchdog
         timeout-minutes: 1
         working-directory: workspace/meridian-core
         run: tools/ci-watchdog.sh start "$RUNNER_TEMP/watchdog.log"
@@ -1537,6 +1564,20 @@ jobs:
           path: ${{ runner.temp }}/cargo
           key: ${{ steps.cargo.outputs.key }}
 
+      # Last, after any failure: one line naming the failed check, or the
+      # ready wait that gave up, or the step that died where no check ran
+      # (v31a item 11). From the make's log and the steps' outcomes alone.
+      - name: The failed assertion
+        if: failure() || cancelled()
+        timeout-minutes: 1
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          if [ -x workspace/meridian-core/tools/ci-watchdog.sh ]; then
+            cd workspace/meridian-core && timeout 10 tools/ci-watchdog.sh verdict "$RUNNER_TEMP/make.log"
+          else
+            echo "FAILED: the job's first steps: core was not checked out"
+          fi
 
   # The release candidate, tagged once the run is green (ruling 1071): the
   # amd64 and arm64 images every check above ran, as one manifest list per

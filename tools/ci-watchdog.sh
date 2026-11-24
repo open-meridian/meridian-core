@@ -76,6 +76,15 @@
 #                                 ignores every signal, and `timeout` waits
 #                                 for its child, so on the runs that died
 #                                 `timeout 3 ip ...` would hang itself
+#   ci-watchdog.sh verdict <make-log>
+#                                 a failed job's last line, "FAILED: ...",
+#                                 naming the failed check (the first, and
+#                                 how many), else the ready wait that gave
+#                                 up, else the step that failed (STEPS, the
+#                                 steps context as JSON): one before the
+#                                 make, the make's own innermost target, a
+#                                 make cancelled by the job's limit, or one
+#                                 after it. File reads alone
 #   ci-watchdog.sh probe <which> <make-log>
 #                                 one fact as a step's result, which arrives
 #                                 when nothing else does: names, hub, blob,
@@ -101,9 +110,9 @@
 
 set -euo pipefail
 
-usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | proof|probe <which> <make-log>" >&2; exit 2; }
+usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | proof|probe <which> <make-log> | verdict <make-log>" >&2; exit 2; }
 case ${1:-}:$# in
-  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|proof:3|probe:3|probe-one:3) ;;
+  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|proof:3|probe:3|probe-one:3|verdict:2) ;;
   *) usage ;;
 esac
 cmd=$1 file=$2
@@ -562,6 +571,49 @@ case $cmd in
         ;;
       *) usage ;;
     esac
+    ;;
+  verdict)
+    # The job's last line, after any failure (v31a item 11: every cluster
+    # job that fails ends with a line naming the failed assertion). From
+    # file reads and the steps' outcomes alone. $file is the make's log;
+    # STEPS is the job's steps context as JSON (toJSON(steps)), for a step
+    # other than the make that failed or a make that never ran.
+    make=$file
+    failed_step=$(printf '%s' "${STEPS:-}" | jq -r 'to_entries[] | select(.value.outcome == "failure" or .value.outcome == "cancelled") | "\(.key) (\(.value.outcome))"' 2>/dev/null | head -n 1 || true)
+    make_outcome=$(printf '%s' "${STEPS:-}" | jq -r '.make.outcome // empty' 2>/dev/null || true)
+    # An e2e check's own line: "    FAILED: <check>" from the runs, "FAILED:
+    # <check>" from the browser, plugin and terminal checks. A suite's
+    # "<suite> FAILED: <count>" is a count, not a check.
+    checks=$(grep -h -E '^[[:space:]]*FAILED: ' "$make" 2>/dev/null || true)
+    [ -n "$checks" ] || checks=$(grep -h -E '^[[:space:]]*FAILED: ' .e2e-*.log 2>/dev/null || true)
+    n=$(printf '%s\n' "$checks" | grep -c . || true)
+    gave=$(grep -h -E '^e2e-cluster-k3d: (gave up on |the cluster could not be made)' "$make" 2>/dev/null | head -n 1 || true)
+    # The innermost make's error: the first "*** [file:line: target] Error n".
+    died=$(grep -h -E '^make(\[[0-9]+\])?: \*\*\* ' "$make" 2>/dev/null | head -n 1 || true)
+    last=$(grep -v -E '^make(\[[0-9]+\])?: \*\*\* |^[[:space:]]*$' "$make" 2>/dev/null | tail -n 1 | cut -c1-200 || true)
+    if [ "$n" -gt 0 ]; then
+      first=$(printf '%s\n' "$checks" | head -n 1 | sed -e 's/^[[:space:]]*FAILED: //' | cut -c1-300)
+      line="FAILED: $first"
+      [ "$n" -le 1 ] || line="$line (the first of $n failed checks)"
+    elif [ -n "$gave" ]; then
+      line="FAILED: making the cluster: $(printf '%s' "$gave" | sed -e 's/^e2e-cluster-k3d: //' -e 's/\. It said:$//' | cut -c1-300)"
+    elif [ ! -s "$make" ] || [ "$make_outcome" = skipped ]; then
+      line="FAILED: the step ${failed_step:-before the make (unnamed)}, before the make ran"
+    elif [ -n "$died" ]; then
+      target=$(printf '%s' "$died" | sed -n 's/.*\*\*\* \[\([^]]*\)\].*/\1/p')
+      line="FAILED: the make's step ${target:-?} died before any check failed ($(printf '%s' "$died" | sed 's/.*\] //')); its last line: ${last:-none}"
+    elif [ "$make_outcome" = cancelled ]; then
+      line="FAILED: the make was cancelled (the job's time limit) before any check failed; its last line: ${last:-none}"
+    elif [ -n "$failed_step" ]; then
+      line="FAILED: the step $failed_step, after the make"
+    else
+      line="FAILED: no check and no step named the failure; the make's last line: ${last:-none}"
+    fi
+    echo "::error title=The failed assertion::$(printf '%s' "$line" | sed -e 's/%/%25/g')"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      printf -- '### The failed assertion\n\n%s\n' "$line" >>"$GITHUB_STEP_SUMMARY" || true
+    fi
+    echo "$line"
     ;;
   probe)
     # $file names the fact, $3 is the make's log. A step that fails says the
