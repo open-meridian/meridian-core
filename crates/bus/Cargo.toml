@@ -13,7 +13,7 @@ async-nats.workspace = true
 futures-util.workspace = true
 meridian-pb.workspace = true
 meridian-domain.workspace = true
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
