@@ -1232,21 +1232,24 @@ pub async fn write_forever(
 ) -> Result<(), String> {
     let context = jetstream::new(client.clone());
     let config = stream_config(&bounds);
-    // Made, or brought to the bounds this release sets: never with fewer
-    // replicas than set, to get past a broker not yet ready (step 3d). Until
-    // then the lake takes no write, and says why in its report.
+    // Made where the broker says there is none: never with fewer replicas
+    // than set, to get past a broker not yet ready (step 3d), and never
+    // over one it could not say of (v31a item 5): a stream made again is
+    // another stream, and the writes the one before held would be passed
+    // by. Brought to this release's bounds once the writer knows its place
+    // (below). Until then the lake takes no write, and says why in its
+    // report.
     loop {
         let made = match context.get_stream(STREAM).await {
-            Ok(_) => context
-                .update_stream(config.clone())
-                .await
-                .map(|_| ())
-                .map_err(|f| f.to_string()),
-            Err(_) => context
+            Ok(_) => Ok(()),
+            Err(failed) if not_found(&failed) => context
                 .create_stream(config.clone())
                 .await
                 .map(|_| ())
                 .map_err(|f| f.to_string()),
+            Err(failed) => Err(format!(
+                "the broker did not say whether it holds it ({failed})"
+            )),
         };
         match made {
             Ok(()) => {
@@ -1276,6 +1279,7 @@ pub async fn write_forever(
         }
     };
     let mut writer = started(&lake, identity).await;
+    bring_to_bounds(&lake, &context, &config, &bounds, &writer).await;
     let place = Arc::new(AtomicU64::new(writer.next()));
     let guarding = tokio::spawn(guard_forever(
         context.clone(),
@@ -1430,6 +1434,79 @@ pub async fn write_forever(
                 }
             }
         }
+    }
+}
+
+/// Whether the broker said it holds no stream of that name: only then is
+/// one made (v31a item 5).
+fn not_found(failed: &jetstream::context::GetStreamError) -> bool {
+    matches!(
+        failed.kind(),
+        jetstream::context::GetStreamErrorKind::JetStream(said)
+            if said.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+    )
+}
+
+/// The stream brought to this release's bounds where they differ from its
+/// own, unless that would drop a write past the writer's place
+/// ([`guard::bounds_drop`], v31a item 5): then it is kept as it is, and the
+/// refusal said naming it, until the writer starts again.
+async fn bring_to_bounds(
+    lake: &Arc<Lake>,
+    context: &jetstream::Context,
+    config: &stream::Config,
+    bounds: &Bounds,
+    writer: &Writer,
+) {
+    let Ok(mut stream) = context.get_stream(STREAM).await else {
+        tracing::warn!("the write-ahead stream could not be read to bring it to its bounds");
+        return;
+    };
+    let info = match stream.info().await {
+        Ok(info) => info.clone(),
+        Err(failed) => {
+            tracing::warn!(%failed, "the write-ahead stream could not be read to bring it to its bounds");
+            return;
+        }
+    };
+    let held = &info.config;
+    if (held.max_age, held.max_bytes, held.num_replicas)
+        == (config.max_age, config.max_bytes, config.num_replicas)
+    {
+        return;
+    }
+    let mut standing = guard::Standing::of(&info.state);
+    // The oldest write past the place is the one whose age a lower age
+    // bound is held to, where the stream's oldest is one the lake recorded.
+    let next = writer.next();
+    if standing.first < next && next <= standing.last {
+        match stream.direct_get(next).await {
+            Ok(at) => {
+                standing.first = next;
+                standing.oldest_ns = i64::try_from(at.time.unix_timestamp_nanos()).unwrap_or(0);
+            }
+            Err(failed) => {
+                tracing::warn!(
+                    %failed,
+                    next,
+                    "the write-ahead stream kept at its bounds: its write at the lake's place \
+                     could not be read"
+                );
+                return;
+            }
+        }
+    }
+    if let Some(refused) = guard::bounds_drop(STREAM, &standing, next, bounds, lake.now_ns()) {
+        tracing::warn!(stream = STREAM, next, "{refused}");
+        return;
+    }
+    match context.update_stream(config.clone()).await {
+        Ok(_) => tracing::info!(
+            max_age_s = bounds.max_age.as_secs(),
+            max_bytes = bounds.max_bytes,
+            "the write-ahead stream brought to this release's bounds"
+        ),
+        Err(failed) => tracing::warn!(%failed, "the write-ahead stream kept at its bounds"),
     }
 }
 

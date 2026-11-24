@@ -12,6 +12,12 @@
 //! look finds it below both. The dashboard files that as a standing notice
 //! and its clearing ([`STUCK_FULL`]). Why a stream stands full is not
 //! judged here.
+//!
+//! **Never made again over writes the lake has not recorded.** The writer
+//! makes the stream only where the broker says there is none, and brings it
+//! to this release's bounds only where that drops no write past the lake's
+//! place ([`bounds_drop`]): a bound lowered while such a write is held is
+//! refused, naming the stream, and the stream kept as it is.
 
 use std::time::Duration;
 
@@ -142,6 +148,44 @@ impl Full {
         let stuck_for = at.duration_since(since);
         (stuck_for >= self.after).then(|| standing.words(bounds, next, now_ns, stuck_for))
     }
+}
+
+/// Whether bringing the stream as it stands to `bounds` would drop a write
+/// past the lake's place `next`: a lower byte bound than it holds, or an
+/// age bound its oldest write the lake has not recorded is past. The words
+/// it is refused with, naming the stream; none where the bounds drop none.
+pub fn bounds_drop(
+    name: &str,
+    standing: &Standing,
+    next: u64,
+    bounds: &Bounds,
+    now_ns: i64,
+) -> Option<String> {
+    let past = standing.past(next);
+    if past == 0 {
+        return None;
+    }
+    let max_bytes = u64::try_from(bounds.max_bytes).unwrap_or(0);
+    let unrecorded_oldest = standing.first >= next;
+    let age = standing.oldest_age(now_ns).unwrap_or_default();
+    let why = if standing.bytes > max_bytes {
+        format!(
+            "it holds {} bytes, over the {} bytes bound",
+            standing.bytes, max_bytes
+        )
+    } else if unrecorded_oldest && age > bounds.max_age {
+        format!(
+            "its oldest write, not yet recorded, is {}s old, past the {}s bound",
+            age.as_secs(),
+            bounds.max_age.as_secs()
+        )
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the write-ahead stream {name} is kept as it is, not brought to this release's bounds: \
+         {why}, and it holds {past} write(s) the lake has not recorded, which the bound would drop"
+    ))
 }
 
 #[cfg(test)]

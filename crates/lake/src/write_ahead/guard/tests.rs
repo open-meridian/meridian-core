@@ -105,3 +105,52 @@ fn a_stream_is_at_its_age_bound_only_where_its_oldest_write_is_not_recorded_and_
     assert!(!empty.at_a_bound(&b, 1, now));
     assert_eq!(empty.past(1), 0);
 }
+
+/// Never made again over writes the lake has not recorded (v31a item 5):
+/// a bound lowered under what the stream holds past the lake's place is
+/// refused, naming the stream; one that drops nothing the lake has not
+/// recorded is not.
+#[test]
+fn bounds_that_would_drop_a_write_the_lake_has_not_recorded_are_refused_naming_the_stream() {
+    let now = 1_700_000_000 * S;
+    let lower_bytes = Bounds {
+        max_bytes: 64 << 20,
+        ..bounds()
+    };
+    let held = standing(1, 4_000, 100 * MIB, now, 300);
+    let refused = bounds_drop("LAKE_WRITE_AHEAD", &held, 3_000, &lower_bytes, now)
+        .expect("a byte bound under what it holds, writes past the place");
+    assert!(refused.contains("LAKE_WRITE_AHEAD"), "{refused}");
+    assert!(
+        refused.contains("1001 write(s) the lake has not recorded"),
+        "{refused}"
+    );
+    assert_eq!(
+        bounds_drop("LAKE_WRITE_AHEAD", &held, 4_001, &lower_bytes, now),
+        None,
+        "every write recorded: nothing the lake has not recorded is dropped"
+    );
+    let shorter = Bounds {
+        max_age: Duration::from_secs(20),
+        ..bounds()
+    };
+    // Its oldest past the place, 300 s old, against 20 s.
+    let refused = bounds_drop("LAKE_WRITE_AHEAD", &held, 1, &shorter, now)
+        .expect("an age bound its oldest unrecorded write is past");
+    assert!(
+        refused.contains("300s old, past the 20s bound"),
+        "{refused}"
+    );
+    // The oldest past the place 5 s old (the caller read it), the stream's
+    // own oldest recorded: nothing unrecorded is dropped.
+    let young_past = standing(3_000, 4_000, 100 * MIB, now, 5);
+    assert_eq!(
+        bounds_drop("LAKE_WRITE_AHEAD", &young_past, 3_000, &shorter, now),
+        None
+    );
+    assert_eq!(
+        bounds_drop("LAKE_WRITE_AHEAD", &held, 3_000, &bounds(), now),
+        None,
+        "the same bounds drop nothing"
+    );
+}
