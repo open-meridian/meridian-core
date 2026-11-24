@@ -35,7 +35,7 @@ async fn a_stream_at_its_byte_bound_for_the_stuck_bound_is_said_stuck_full_until
     let at = |s: u64| start + Duration::from_secs(s);
     // 256 MiB held of 256: no room for the broker's largest write. The lake
     // at 900 of 4,000.
-    let stuck = standing(1, 4_000, 256 * MIB - 1_000, now, 120);
+    let stuck = standing(1, 4_000, 256 * MIB - 1_000, now, 500).from_place(901, now - 120 * S);
     assert_eq!(full.looked(at(0), &stuck, 901, &bounds(), now), None);
     assert_eq!(full.looked(at(25), &stuck, 901, &bounds(), now), None);
     let said = full
@@ -45,7 +45,7 @@ async fn a_stream_at_its_byte_bound_for_the_stuck_bound_is_said_stuck_full_until
     for figure in [
         "for 30s",
         "holds 256.0 MiB of its 256.0 MiB bound",
-        "its oldest write 120s old of its 600s bound",
+        "the oldest write the lake has not recorded 120s old of its 600s bound",
         "3100 write(s) past the lake's place",
         "the lake at 900, the stream at 4000",
     ] {
@@ -73,6 +73,10 @@ async fn a_stream_full_of_writes_the_lake_recorded_is_stuck_full_saying_none_is_
         .looked(start + STUCK_AFTER, &recorded, 4_001, &bounds(), now)
         .expect("stuck full");
     assert!(said.contains(" 0 write(s) past the lake's place"), "{said}");
+    assert!(
+        said.contains("no write the lake has not recorded to age against its 600s bound"),
+        "{said}"
+    );
 }
 
 /// At its age bound: its oldest write one the lake has not recorded, within
@@ -88,10 +92,26 @@ fn a_stream_is_at_its_age_bound_only_where_its_oldest_write_is_not_recorded_and_
         !unrecorded_old.at_a_bound(&b, 201, now),
         "every write recorded"
     );
-    let recorded_old = standing(100, 200, MIB, now, 580);
+    // Its oldest recorded, the lake at 150: its oldest write the lake has
+    // not recorded is the one at 150, whose time is read from the stream
+    // (the review of the stream guard, finding 3). 580 s old of 600, it is
+    // about to be dropped; a minute old, it is not.
+    let recorded_old = standing(100, 200, MIB, now, 590);
+    assert!(recorded_old.oldest_is_recorded(150));
+    assert!(!recorded_old.oldest_is_recorded(100) && !recorded_old.oldest_is_recorded(201));
+    let about_to_drop = recorded_old.from_place(150, now - 580 * S);
+    assert_eq!((about_to_drop.first, about_to_drop.past(150)), (150, 51));
     assert!(
-        !recorded_old.at_a_bound(&b, 150, now),
-        "its oldest recorded"
+        about_to_drop.at_a_bound(&b, 150, now),
+        "the write at the lake's place is about to be dropped"
+    );
+    assert!(!recorded_old
+        .from_place(150, now - 60 * S)
+        .at_a_bound(&b, 150, now));
+    assert_eq!(
+        recorded_old.from_place(100, now - 5 * S),
+        recorded_old,
+        "its oldest is the one at the place: nothing read"
     );
     let young = standing(100, 200, MIB, now, 60);
     assert!(!young.at_a_bound(&b, 100, now));

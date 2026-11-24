@@ -1447,6 +1447,27 @@ fn not_found(failed: &jetstream::context::GetStreamError) -> bool {
     )
 }
 
+/// The stream as it stands from the lake's place `next`
+/// ([`guard::Standing::from_place`]): where its oldest write is one the
+/// lake recorded and it holds writes the lake has not, the write at the
+/// place is read from it for its time -- the oldest write the lake has not
+/// recorded, whose age the age bound is held to.
+async fn from_place(
+    stream: &stream::Stream,
+    standing: guard::Standing,
+    next: u64,
+) -> Result<guard::Standing, String> {
+    if !standing.oldest_is_recorded(next) {
+        return Ok(standing);
+    }
+    let at = stream
+        .direct_get(next)
+        .await
+        .map_err(|failed| failed.to_string())?;
+    let at_ns = i64::try_from(at.time.unix_timestamp_nanos()).unwrap_or(0);
+    Ok(standing.from_place(next, at_ns))
+}
+
 /// The stream brought to this release's bounds where they differ from its
 /// own, unless that would drop a write past the writer's place
 /// ([`guard::bounds_drop`], v31a item 5), or the broker refuses them: then
@@ -1481,7 +1502,7 @@ async fn bring_to_bounds(
     if same(config) {
         return None;
     }
-    let mut standing = guard::Standing::of(&info.state);
+    let standing = guard::Standing::of(&info.state);
     // A byte bound under what the stream holds is not applied: the stream
     // keeps its own, and the rest of the bounds are brought as ever.
     let mut config = config.clone();
@@ -1496,23 +1517,18 @@ async fn bring_to_bounds(
     // The oldest write past the place is the one whose age a lower age
     // bound is held to, where the stream's oldest is one the lake recorded.
     let next = writer.next();
-    if standing.first < next && next <= standing.last {
-        match stream.direct_get(next).await {
-            Ok(at) => {
-                standing.first = next;
-                standing.oldest_ns = i64::try_from(at.time.unix_timestamp_nanos()).unwrap_or(0);
-            }
-            Err(failed) => {
-                tracing::warn!(
-                    %failed,
-                    next,
-                    "the write-ahead stream kept at its bounds: its write at the lake's place \
-                     could not be read"
-                );
-                return bytes_kept;
-            }
+    let standing = match from_place(&stream, standing, next).await {
+        Ok(standing) => standing,
+        Err(failed) => {
+            tracing::warn!(
+                %failed,
+                next,
+                "the write-ahead stream kept at its bounds: its write at the lake's place \
+                 could not be read"
+            );
+            return bytes_kept;
         }
-    }
+    };
     if let Some(refused) = guard::bounds_drop(STREAM, &standing, next, bounds, lake.now_ns()) {
         tracing::warn!(stream = STREAM, next, "{refused}");
         return guard::said(Some(refused), bytes_kept.as_deref());
@@ -1551,7 +1567,9 @@ impl Drop for AbortOnDrop {
 /// The stream looked at every [`guard::LOOK_EVERY`] against the writer's
 /// place (v31a item 5): stuck full, its member says so, degraded, with its
 /// figures; drained, it says so no longer. Judged at each look by the
-/// stream's own bounds, as its leader says them then -- never the chart's,
+/// stream's own bounds, as its leader says them then, its age bound held
+/// to the oldest write the lake has not recorded ([`from_place`]) -- never
+/// the chart's,
 /// which the stream does not hold where it was kept as it was (`kept`, the
 /// refusal [`bring_to_bounds`] gave, which the member says for as long as
 /// this writer runs). A look the broker does not answer changes nothing
@@ -1570,15 +1588,33 @@ async fn guard_forever(
     }
     loop {
         tokio::time::sleep(guard::LOOK_EVERY).await;
-        let looked = match context.get_stream(STREAM).await {
-            Ok(mut stream) => stream
+        let next = place.load(Ordering::Relaxed);
+        // The stream, and from the lake's place: once the stream has
+        // dropped or the lake recorded its oldest, the age held to its
+        // bound is the write's at the place.
+        let looked = async {
+            let mut stream = context
+                .get_stream(STREAM)
+                .await
+                .map_err(|failed| failed.to_string())?;
+            let (state, held) = stream
                 .info()
                 .await
                 .map(|info| (info.state.clone(), info.config.clone()))
-                .map_err(|f| f.to_string()),
-            Err(failed) => Err(failed.to_string()),
+                .map_err(|failed| failed.to_string())?;
+            // Its write at the place not read, it is judged by its bytes
+            // alone at this look.
+            let standing = guard::Standing::of(&state);
+            let standing = match from_place(&stream, standing, next).await {
+                Ok(standing) => standing,
+                Err(failed) => {
+                    tracing::debug!(%failed, next, "the write at the lake's place was not read");
+                    standing
+                }
+            };
+            Ok::<_, String>((standing, held))
         };
-        let (state, held) = match looked {
+        let (standing, held) = match looked.await {
             Ok(looked) => looked,
             Err(failed) => {
                 tracing::debug!(%failed, "the write-ahead stream's guard could not look at it");
@@ -1590,8 +1626,6 @@ async fn guard_forever(
             max_bytes: held.max_bytes,
             replicas: held.num_replicas,
         };
-        let standing = guard::Standing::of(&state);
-        let next = place.load(Ordering::Relaxed);
         match full.looked(
             tokio::time::Instant::now(),
             &standing,

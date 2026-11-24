@@ -7,8 +7,9 @@
 //! the stream every [`LOOK_EVERY`], and where every look for [`STUCK_AFTER`]
 //! found it at a bound, it is *stuck full*. The writer's member says so in
 //! its report, degraded, with the figures that tell its causes apart -- the
-//! bytes it holds against its bound, its oldest write's age against its age
-//! bound, and how many writes it holds past the lake's place -- until a
+//! bytes it holds against its bound, the age of the oldest write the lake
+//! has not recorded against its age bound, and how many writes it holds
+//! past the lake's place -- until a
 //! look finds it below both. The dashboard files that as a standing notice
 //! and its clearing ([`STUCK_FULL`]). Why a stream stands full is not
 //! judged here. The bounds are the stream's own, as its leader says them
@@ -83,24 +84,54 @@ impl Standing {
         (self.last + 1).saturating_sub(next.max(self.first))
     }
 
+    /// Whether its oldest write is one the lake recorded while it holds
+    /// writes the lake has not: then its oldest write the lake has not
+    /// recorded is the one at the place `next`, whose time the stream's
+    /// state does not say, and is read from the stream ([`Self::from_place`]).
+    pub fn oldest_is_recorded(&self, next: u64) -> bool {
+        self.messages > 0 && self.first < next && next <= self.last
+    }
+
+    /// It from the lake's place `next`, the write there made at `at_ns`:
+    /// its first and oldest the write at the place, where its own oldest
+    /// is one the lake recorded ([`Self::oldest_is_recorded`]); itself
+    /// where not.
+    #[must_use]
+    pub fn from_place(mut self, next: u64, at_ns: i64) -> Self {
+        if self.oldest_is_recorded(next) {
+            self.first = next;
+            self.oldest_ns = at_ns;
+        }
+        self
+    }
+
+    /// The age at `now_ns` of the oldest write the lake has not recorded:
+    /// none where it holds none past the place `next`, nor where its
+    /// oldest is one the lake recorded (read from the place first,
+    /// [`Self::from_place`]).
+    pub fn unrecorded_age(&self, next: u64, now_ns: i64) -> Option<Duration> {
+        (self.first >= next && self.past(next) > 0)
+            .then(|| self.oldest_age(now_ns))
+            .flatten()
+    }
+
     /// Its oldest write's age at `now_ns`; none where it holds none.
     pub fn oldest_age(&self, now_ns: i64) -> Option<Duration> {
         (self.messages > 0)
             .then(|| Duration::from_nanos(now_ns.saturating_sub(self.oldest_ns).max(0) as u64))
     }
 
-    /// Whether it stands at its byte bound -- some write refused -- or its
-    /// oldest write is one the lake has not recorded and is about to be
-    /// dropped at its age bound.
+    /// Whether it stands at its byte bound -- some write refused -- or the
+    /// oldest write the lake has not recorded is about to be dropped at its
+    /// age bound. Taken from the lake's place first ([`Self::from_place`]),
+    /// so that write is its oldest once drops have started.
     pub fn at_a_bound(&self, bounds: &Bounds, next: u64, now_ns: i64) -> bool {
         // A bound of none (the broker's -1 bytes, 0 s) is never stood at.
         let max_bytes = u64::try_from(bounds.max_bytes).unwrap_or(0);
         let by_bytes = max_bytes > 0 && self.bytes.saturating_add(LARGEST_WRITE) > max_bytes;
         let by_age = !bounds.max_age.is_zero()
-            && self.first >= next
-            && self.past(next) > 0
             && self
-                .oldest_age(now_ns)
+                .unrecorded_age(next, now_ns)
                 .is_some_and(|age| age + STUCK_AFTER >= bounds.max_age);
         by_bytes || by_age
     }
@@ -109,16 +140,24 @@ impl Standing {
     /// the figures that tell its causes apart.
     pub fn words(&self, bounds: &Bounds, next: u64, now_ns: i64, stuck_for: Duration) -> String {
         let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
-        let age = self.oldest_age(now_ns).unwrap_or_default();
+        let age = match self.unrecorded_age(next, now_ns) {
+            Some(age) => format!(
+                "the oldest write the lake has not recorded {}s old of its {}s bound",
+                age.as_secs(),
+                bounds.max_age.as_secs()
+            ),
+            None => format!(
+                "no write the lake has not recorded to age against its {}s bound",
+                bounds.max_age.as_secs()
+            ),
+        };
         format!(
-            "{STUCK_FULL} for {}s: holds {:.1} MiB of its {:.1} MiB bound, its oldest write {}s \
-             old of its {}s bound, {} write(s) past the lake's place (the lake at {}, the stream \
-             at {}); a write it has no room for is refused for load, none it holds is dropped",
+            "{STUCK_FULL} for {}s: holds {:.1} MiB of its {:.1} MiB bound, {age}, {} write(s) \
+             past the lake's place (the lake at {}, the stream at {}); a write it has no room \
+             for is refused for load, none it holds is dropped",
             stuck_for.as_secs(),
             mib(self.bytes),
             mib(u64::try_from(bounds.max_bytes).unwrap_or(0)),
-            age.as_secs(),
-            bounds.max_age.as_secs(),
             self.past(next),
             next.saturating_sub(1),
             self.last
