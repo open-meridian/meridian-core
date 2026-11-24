@@ -107,7 +107,9 @@ pg_hba.conf's, trust only on a local line, and under internal TLS (ruling
 1084) a line that would admit a connection in the clear is refused -- every
 remote line is hostssl, or its method is reject. A line the server would
 not start with is refused too: its address, its mask and its options are
-each checked for their shape.
+each checked for their shape. Under Patroni the value must hold a line
+admitting the postgres role's replication, which the members copy the
+primary by.
 Takes (dict "top" . "patroni" bool "tls" bool).
 */}}
 {{- define "meridian-runtime.databaseAccess" -}}
@@ -132,6 +134,7 @@ Takes (dict "top" . "patroni" bool "tls" bool).
 {{- $anIp := "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$" -}}
 {{- $aRange := "^([0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*/[0-9]{1,3})$" -}}
 {{- $aName := "^\\.?[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$" -}}
+{{- $replication := false -}}
 {{- range $rules -}}
 {{- if not (kindIs "string" .) -}}
 {{- fail (printf "database.brought.pgHba has %v; each item is one pg_hba.conf line, a string" .) -}}
@@ -189,6 +192,14 @@ Takes (dict "top" . "patroni" bool "tls" bool).
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- $databases := splitList "," (index $words 1) -}}
+{{- $users := splitList "," (index $words 2) -}}
+{{- if and (not $local) (ne $method "reject") (has "replication" $databases) (or (has "postgres" $users) (has "all" $users)) -}}
+{{- $replication = true -}}
+{{- end -}}
+{{- end -}}
+{{- if and .patroni .top.Values.database.brought.pgHba (not $replication) -}}
+{{- fail "database.brought.pgHba has no line admitting the postgres role's replication, and with standbys or read replicas (Patroni) the members copy the primary by it: without one no standby follows, and then no commit is acknowledged. Give one before the lines for every other role, for example \"host replication postgres 10.0.0.0/8 scram-sha-256\" (hostssl with tls.internal.enabled)" -}}
 {{- end -}}
 {{- toJson $rules -}}
 {{- end -}}

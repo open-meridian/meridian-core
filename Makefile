@@ -3743,6 +3743,25 @@ chart-check:
 	refused "" '["host @dbs all all md5"]' "a file the pod does not hold" "no @file"; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set-json 'database.brought.pgHba=["local all all peer map=m","host db1,db2 +grp,u ::1/128 md5","host all all .example.com scram-sha-256","host all all samenet scram-sha-256","hostssl all all 10.0.0.0 255.0.0.0 cert clientcert=verify-full"]' >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: database.brought.pgHba refused a well-formed line: a local line with an option, lists of databases and users, an IPv6 range, a domain suffix, samenet, or an address and mask" >&2; exit 1; }
+	@# Finding 4: under Patroni the members copy the primary as the postgres
+	@# role, by a replication line. A value without one left every standby
+	@# behind, and then every commit waiting on one (synchronous ANY 1): it
+	@# is refused, with standbys and with a read replica alone.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	refused() { said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$1 --set-json "database.brought.pgHba=$$2" 2>&1 >/dev/null)" \
+			&& { echo "chart-check FAILED: database.brought.pgHba rendered $$2: $$3" >&2; exit 1; }; \
+		echo "$$said" | grep -qF -- "$$4" \
+			|| { echo "chart-check FAILED: database.brought.pgHba's $$2 was refused without saying \"$$4\": $$said" >&2; exit 1; }; }; \
+	for patroni in "--set resilience.profile=ha" "--set database.brought.readReplicas=1"; do \
+		refused "$$patroni" '["host all all 10.0.0.0/8 scram-sha-256"]' "under Patroni ($$patroni), no replication line" "no line admitting the postgres role's replication"; \
+		refused "$$patroni" '["host replication postgres all reject","host all all all scram-sha-256"]' "under Patroni ($$patroni), replication only rejected" "no line admitting the postgres role's replication"; \
+		refused "$$patroni" '["host replication other all scram-sha-256","host all all all scram-sha-256"]' "under Patroni ($$patroni), replication for another role only" "no line admitting the postgres role's replication"; \
+		refused "$$patroni" '["local replication postgres peer","host all all all scram-sha-256"]' "under Patroni ($$patroni), replication over the pod's own socket only" "no line admitting the postgres role's replication"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$patroni --set-json 'database.brought.pgHba=["host replication,all all 10.0.0.0/8 scram-sha-256"]' >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: under Patroni ($$patroni), a line admitting replication to every role was refused" >&2; exit 1; }; \
+	done; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set-json 'database.brought.pgHba=["host all all 10.0.0.0/8 scram-sha-256"]' >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: alone, where nothing replicates, a value with no replication line was refused" >&2; exit 1; }
 	@# An external database's private CA (database.caSecret, ruled
 	@# 2026-11-08): its Secret's ca.crt mounted, and named to the runtime,
 	@# in every pod that connects to the database -- the five stores, the
