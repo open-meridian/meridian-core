@@ -1759,17 +1759,23 @@ impl PostgresStore {
             )
             .map_err(unavailable)?
             .map(|row| row.get(0));
-        // Placed in another database (step 3d; section 6.4): found there.
-        let found = here.or_else(|| {
-            self.databases.get().and_then(|stores| {
-                stores
-                    .iter()
-                    .filter_map(std::sync::Weak::upgrade)
-                    .filter(|store| !std::ptr::eq(store.as_ref(), self))
-                    .find_map(|store| store.placement_held(account_id))
-            })
-        });
+        // Placed in another database (step 3d; section 6.4): found there,
+        // by its row -- the record, never that store's memory of where it
+        // last found the account, which names the partition it left once
+        // it is closed toward this database (PR CI 45339243058).
+        let found = here.or_else(|| self.placed_elsewhere(account_id));
         Ok(found.unwrap_or_else(|| first_partition_of(account_id).to_string()))
+    }
+
+    /// The partition another of the book's databases holds `account_id` in
+    /// now, by its row there; none where none holds it, or none answers.
+    fn placed_elsewhere(&self, account_id: &str) -> Option<String> {
+        self.databases
+            .get()?
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|store| !std::ptr::eq(store.as_ref(), self))
+            .find_map(|store| store.account_row(account_id).ok().flatten())
     }
 
     fn place(&self, account_id: &str, partition: &str) {
@@ -2046,14 +2052,27 @@ impl PostgresStore {
         } = &pending.command;
         // Its account's partition read again under the partition's lock
         // (section 6.3): an account found in another is acted on there.
-        let now: String = tx
+        let here: Option<String> = tx
             .query_opt(
                 "SELECT partition FROM book_account WHERE account_id = $1",
                 &[account_id],
             )
             .map_err(unavailable)?
-            .map(|row| row.get(0))
-            .unwrap_or_else(|| first_partition_of(account_id).to_string());
+            .map(|row| row.get(0));
+        // Closed in another database toward this partition, and not opened
+        // here yet (step 3d; section 6.8; PR CI 45339243058): this database
+        // holds no row of it until its open copies it, so it is held but
+        // for the open, as an account closed and not yet opened within one
+        // database is below -- never taken for one in its first partition.
+        if here.is_none()
+            && !crate::moves::is_open_key(idempotency_key)
+            && self.placed_elsewhere(account_id).as_deref() == Some(partition)
+        {
+            return Ok(Err(StoreError::Held(format!(
+                "account {account_id} is moving to {partition}: ask again in a moment"
+            ))));
+        }
+        let now = here.unwrap_or_else(|| first_partition_of(account_id).to_string());
         if now != partition {
             return Ok(Err(StoreError::Moved(now)));
         }
