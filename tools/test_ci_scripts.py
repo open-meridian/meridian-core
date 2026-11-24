@@ -16,6 +16,10 @@ of `make e2e-harness-check`.
   Ready and no node container is restarting, its restart count steady
   (v31a item 11; queue run 45395079443's agent-2 restart-looped while every
   ready wait passed).
+- e2e/cluster/image-load.sh: an image that never reached a node says that
+  node's container state (restarts, exit code, OOMKilled) and its log's last
+  200 lines (e2e/cluster/node-state.sh), as the watchdog's evidence does for
+  every node (v31a item 11).
 - tools/ci-sdk.sh: interop reads the SDK release tools/ci-sdk.txt pins, and
   another ref only where a run names it, said as a warning (v31a item 11).
 """
@@ -362,6 +366,50 @@ esac
         first = recipe.index("e2e/cluster/nodes-steady.sh")
         self.assertLess(first, recipe.index('ready "the API server'))
         self.assertIn('ready "every node Ready, its container running and not restarting', recipe)
+
+
+class ImageLoad(unittest.TestCase):
+    """image-load.sh with k3d and docker stood in for: the import exits 0
+    and agent-1's containerd never holds the image."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="c4b2-load-")
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        stub(self.bin, "k3d", "echo imported\n")
+        stub(self.bin, "sleep", "")
+        stub(self.bin, "docker", """
+case "$1" in
+  ps) printf 'k3d-c-server-0\nk3d-c-agent-1\nk3d-c-serverlb\n' ;;
+  image) exit 0 ;;
+  exec) echo "IMAGE TAG ID SIZE"; [ "$2" = k3d-c-agent-1 ] || echo "docker.io/library/app 1 x 1MB" ;;
+  inspect) echo "running true, restarting false, restarts 3, last exit 137, OOMKilled true, started a, finished b" ;;
+  logs) for n in $(seq 1 250); do echo "line $n of $5"; done | tail -n "$4" ;;
+esac
+""")
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def test_an_image_that_never_reached_a_node_says_what_docker_says_of_that_node(self):
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
+        done = subprocess.run(["sh", os.path.join(E2E, "image-load.sh"), "k3d", "c", "app:1"],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("image-load: app:1 never arrived in k3d-c-agent-1", done.stderr)
+        self.assertIn("node-state: k3d-c-agent-1: running true, restarting false, restarts 3, last exit 137, "
+                      "OOMKilled true", done.stderr)
+        self.assertIn("node-state: k3d-c-agent-1, its log's last 200 lines:", done.stderr)
+        said = [line for line in done.stderr.splitlines() if line.startswith("    line ")]
+        self.assertEqual((len(said), said[-1].strip()), (200, "line 250 of k3d-c-agent-1"))
+        self.assertNotIn("node-state: k3d-c-server-0", done.stderr)
+
+    def test_the_watchdog_s_evidence_says_every_node_container(self):
+        with open(os.path.join(TOOLS, "ci-watchdog.sh")) as f:
+            watchdog = f.read()
+        evidence = watchdog[watchdog.index("\n  evidence)"):watchdog.index("\n  beacon)")]
+        self.assertIn("nodes_said", evidence)
+        self.assertIn("e2e/cluster/node-state.sh\" 200 $bad", watchdog)
 
 
 class SdkRef(unittest.TestCase):

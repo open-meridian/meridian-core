@@ -267,6 +267,24 @@ loop() {
   done
 }
 
+# Every k3d node container's state (e2e/cluster/node-state.sh), and the
+# last 200 lines of each that restarted or is not running. Bounded per call.
+nodes_said() {
+  local all node bad=""
+  all=$(timeout 4 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^k3d-.*-(server|agent)-[0-9]+$' | sort || true)
+  if [ -z "$all" ]; then echo "(no k3d node container here)"; return 0; fi
+  # shellcheck disable=SC2086 # one name a word
+  bounded 30 "$(dirname "$0")/../e2e/cluster/node-state.sh" 0 $all
+  for node in $all; do
+    case $(timeout 4 docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$node" 2>/dev/null) in
+      "true 0") ;;
+      *) bad="$bad $node" ;;
+    esac
+  done
+  # shellcheck disable=SC2086 # one name a word
+  [ -z "$bad" ] || bounded 30 "$(dirname "$0")/../e2e/cluster/node-state.sh" 200 $bad
+}
+
 # What a failed make left on disk, from file reads alone: no network and no
 # Docker, so it is ready to send before anything is probed. $1 is the make's
 # log, $2 the sampler's file. Evidence first: the runner, the proofs'
@@ -418,6 +436,11 @@ case $cmd in
         echo "-- $node: its resolver, a lookup, its images"
         bounded 8 docker exec "$node" sh -c 'cat /etc/resolv.conf; nslookup registry-1.docker.io 2>&1 | tail -n 6; crictl images 2>&1 | head -n 20'
       done
+      # Every node container, as Docker has it, and the last 200 lines of
+      # each one that restarted or is not running (v31a item 11: queue run
+      # 45395079443's agent-2 restart-looped, and nothing kept said why).
+      echo "== the cluster's node containers"
+      nodes_said
       echo "== the sampler's file: its start, then its last three samples"
       sed -n '1,/^=== 20/p' "$watch" 2>/dev/null | head -n 40
       awk '/^=== /{n++} {l[NR]=$0; s[NR]=n} END{for(i=1;i<=NR;i++) if(s[i]>n-3) print l[i]}' "$watch" 2>/dev/null | tail -n 80
@@ -433,6 +456,7 @@ case $cmd in
     section "the make's last 60" | tail -n 25 | annotate error "the make's last lines"
     section 'the network now' | annotate warning "the runner's network after the make"
     section 'the cluster, if it was left' | annotate warning "the cluster the make left"
+    section "the cluster's node containers" | grep '^node-state: [^,]*: ' | annotate warning "the cluster's node containers"
     section "the sampler's file" | grep -E '^=== |^net: |^Mem:|^/dev/|[Oo]ut of memory|oom' | tail -n 30 | annotate warning "the watchdog's last samples"
     if [ -n "$posting" ]; then
       if [ -s "$watch.check" ]; then
