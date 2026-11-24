@@ -937,6 +937,11 @@ fn a_data_plugin_writes_ahead_on_its_own_subjects_and_the_lake_reads_the_stream(
             "$JS.API.CONSUMER.INFO.LAKE_WRITE_AHEAD.*",
             "$JS.API.CONSUMER.MSG.NEXT.LAKE_WRITE_AHEAD.*",
             "$JS.API.CONSUMER.DELETE.LAKE_WRITE_AHEAD.*",
+            // Its write at a place read by sequence, for its time: the age
+            // a lower age bound and the guard's alarm are held to (v31a
+            // item 5; merge-queue run 45506457847, where the broker
+            // refused it and the stream was kept at its bounds).
+            "$JS.API.DIRECT.GET.LAKE_WRITE_AHEAD",
         ]
     );
     for never in [
@@ -1155,8 +1160,9 @@ fn every_call_on(stream: &str) -> Vec<String> {
 /// Of [`every_call_on`] its stream, the calls the stream's owner makes: the
 /// analytics queue asks for and makes its stream (its consumer's calls name
 /// `workers`, which no probe does); the lake's writer asks for, makes and
-/// updates its stream, and makes, asks, pulls from and lets go of its
-/// reader, a consumer the server names.
+/// updates its stream, makes, asks, pulls from and lets go of its
+/// reader, a consumer the server names, and reads a write by its sequence
+/// (never by a subject: that call is a data plugin's, of its own).
 fn owners_calls(stream: &str) -> Vec<String> {
     let mut calls = vec![
         format!("$JS.API.STREAM.INFO.{stream}"),
@@ -1169,6 +1175,7 @@ fn owners_calls(stream: &str) -> Vec<String> {
             format!("$JS.API.CONSUMER.INFO.{stream}.someone"),
             format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.someone"),
             format!("$JS.API.CONSUMER.DELETE.{stream}.someone"),
+            format!("$JS.API.DIRECT.GET.{stream}"),
         ]);
     }
     calls
