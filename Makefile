@@ -3722,6 +3722,27 @@ chart-check:
 	refused "" '["host all all all allow"]' "a method pg_hba.conf does not have" "whose method"; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set-json 'database.brought.pgHba=["local all all trust","hostssl all all 10.0.0.0 255.0.0.0 cert clientcert=verify-full","host all all all reject"]' >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: database.brought.pgHba refused a local trust line, a line by address and mask, or a rejecting line" >&2; exit 1; }
+	@# Finding 3: a line Postgres cannot read is a server that does not
+	@# start. Refused at render: a missing field, an address that is none of
+	@# pg_hba.conf's shapes, an IP address with no mask or a mask that is
+	@# not one, a word past the method that is not name=value, and a quoted
+	@# word or an @file among its fields.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	refused() { said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$1 --set-json "database.brought.pgHba=$$2" 2>&1 >/dev/null)" \
+			&& { echo "chart-check FAILED: database.brought.pgHba rendered $$2: $$3" >&2; exit 1; }; \
+		echo "$$said" | grep -qF -- "$$4" \
+			|| { echo "chart-check FAILED: database.brought.pgHba's $$2 was refused without saying \"$$4\": $$said" >&2; exit 1; }; }; \
+	refused "" '["hostssl all all scram-sha-256"]' "a line with no address" "too few fields"; \
+	refused "" '["local all all"]' "a local line with no method" "too few fields"; \
+	refused "" '["host all all 10.0.0.1 scram-sha-256"]' "an IP address with no mask" "too few fields"; \
+	refused "" '["host all all 10.0.0.1 scram-sha-256 md5"]' "a mask that is not one" "followed by its mask"; \
+	refused "" '["host all all 10.0.0.0/8/8 md5"]' "an address of no shape" "whose address"; \
+	refused "" '["host all all trust md5"]' "a method where the address is" "whose address"; \
+	refused "" '["host all all all scram-sha-256 bogus"]' "a word past the method that is no option" "name=value"; \
+	refused "" '["local all all md5 extra"]' "a word past a local line's method that is no option" "name=value"; \
+	refused "" '["host @dbs all all md5"]' "a file the pod does not hold" "no @file"; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set-json 'database.brought.pgHba=["local all all peer map=m","host db1,db2 +grp,u ::1/128 md5","host all all .example.com scram-sha-256","host all all samenet scram-sha-256","hostssl all all 10.0.0.0 255.0.0.0 cert clientcert=verify-full"]' >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: database.brought.pgHba refused a well-formed line: a local line with an option, lists of databases and users, an IPv6 range, a domain suffix, samenet, or an address and mask" >&2; exit 1; }
 	@# An external database's private CA (database.caSecret, ruled
 	@# 2026-11-08): its Secret's ca.crt mounted, and named to the runtime,
 	@# in every pod that connects to the database -- the five stores, the

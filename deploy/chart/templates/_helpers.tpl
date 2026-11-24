@@ -105,7 +105,9 @@ comment, line break or continuation in it, and is judged by its fields
 where pg_hba.conf has them, never by how it ends: its method is one of
 pg_hba.conf's, trust only on a local line, and under internal TLS (ruling
 1084) a line that would admit a connection in the clear is refused -- every
-remote line is hostssl, or its method is reject.
+remote line is hostssl, or its method is reject. A line the server would
+not start with is refused too: its address, its mask and its options are
+each checked for their shape.
 Takes (dict "top" . "patroni" bool "tls" bool).
 */}}
 {{- define "meridian-runtime.databaseAccess" -}}
@@ -128,6 +130,8 @@ Takes (dict "top" . "patroni" bool "tls" bool).
 {{- end -}}
 {{- $methods := list "trust" "reject" "scram-sha-256" "md5" "password" "gss" "sspi" "ident" "peer" "ldap" "radius" "cert" "pam" "bsd" -}}
 {{- $anIp := "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$" -}}
+{{- $aRange := "^([0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*/[0-9]{1,3})$" -}}
+{{- $aName := "^\\.?[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$" -}}
 {{- range $rules -}}
 {{- if not (kindIs "string" .) -}}
 {{- fail (printf "database.brought.pgHba has %v; each item is one pg_hba.conf line, a string" .) -}}
@@ -160,6 +164,30 @@ Takes (dict "top" . "patroni" bool "tls" bool).
 {{- end -}}
 {{- if and $.tls (has $type (list "host" "hostnossl" "hostgssenc" "hostnogssenc")) (ne $method "reject") -}}
 {{- fail (printf "database.brought.pgHba has %q, which admits a connection in the clear; with tls.internal.enabled every remote line is hostssl or its method is reject (ruling 1084)" .) -}}
+{{- end -}}
+{{- $line := . -}}
+{{- range (slice $words 1 (int (add $at 1))) -}}
+{{- if or (contains "\"" .) (hasPrefix "@" .) -}}
+{{- fail (printf "database.brought.pgHba has %q; its database, user, address and method are written plainly here: no quoted word, and no @file, which the server's pod does not hold" $line) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (int $at) 5 -}}
+{{- if not (regexMatch $anIp (index $words 4)) -}}
+{{- fail (printf "database.brought.pgHba has %q; an IP address without a range (/8) is followed by its mask, as in \"10.0.0.0 255.0.0.0\", and %q is not one. The server would not start with it" . (index $words 4)) -}}
+{{- end -}}
+{{- else if not $local -}}
+{{- $address := index $words 3 -}}
+{{- if not (or (has $address (list "all" "samehost" "samenet")) (regexMatch $aRange $address) (and (regexMatch $aName $address) (regexMatch "[A-Za-z]" $address) (not (has $address $methods)))) -}}
+{{- fail (printf "database.brought.pgHba has %q, whose address, its fourth field, is %q; it is all, samehost, samenet, a host name, a range (10.0.0.0/8, ::/0) or an IP address then its mask. The server would not start with it" . $address) -}}
+{{- end -}}
+{{- end -}}
+{{- $options := slice $words (int (add $at 1)) -}}
+{{- if not (contains "\"" (join " " $options)) -}}
+{{- range $options -}}
+{{- if not (regexMatch "^[a-z][a-z0-9_]*=." .) -}}
+{{- fail (printf "database.brought.pgHba has %q; past its method, %q, a line holds only options written name=value, and %q is not one. The server would not start with it" $line $method .) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- toJson $rules -}}
