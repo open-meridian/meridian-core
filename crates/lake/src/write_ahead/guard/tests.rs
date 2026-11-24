@@ -244,7 +244,7 @@ fn a_byte_bound_lower_than_the_stream_holds_is_not_applied_and_said() {
         max_bytes: mib << 20,
         ..bounds()
     };
-    let kept = bytes_kept("LAKE_WRITE_AHEAD", &held, 256 << 20, &to(128))
+    let kept = bytes_kept("LAKE_WRITE_AHEAD", &held, 256 << 20, &to(128), MIB)
         .expect("137 MiB held of a new 128 MiB bound");
     for part in [
         "LAKE_WRITE_AHEAD keeps its 256.0 MiB bound",
@@ -253,15 +253,54 @@ fn a_byte_bound_lower_than_the_stream_holds_is_not_applied_and_said() {
     ] {
         assert!(kept.contains(part), "{part} in {kept}");
     }
-    assert_eq!(bytes_kept("S", &held, 256 << 20, &to(192)), None, "it fits");
     assert_eq!(
-        bytes_kept("S", &held, 256 << 20, &to(256)),
+        bytes_kept("S", &held, 256 << 20, &to(192), MIB),
+        None,
+        "it fits"
+    );
+    assert_eq!(
+        bytes_kept("S", &held, 256 << 20, &to(256), MIB),
         None,
         "the same"
     );
-    assert_eq!(bytes_kept("S", &held, 128 << 20, &to(512)), None, "raised");
+    assert_eq!(
+        bytes_kept("S", &held, 128 << 20, &to(512), MIB),
+        None,
+        "raised"
+    );
     // A stream with no byte bound is lowered to one only where it fits.
-    assert!(bytes_kept("S", &held, -1, &to(128))
+    assert!(bytes_kept("S", &held, -1, &to(128), MIB)
         .is_some_and(|kept| kept.contains("keeps no byte bound")));
-    assert_eq!(bytes_kept("S", &held, -1, &to(256)), None);
+    assert_eq!(bytes_kept("S", &held, -1, &to(256), MIB), None);
+}
+
+/// The review of 4c, fix B item 3: a stream within one of the broker's
+/// largest writes of the lower byte bound keeps its own too. Lowered, it
+/// would stand at the bound and refuse its next write of that size.
+#[test]
+fn a_stream_within_one_largest_write_of_a_lower_byte_bound_keeps_its_bound() {
+    let now = 1_700_000_000 * S;
+    let to = |mib: i64| Bounds {
+        max_bytes: mib << 20,
+        ..bounds()
+    };
+    let largest = 8 * MIB;
+    // 124 MiB held of a new 128: half a largest write under it.
+    let near = standing(1, 160, 128 * MIB - largest / 2, now, 60);
+    let kept = bytes_kept("LAKE_WRITE_AHEAD", &near, 256 << 20, &to(128), largest)
+        .expect("no room for the broker's largest write under the new bound");
+    for part in [
+        "LAKE_WRITE_AHEAD keeps its 256.0 MiB bound",
+        "this release's 128.0 MiB",
+        "it holds 124.0 MiB",
+        "8.0 MiB",
+    ] {
+        assert!(kept.contains(part), "{part} in {kept}");
+    }
+    // Room for exactly one largest write: the bound is applied.
+    let room = standing(1, 160, 128 * MIB - largest, now, 60);
+    assert_eq!(bytes_kept("S", &room, 256 << 20, &to(128), largest), None);
+    // The same and a higher bound are applied whatever it holds.
+    assert_eq!(bytes_kept("S", &near, 128 << 20, &to(128), largest), None);
+    assert_eq!(bytes_kept("S", &near, 128 << 20, &to(256), largest), None);
 }

@@ -1326,10 +1326,10 @@ pub async fn write_forever(
         }
     };
     let mut writer = started(&lake, identity).await;
-    let kept = bring_to_bounds(&lake, &context, &config, &bounds, &writer).await;
-    let place = Arc::new(AtomicU64::new(writer.next()));
     // The room a write needs: the broker's largest message, as it says it.
     let largest_write = u64::try_from(client.server_info().max_payload).unwrap_or(u64::MAX);
+    let kept = bring_to_bounds(&lake, &context, &config, &bounds, largest_write, &writer).await;
+    let place = Arc::new(AtomicU64::new(writer.next()));
     let guarding = tokio::spawn(guard_forever(
         context.clone(),
         largest_write,
@@ -1524,14 +1524,15 @@ async fn from_place(
 /// ([`guard::bounds_drop`], v31a item 5), or the broker refuses them: then
 /// it is kept as it is, and the refusal said naming it -- here, and in the
 /// member's report (the words returned) -- until the writer starts again.
-/// A byte bound under what the stream holds is not applied either
-/// ([`guard::bytes_kept`]): the stream keeps its own byte bound, said the
+/// A byte bound the stream would have no room for a write under is not
+/// applied either ([`guard::bytes_kept`]): the stream keeps its own byte bound, said the
 /// same way, and the next writer's start applies it once it fits.
 async fn bring_to_bounds(
     lake: &Arc<Lake>,
     context: &jetstream::Context,
     config: &stream::Config,
     bounds: &Bounds,
+    largest_write: u64,
     writer: &Writer,
 ) -> Option<String> {
     let Ok(mut stream) = context.get_stream(STREAM).await else {
@@ -1554,10 +1555,11 @@ async fn bring_to_bounds(
         return None;
     }
     let standing = guard::Standing::of(&info.state);
-    // A byte bound under what the stream holds is not applied: the stream
-    // keeps its own, and the rest of the bounds are brought as ever.
+    // A byte bound under what the stream holds and the broker's largest
+    // write is not applied: the stream keeps its own, and the rest of the
+    // bounds are brought as ever.
     let mut config = config.clone();
-    let bytes_kept = guard::bytes_kept(STREAM, &standing, held.max_bytes, bounds);
+    let bytes_kept = guard::bytes_kept(STREAM, &standing, held.max_bytes, bounds, largest_write);
     if let Some(kept) = &bytes_kept {
         tracing::warn!(stream = STREAM, "{kept}");
         config.max_bytes = held.max_bytes;

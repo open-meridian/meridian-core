@@ -250,21 +250,24 @@ pub fn bounds_drop(
 
 /// Whether the byte bound of `bounds` is not applied to the stream as it
 /// stands, its own being `held_max_bytes`: a lower bound than its own (none
-/// where that is not above 0) that it holds more than. Under it the stream
-/// would refuse every write until the writes it holds aged out. The words
-/// its member says, naming the stream; none where the bound is not lower,
-/// or what the stream holds fits it. A higher bound is always applied.
+/// where that is not above 0) that what it holds, and the broker's largest
+/// write (`largest_write`) with it, do not fit. Under it the stream would
+/// stand at its bound ([`Standing::at_a_bound`]) and refuse a write until
+/// the writes it holds aged out. The words its member says, naming the
+/// stream; none where the bound is not lower, or the stream has room for
+/// a write under it. A higher bound is always applied.
 pub fn bytes_kept(
     name: &str,
     standing: &Standing,
     held_max_bytes: i64,
     bounds: &Bounds,
+    largest_write: u64,
 ) -> Option<String> {
     let new = u64::try_from(bounds.max_bytes)
         .ok()
         .filter(|new| *new > 0)?;
     let own = u64::try_from(held_max_bytes).ok().filter(|own| *own > 0);
-    if own.is_some_and(|own| own <= new) || standing.bytes <= new {
+    if own.is_some_and(|own| own <= new) || standing.bytes.saturating_add(largest_write) <= new {
         return None;
     }
     let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
@@ -274,11 +277,12 @@ pub fn bytes_kept(
     );
     Some(format!(
         "the write-ahead stream {name} keeps {own}, not brought to this release's {:.1} MiB: \
-         it holds {:.1} MiB, and under the lower bound it would refuse every write until the \
-         writes it holds aged out; the bound is applied at a writer's start once what the \
-         stream holds fits it",
+         it holds {:.1} MiB, and under the lower bound it would have no room for the broker's \
+         largest write ({:.1} MiB) and refuse writes until the writes it holds aged out; the \
+         bound is applied at a writer's start once the stream has that room under it",
         mib(new),
-        mib(standing.bytes)
+        mib(standing.bytes),
+        mib(largest_write)
     ))
 }
 
