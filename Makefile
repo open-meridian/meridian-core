@@ -3677,6 +3677,8 @@ chart-check:
 		|| { echo "chart-check FAILED: alone, without TLS, the database's access rules are not in a ConfigMap, its own pod's then every role by password: $$hba" >&2; exit 1; }; \
 	echo "$$plain" | grep -qx -- "            - hba_file=/etc/meridian-hba/pg_hba.conf" \
 		|| { echo "chart-check FAILED: alone, without TLS, the database does not read its access rules from the ConfigMap (hba_file)" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 -x -- "        - name: hba" | grep -q "configMap:" \
+		|| { echo "chart-check FAILED: alone, without TLS or an archive, the database mounts its access rules (hba) but its pod defines no hba volume, so the API server refuses the StatefulSet" >&2; exit 1; }; \
 	first="$$(echo "$$plain" | sed -n 's/^ *checksum\/access: //p')"; \
 	[ -n "$$first" ] || { echo "chart-check FAILED: alone, the database's pods carry no checksum/access, so a change to its rules is never read" >&2; exit 1; }; \
 	set="$$($(HELM_TEMPLATE) check deploy/chart $$base --set 'database.brought.pgHba[0]=host all e2e_hba_refused all reject' --set 'database.brought.pgHba[1]=host all all 10.0.0.0/8 scram-sha-256' 2>/dev/null)" \
