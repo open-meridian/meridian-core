@@ -11,13 +11,18 @@
 //! bound, and how many writes it holds past the lake's place -- until a
 //! look finds it below both. The dashboard files that as a standing notice
 //! and its clearing ([`STUCK_FULL`]). Why a stream stands full is not
-//! judged here.
+//! judged here. The bounds are the stream's own, as its leader says them
+//! at that look, never the chart's: a stream kept as it was made is judged
+//! as it was made.
 //!
 //! **Never made again over writes the lake has not recorded.** The writer
 //! makes the stream only where the broker says there is none, and brings it
 //! to this release's bounds only where that drops no write past the lake's
-//! place ([`bounds_drop`]): a bound lowered while such a write is held is
-//! refused, naming the stream, and the stream kept as it is.
+//! place ([`bounds_drop`]): an age bound its oldest such write is past is
+//! refused, naming the stream, the stream kept as it is and its member
+//! saying so ([`said`]). A lower byte bound drops none -- the stream
+//! refuses new writes (`discard: new`) until it is back under it -- and is
+//! never refused.
 
 use std::time::Duration;
 
@@ -85,9 +90,11 @@ impl Standing {
     /// oldest write is one the lake has not recorded and is about to be
     /// dropped at its age bound.
     pub fn at_a_bound(&self, bounds: &Bounds, next: u64, now_ns: i64) -> bool {
+        // A bound of none (the broker's -1 bytes, 0 s) is never stood at.
         let max_bytes = u64::try_from(bounds.max_bytes).unwrap_or(0);
-        let by_bytes = self.bytes.saturating_add(LARGEST_WRITE) > max_bytes;
-        let by_age = self.first >= next
+        let by_bytes = max_bytes > 0 && self.bytes.saturating_add(LARGEST_WRITE) > max_bytes;
+        let by_age = !bounds.max_age.is_zero()
+            && self.first >= next
             && self.past(next) > 0
             && self
                 .oldest_age(now_ns)
@@ -130,7 +137,7 @@ impl Full {
     }
 
     /// One look at `at`: the stream standing so, the lake's place `next`,
-    /// the wall clock `now_ns`. The words it is said with while stuck full;
+    /// the stream's own `bounds` at that look, the wall clock `now_ns`. The words it is said with while stuck full;
     /// none while it is not.
     pub fn looked(
         &mut self,
@@ -151,9 +158,11 @@ impl Full {
 }
 
 /// Whether bringing the stream as it stands to `bounds` would drop a write
-/// past the lake's place `next`: a lower byte bound than it holds, or an
-/// age bound its oldest write the lake has not recorded is past. The words
-/// it is refused with, naming the stream; none where the bounds drop none.
+/// past the lake's place `next`: an age bound its oldest write the lake has
+/// not recorded is past. The words it is refused with, naming the stream;
+/// none where the bounds drop none. A byte bound lower than it holds drops
+/// none: the stream keeps every write and refuses new ones until it is
+/// under it (`discard: new`; seen on a real broker, 160 writes kept).
 pub fn bounds_drop(
     name: &str,
     standing: &Standing,
@@ -165,15 +174,9 @@ pub fn bounds_drop(
     if past == 0 {
         return None;
     }
-    let max_bytes = u64::try_from(bounds.max_bytes).unwrap_or(0);
     let unrecorded_oldest = standing.first >= next;
     let age = standing.oldest_age(now_ns).unwrap_or_default();
-    let why = if standing.bytes > max_bytes {
-        format!(
-            "it holds {} bytes, over the {} bytes bound",
-            standing.bytes, max_bytes
-        )
-    } else if unrecorded_oldest && age > bounds.max_age {
+    let why = if unrecorded_oldest && age > bounds.max_age {
         format!(
             "its oldest write, not yet recorded, is {}s old, past the {}s bound",
             age.as_secs(),
@@ -186,6 +189,17 @@ pub fn bounds_drop(
         "the write-ahead stream {name} is kept as it is, not brought to this release's bounds: \
          {why}, and it holds {past} write(s) the lake has not recorded, which the bound would drop"
     ))
+}
+
+/// What the writer's member says of its stream at a look: stuck full, in
+/// its words; and where the stream was not brought to this release's
+/// bounds, that refusal -- after them, or alone. None where neither.
+pub fn said(stuck: Option<String>, kept: Option<&str>) -> Option<String> {
+    match (stuck, kept) {
+        (Some(stuck), Some(kept)) => Some(format!("{stuck}; {kept}")),
+        (Some(stuck), None) => Some(stuck),
+        (None, kept) => kept.map(str::to_string),
+    }
 }
 
 #[cfg(test)]

@@ -1279,13 +1279,13 @@ pub async fn write_forever(
         }
     };
     let mut writer = started(&lake, identity).await;
-    bring_to_bounds(&lake, &context, &config, &bounds, &writer).await;
+    let kept = bring_to_bounds(&lake, &context, &config, &bounds, &writer).await;
     let place = Arc::new(AtomicU64::new(writer.next()));
     let guarding = tokio::spawn(guard_forever(
         context.clone(),
         Arc::clone(&lake),
         Arc::clone(&place),
-        bounds,
+        kept,
         waiting,
     ));
     let _guarding = AbortOnDrop(guarding);
@@ -1449,31 +1449,32 @@ fn not_found(failed: &jetstream::context::GetStreamError) -> bool {
 
 /// The stream brought to this release's bounds where they differ from its
 /// own, unless that would drop a write past the writer's place
-/// ([`guard::bounds_drop`], v31a item 5): then it is kept as it is, and the
-/// refusal said naming it, until the writer starts again.
+/// ([`guard::bounds_drop`], v31a item 5), or the broker refuses them: then
+/// it is kept as it is, and the refusal said naming it -- here, and in the
+/// member's report (the words returned) -- until the writer starts again.
 async fn bring_to_bounds(
     lake: &Arc<Lake>,
     context: &jetstream::Context,
     config: &stream::Config,
     bounds: &Bounds,
     writer: &Writer,
-) {
+) -> Option<String> {
     let Ok(mut stream) = context.get_stream(STREAM).await else {
         tracing::warn!("the write-ahead stream could not be read to bring it to its bounds");
-        return;
+        return None;
     };
     let info = match stream.info().await {
         Ok(info) => info.clone(),
         Err(failed) => {
             tracing::warn!(%failed, "the write-ahead stream could not be read to bring it to its bounds");
-            return;
+            return None;
         }
     };
     let held = &info.config;
     if (held.max_age, held.max_bytes, held.num_replicas)
         == (config.max_age, config.max_bytes, config.num_replicas)
     {
-        return;
+        return None;
     }
     let mut standing = guard::Standing::of(&info.state);
     // The oldest write past the place is the one whose age a lower age
@@ -1492,21 +1493,30 @@ async fn bring_to_bounds(
                     "the write-ahead stream kept at its bounds: its write at the lake's place \
                      could not be read"
                 );
-                return;
+                return None;
             }
         }
     }
     if let Some(refused) = guard::bounds_drop(STREAM, &standing, next, bounds, lake.now_ns()) {
         tracing::warn!(stream = STREAM, next, "{refused}");
-        return;
+        return Some(refused);
     }
     match context.update_stream(config.clone()).await {
-        Ok(_) => tracing::info!(
-            max_age_s = bounds.max_age.as_secs(),
-            max_bytes = bounds.max_bytes,
-            "the write-ahead stream brought to this release's bounds"
-        ),
-        Err(failed) => tracing::warn!(%failed, "the write-ahead stream kept at its bounds"),
+        Ok(_) => {
+            tracing::info!(
+                max_age_s = bounds.max_age.as_secs(),
+                max_bytes = bounds.max_bytes,
+                "the write-ahead stream brought to this release's bounds"
+            );
+            None
+        }
+        Err(failed) => {
+            tracing::warn!(%failed, "the write-ahead stream kept at its bounds");
+            Some(format!(
+                "the write-ahead stream {STREAM} is kept as it is, not brought to this \
+                 release's bounds: the broker refused them ({failed})"
+            ))
+        }
     }
 }
 
@@ -1521,33 +1531,45 @@ impl Drop for AbortOnDrop {
 
 /// The stream looked at every [`guard::LOOK_EVERY`] against the writer's
 /// place (v31a item 5): stuck full, its member says so, degraded, with its
-/// figures; drained, it says so no longer. A look the broker does not
-/// answer changes nothing said.
+/// figures; drained, it says so no longer. Judged at each look by the
+/// stream's own bounds, as its leader says them then -- never the chart's,
+/// which the stream does not hold where it was kept as it was (`kept`, the
+/// refusal [`bring_to_bounds`] gave, which the member says for as long as
+/// this writer runs). A look the broker does not answer changes nothing
+/// said.
 async fn guard_forever(
     context: jetstream::Context,
     lake: Arc<Lake>,
     place: Arc<AtomicU64>,
-    bounds: Bounds,
+    kept: Option<String>,
     waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) {
     let mut full = guard::Full::new(guard::STUCK_AFTER);
     let mut said = false;
+    if kept.is_some() {
+        waiting(kept.clone());
+    }
     loop {
         tokio::time::sleep(guard::LOOK_EVERY).await;
         let looked = match context.get_stream(STREAM).await {
             Ok(mut stream) => stream
                 .info()
                 .await
-                .map(|info| info.state.clone())
+                .map(|info| (info.state.clone(), info.config.clone()))
                 .map_err(|f| f.to_string()),
             Err(failed) => Err(failed.to_string()),
         };
-        let state = match looked {
-            Ok(state) => state,
+        let (state, held) = match looked {
+            Ok(looked) => looked,
             Err(failed) => {
                 tracing::debug!(%failed, "the write-ahead stream's guard could not look at it");
                 continue;
             }
+        };
+        let bounds = Bounds {
+            max_age: held.max_age,
+            max_bytes: held.max_bytes,
+            replicas: held.num_replicas,
         };
         let standing = guard::Standing::of(&state);
         let next = place.load(Ordering::Relaxed);
@@ -1562,7 +1584,7 @@ async fn guard_forever(
                 if !said {
                     tracing::warn!(stream = STREAM, "{words}");
                 }
-                waiting(Some(words));
+                waiting(guard::said(Some(words), kept.as_deref()));
                 said = true;
             }
             None if said => {
@@ -1572,7 +1594,7 @@ async fn guard_forever(
                     past = standing.past(next),
                     "the lake's write-ahead stream drained: no longer at a bound"
                 );
-                waiting(None);
+                waiting(guard::said(None, kept.as_deref()));
                 said = false;
             }
             None => {}

@@ -1200,3 +1200,79 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
     );
     context.delete_stream(STREAM).await.unwrap();
 }
+
+/// v31a item 5, the review of the stream guard, finding 1: the guard judges
+/// the stream by the stream's own bounds, not the chart's. A stream made at
+/// 256 MiB holds more than 128 MiB, every write of it past the lake's
+/// place, when a writer starts whose chart says 128 MiB. After 40 s -- past
+/// the 30 s a stream stands at a bound before it is said -- its member is
+/// said stuck full only where the stream stands at the bound the stream
+/// itself has by then, never for the chart's while the stream has room; and
+/// the lower bound dropped none of its writes.
+///
+/// By hand, as `a_write_naming_another_instances_inbox_is_recorded_and_
+/// answered_to_nobody` above; this test empties the broker of the lake's
+/// stream.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_stream_with_room_under_its_own_bound_is_not_said_stuck_full_by_the_charts() {
+    use crate::write_ahead::{guard::STUCK_FULL, stream_config, write_forever, Bounds};
+    use async_nats::jetstream;
+    use meridian_bus::write_ahead::{subject, STREAM};
+    use std::time::Duration;
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = meridian_bus::NatsBackend::client(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let made = Bounds {
+        max_age: Duration::from_secs(600),
+        max_bytes: 256 << 20,
+        replicas: 1,
+    };
+    let mut stream = context.create_stream(stream_config(&made)).await.unwrap();
+    // 160 writes of 900 KB: 137 MiB, past 128.
+    let body = vec![7u8; 900_000];
+    for _ in 0..160 {
+        context
+            .publish(subject("coinbase-1", "daily"), body.clone().into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let held = stream.info().await.unwrap().state.bytes;
+    assert!(held > 128 << 20 && held < 200 << 20, "{held} bytes held");
+    let h = harness();
+    let said = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let writer = {
+        let (lake, client, said) = (h.lake.clone(), client.clone(), Arc::clone(&said));
+        let chart = Bounds {
+            max_bytes: 128 << 20,
+            ..made
+        };
+        tokio::spawn(async move {
+            write_forever(lake, client, chart, move |why| {
+                said.lock().unwrap().push(why)
+            })
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    writer.abort();
+    let _ = writer.await;
+    let info = stream.info().await.unwrap().clone();
+    context.delete_stream(STREAM).await.unwrap();
+    assert_eq!(info.state.messages, 160, "no write dropped by the bound");
+    let said = said.lock().unwrap().clone();
+    let stuck: Vec<_> = said
+        .iter()
+        .flatten()
+        .filter(|why| why.starts_with(STUCK_FULL))
+        .collect();
+    assert!(
+        stuck.is_empty() || info.state.bytes + (1 << 20) > info.config.max_bytes as u64,
+        "said stuck full with {} bytes held of the stream's own {} bytes bound: {stuck:?}",
+        info.state.bytes,
+        info.config.max_bytes
+    );
+}

@@ -107,9 +107,11 @@ fn a_stream_is_at_its_age_bound_only_where_its_oldest_write_is_not_recorded_and_
 }
 
 /// Never made again over writes the lake has not recorded (v31a item 5):
-/// a bound lowered under what the stream holds past the lake's place is
-/// refused, naming the stream; one that drops nothing the lake has not
-/// recorded is not.
+/// an age bound its oldest unrecorded write is past is refused, naming the
+/// stream; one that drops nothing the lake has not recorded is not, and a
+/// byte bound lowered under what the stream holds drops none (the review of
+/// the stream guard, finding 1): the stream keeps its writes and refuses
+/// new ones.
 #[test]
 fn bounds_that_would_drop_a_write_the_lake_has_not_recorded_are_refused_naming_the_stream() {
     let now = 1_700_000_000 * S;
@@ -118,12 +120,10 @@ fn bounds_that_would_drop_a_write_the_lake_has_not_recorded_are_refused_naming_t
         ..bounds()
     };
     let held = standing(1, 4_000, 100 * MIB, now, 300);
-    let refused = bounds_drop("LAKE_WRITE_AHEAD", &held, 3_000, &lower_bytes, now)
-        .expect("a byte bound under what it holds, writes past the place");
-    assert!(refused.contains("LAKE_WRITE_AHEAD"), "{refused}");
-    assert!(
-        refused.contains("1001 write(s) the lake has not recorded"),
-        "{refused}"
+    assert_eq!(
+        bounds_drop("LAKE_WRITE_AHEAD", &held, 3_000, &lower_bytes, now),
+        None,
+        "a byte bound under what it holds drops no write"
     );
     assert_eq!(
         bounds_drop("LAKE_WRITE_AHEAD", &held, 4_001, &lower_bytes, now),
@@ -137,6 +137,11 @@ fn bounds_that_would_drop_a_write_the_lake_has_not_recorded_are_refused_naming_t
     // Its oldest past the place, 300 s old, against 20 s.
     let refused = bounds_drop("LAKE_WRITE_AHEAD", &held, 1, &shorter, now)
         .expect("an age bound its oldest unrecorded write is past");
+    assert!(refused.contains("LAKE_WRITE_AHEAD"), "{refused}");
+    assert!(
+        refused.contains("4000 write(s) the lake has not recorded"),
+        "{refused}"
+    );
     assert!(
         refused.contains("300s old, past the 20s bound"),
         "{refused}"
@@ -152,5 +157,38 @@ fn bounds_that_would_drop_a_write_the_lake_has_not_recorded_are_refused_naming_t
         bounds_drop("LAKE_WRITE_AHEAD", &held, 3_000, &bounds(), now),
         None,
         "the same bounds drop nothing"
+    );
+}
+
+/// The review of the stream guard, finding 1: the bounds a look is judged
+/// by are the stream's own, and a bound the stream does not have -- the
+/// broker's -1 bytes, 0 s -- is never stood at. A refused bring-to-bounds is
+/// said in the member's detail: after the stuck-full words, which stay
+/// first for the dashboard's judge, or alone.
+#[test]
+fn a_stream_is_judged_by_its_own_bounds_and_a_refused_bring_to_bounds_is_said() {
+    let now = 1_700_000_000 * S;
+    // 137 MiB held: at the bound of a stream made at 128 MiB, not of one
+    // made at 256.
+    let held = standing(1, 160, 137 * MIB, now, 60);
+    let at_128 = Bounds {
+        max_bytes: 128 << 20,
+        ..bounds()
+    };
+    assert!(held.at_a_bound(&at_128, 1, now));
+    assert!(!held.at_a_bound(&bounds(), 1, now));
+    let none = Bounds {
+        max_bytes: -1,
+        max_age: Duration::ZERO,
+        ..bounds()
+    };
+    assert!(!standing(1, 160, 137 * MIB, now, 86_400).at_a_bound(&none, 1, now));
+    let kept = "the write-ahead stream LAKE_WRITE_AHEAD is kept as it is";
+    assert_eq!(said(None, None), None);
+    assert_eq!(said(None, Some(kept)).as_deref(), Some(kept));
+    let both = said(Some(format!("{STUCK_FULL} for 30s")), Some(kept)).unwrap();
+    assert!(
+        both.starts_with(STUCK_FULL) && both.ends_with(kept),
+        "{both}"
     );
 }
