@@ -9850,3 +9850,76 @@ async fn a_write_between_a_cross_database_close_and_open_is_held_by_a_member_tha
 async fn a_write_between_a_cross_database_close_and_open_is_held_by_a_member_that_never_found_it() {
     held_between_two_databases("ACC-HELD-FRESH", false).await;
 }
+
+/// The same through two members that hand writes on (PR CI 45339243058):
+/// asked of either group's member between the close and the open, a write
+/// is answered once the account opens, handed on at most once each -- never
+/// passed back and forth between the groups, each by "the record", until
+/// the hand-ons' margins spent its caller's wait ("the caller's deadline
+/// left no time to hand it on").
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_between_a_cross_database_close_and_open_is_answered_and_never_handed_back_and_forth(
+) {
+    let h = blocking(two_databases);
+    let (from, to) = (partition_of(1, 2), partition_of(0, 2));
+    let account = accounts_in("ACC-HANDED", &from, 1, &h.one.0, h.one.1.as_ref())
+        .await
+        .remove(0);
+    // Group 0's member found it where it was, as one that pre-routed a
+    // write of it has.
+    assert_eq!(blocking(|| h.zero.1.writer_group_of(&account)), Some(1));
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    // Closed by group 1, and stopped before its open is handed to group 0.
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &h.one.0,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(stopped.is_err(), "stopped between its close and its open");
+    let handed = h.broker.handed.load(Ordering::SeqCst);
+    let write = |bus: &Arc<Bus>, reason: &'static str| {
+        let (bus, account) = (bus.clone(), account.clone());
+        tokio::spawn(async move {
+            write_within(&bus, &account, reason, std::time::Duration::from_secs(5)).await
+        })
+    };
+    let (by_zero, by_one) = (
+        write(&h.zero.0, "asked of its new group"),
+        write(&h.one.0, "asked of the group it left"),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    send(
+        &h.zero.0,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .expect("opened by group 0");
+    by_zero
+        .await
+        .unwrap()
+        .expect("asked of its new group's member: written once it opens");
+    by_one
+        .await
+        .unwrap()
+        .expect("asked of the member of the group it left: written once it opens");
+    let handed = h.broker.handed.load(Ordering::SeqCst) - handed;
+    assert!(
+        handed <= 2,
+        "two writes and the open, handed on {handed} times"
+    );
+    blocking(move || drop(h));
+}
