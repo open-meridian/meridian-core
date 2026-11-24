@@ -1452,6 +1452,9 @@ fn not_found(failed: &jetstream::context::GetStreamError) -> bool {
 /// ([`guard::bounds_drop`], v31a item 5), or the broker refuses them: then
 /// it is kept as it is, and the refusal said naming it -- here, and in the
 /// member's report (the words returned) -- until the writer starts again.
+/// A byte bound under what the stream holds is not applied either
+/// ([`guard::bytes_kept`]): the stream keeps its own byte bound, said the
+/// same way, and the next writer's start applies it once it fits.
 async fn bring_to_bounds(
     lake: &Arc<Lake>,
     context: &jetstream::Context,
@@ -1471,12 +1474,25 @@ async fn bring_to_bounds(
         }
     };
     let held = &info.config;
-    if (held.max_age, held.max_bytes, held.num_replicas)
-        == (config.max_age, config.max_bytes, config.num_replicas)
-    {
+    let same = |config: &stream::Config| {
+        (held.max_age, held.max_bytes, held.num_replicas)
+            == (config.max_age, config.max_bytes, config.num_replicas)
+    };
+    if same(config) {
         return None;
     }
     let mut standing = guard::Standing::of(&info.state);
+    // A byte bound under what the stream holds is not applied: the stream
+    // keeps its own, and the rest of the bounds are brought as ever.
+    let mut config = config.clone();
+    let bytes_kept = guard::bytes_kept(STREAM, &standing, held.max_bytes, bounds);
+    if let Some(kept) = &bytes_kept {
+        tracing::warn!(stream = STREAM, "{kept}");
+        config.max_bytes = held.max_bytes;
+        if same(&config) {
+            return bytes_kept;
+        }
+    }
     // The oldest write past the place is the one whose age a lower age
     // bound is held to, where the stream's oldest is one the lake recorded.
     let next = writer.next();
@@ -1493,29 +1509,32 @@ async fn bring_to_bounds(
                     "the write-ahead stream kept at its bounds: its write at the lake's place \
                      could not be read"
                 );
-                return None;
+                return bytes_kept;
             }
         }
     }
     if let Some(refused) = guard::bounds_drop(STREAM, &standing, next, bounds, lake.now_ns()) {
         tracing::warn!(stream = STREAM, next, "{refused}");
-        return Some(refused);
+        return guard::said(Some(refused), bytes_kept.as_deref());
     }
     match context.update_stream(config.clone()).await {
         Ok(_) => {
             tracing::info!(
-                max_age_s = bounds.max_age.as_secs(),
-                max_bytes = bounds.max_bytes,
+                max_age_s = config.max_age.as_secs(),
+                max_bytes = config.max_bytes,
                 "the write-ahead stream brought to this release's bounds"
             );
-            None
+            bytes_kept
         }
         Err(failed) => {
             tracing::warn!(%failed, "the write-ahead stream kept at its bounds");
-            Some(format!(
-                "the write-ahead stream {STREAM} is kept as it is, not brought to this \
-                 release's bounds: the broker refused them ({failed})"
-            ))
+            guard::said(
+                Some(format!(
+                    "the write-ahead stream {STREAM} is kept as it is, not brought to this \
+                     release's bounds: the broker refused them ({failed})"
+                )),
+                bytes_kept.as_deref(),
+            )
         }
     }
 }

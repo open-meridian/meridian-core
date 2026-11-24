@@ -1276,3 +1276,85 @@ async fn a_stream_with_room_under_its_own_bound_is_not_said_stuck_full_by_the_ch
         info.config.max_bytes
     );
 }
+
+/// v31a item 5, the lowered byte bound: the lake never refuses its own
+/// writes over a setting. A stream made at 256 MiB holds 137 MiB when a
+/// writer starts whose chart says 128 MiB. Lowered, the stream would refuse
+/// every write until the writes it holds aged out; so it keeps its 256 MiB
+/// bound, takes the next write, and its member says why. The next writer
+/// start applies the bound once what the stream holds fits it.
+///
+/// By hand, as `a_write_naming_another_instances_inbox_is_recorded_and_
+/// answered_to_nobody` above; this test empties the broker of the lake's
+/// stream.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_byte_bound_under_what_the_stream_holds_is_not_applied_and_the_stream_takes_writes() {
+    use crate::write_ahead::{stream_config, write_forever, Bounds};
+    use async_nats::jetstream;
+    use meridian_bus::write_ahead::{subject, STREAM};
+    use std::time::Duration;
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = meridian_bus::NatsBackend::client(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let made = Bounds {
+        max_age: Duration::from_secs(600),
+        max_bytes: 256 << 20,
+        replicas: 1,
+    };
+    let mut stream = context.create_stream(stream_config(&made)).await.unwrap();
+    // 160 writes of 900 KB: 137 MiB, past 128.
+    let body = vec![7u8; 900_000];
+    for _ in 0..160 {
+        context
+            .publish(subject("coinbase-1", "daily"), body.clone().into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let h = harness();
+    let said = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let writer = {
+        let (lake, client, said) = (h.lake.clone(), client.clone(), Arc::clone(&said));
+        let chart = Bounds {
+            max_bytes: 128 << 20,
+            ..made
+        };
+        tokio::spawn(async move {
+            write_forever(lake, client, chart, move |why| {
+                said.lock().unwrap().push(why)
+            })
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let taken = match context
+        .publish(subject("coinbase-1", "daily"), body.clone().into())
+        .await
+    {
+        Ok(ack) => ack.await.map(|_| ()).map_err(|f| f.to_string()),
+        Err(failed) => Err(failed.to_string()),
+    };
+    writer.abort();
+    let _ = writer.await;
+    let info = stream.info().await.unwrap().clone();
+    context.delete_stream(STREAM).await.unwrap();
+    assert_eq!(
+        info.config.max_bytes,
+        256 << 20,
+        "the stream keeps its own bound while it holds more than the chart's"
+    );
+    assert_eq!(taken, Ok(()), "the stream takes the next write");
+    assert_eq!(info.state.messages, 161);
+    let said = said.lock().unwrap().clone();
+    let why = said
+        .iter()
+        .flatten()
+        .find(|why| why.contains("keeps its 256.0 MiB bound"))
+        .unwrap_or_else(|| panic!("the member says why its stream keeps its bound: {said:?}"));
+    for part in [STREAM, "128.0 MiB", "holds 137.3 MiB"] {
+        assert!(why.contains(part), "{part} in {why}");
+    }
+}

@@ -192,3 +192,37 @@ fn a_stream_is_judged_by_its_own_bounds_and_a_refused_bring_to_bounds_is_said() 
         "{both}"
     );
 }
+
+/// The lowered byte bound: a byte bound under what the stream holds is not
+/// applied -- the stream would refuse every write until the writes it holds
+/// aged out -- and its member says why. One the stream's writes fit, the
+/// same bound, and a higher one are applied.
+#[test]
+fn a_byte_bound_lower_than_the_stream_holds_is_not_applied_and_said() {
+    let now = 1_700_000_000 * S;
+    let held = standing(1, 160, 137 * MIB, now, 60);
+    let to = |mib: i64| Bounds {
+        max_bytes: mib << 20,
+        ..bounds()
+    };
+    let kept = bytes_kept("LAKE_WRITE_AHEAD", &held, 256 << 20, &to(128))
+        .expect("137 MiB held of a new 128 MiB bound");
+    for part in [
+        "LAKE_WRITE_AHEAD keeps its 256.0 MiB bound",
+        "this release's 128.0 MiB",
+        "it holds 137.0 MiB",
+    ] {
+        assert!(kept.contains(part), "{part} in {kept}");
+    }
+    assert_eq!(bytes_kept("S", &held, 256 << 20, &to(192)), None, "it fits");
+    assert_eq!(
+        bytes_kept("S", &held, 256 << 20, &to(256)),
+        None,
+        "the same"
+    );
+    assert_eq!(bytes_kept("S", &held, 128 << 20, &to(512)), None, "raised");
+    // A stream with no byte bound is lowered to one only where it fits.
+    assert!(bytes_kept("S", &held, -1, &to(128))
+        .is_some_and(|kept| kept.contains("keeps no byte bound")));
+    assert_eq!(bytes_kept("S", &held, -1, &to(256)), None);
+}

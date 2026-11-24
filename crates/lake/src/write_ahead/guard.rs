@@ -20,9 +20,12 @@
 //! to this release's bounds only where that drops no write past the lake's
 //! place ([`bounds_drop`]): an age bound its oldest such write is past is
 //! refused, naming the stream, the stream kept as it is and its member
-//! saying so ([`said`]). A lower byte bound drops none -- the stream
-//! refuses new writes (`discard: new`) until it is back under it -- and is
-//! never refused.
+//! saying so ([`said`]). A lower byte bound drops none, but under one the
+//! stream holds more than, it refuses every new write (`discard: new`)
+//! until the writes it holds age out: the lake does not refuse its own
+//! writes over a setting, so such a bound is not applied ([`bytes_kept`]).
+//! The stream keeps its own byte bound, its member saying so, and the next
+//! writer's start applies the bound once what the stream holds fits it.
 
 use std::time::Duration;
 
@@ -162,7 +165,8 @@ impl Full {
 /// not recorded is past. The words it is refused with, naming the stream;
 /// none where the bounds drop none. A byte bound lower than it holds drops
 /// none: the stream keeps every write and refuses new ones until it is
-/// under it (`discard: new`; seen on a real broker, 160 writes kept).
+/// under it (`discard: new`; seen on a real broker, 160 writes kept), which
+/// is why such a bound is not applied ([`bytes_kept`]).
 pub fn bounds_drop(
     name: &str,
     standing: &Standing,
@@ -188,6 +192,40 @@ pub fn bounds_drop(
     Some(format!(
         "the write-ahead stream {name} is kept as it is, not brought to this release's bounds: \
          {why}, and it holds {past} write(s) the lake has not recorded, which the bound would drop"
+    ))
+}
+
+/// Whether the byte bound of `bounds` is not applied to the stream as it
+/// stands, its own being `held_max_bytes`: a lower bound than its own (none
+/// where that is not above 0) that it holds more than. Under it the stream
+/// would refuse every write until the writes it holds aged out. The words
+/// its member says, naming the stream; none where the bound is not lower,
+/// or what the stream holds fits it. A higher bound is always applied.
+pub fn bytes_kept(
+    name: &str,
+    standing: &Standing,
+    held_max_bytes: i64,
+    bounds: &Bounds,
+) -> Option<String> {
+    let new = u64::try_from(bounds.max_bytes)
+        .ok()
+        .filter(|new| *new > 0)?;
+    let own = u64::try_from(held_max_bytes).ok().filter(|own| *own > 0);
+    if own.is_some_and(|own| own <= new) || standing.bytes <= new {
+        return None;
+    }
+    let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
+    let own = own.map_or_else(
+        || "no byte bound".to_string(),
+        |own| format!("its {:.1} MiB bound", mib(own)),
+    );
+    Some(format!(
+        "the write-ahead stream {name} keeps {own}, not brought to this release's {:.1} MiB: \
+         it holds {:.1} MiB, and under the lower bound it would refuse every write until the \
+         writes it holds aged out; the bound is applied at a writer's start once what the \
+         stream holds fits it",
+        mib(new),
+        mib(standing.bytes)
     ))
 }
 
