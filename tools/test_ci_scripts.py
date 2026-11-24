@@ -12,6 +12,10 @@ of `make e2e-harness-check`.
   three-agent jobs).
 - tools/ci-watchdog.sh verdict: a failed job's last line names the failed
   check, or the step that died where no check ran (v31a item 11).
+- e2e/cluster/nodes-steady.sh: the cluster is ready only when every node is
+  Ready and no node container is restarting, its restart count steady
+  (v31a item 11; queue run 45395079443's agent-2 restart-looped while every
+  ready wait passed).
 - tools/ci-sdk.sh: interop reads the SDK release tools/ci-sdk.txt pins, and
   another ref only where a run names it, said as a warning (v31a item 11).
 """
@@ -248,6 +252,116 @@ class Watchdog(unittest.TestCase):
         line = self.last_line(log=self.READY.format(system="none", host="x:1"),
                               steps={"make": {"outcome": "success"}, "pulls": {"outcome": "failure"}})
         self.assertEqual(line, "FAILED: the step pulls (failure), after the make")
+
+
+E2E = os.path.join(TOOLS, "..", "e2e", "cluster")
+
+
+class NodesSteady(unittest.TestCase):
+    """nodes-steady.sh with docker, kubectl and date stood in for, each
+    answering from a file the test writes."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="c4b2-steady-")
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        self.state = os.path.join(self.root, "state")
+        # docker: `ps` lists the node files' names; `inspect` answers a node's
+        # file: running restarting restarts exit-code oomkilled.
+        stub(self.bin, "docker", f"""
+case "$1" in
+  ps) ls {self.root}/node | sed 's/^/x/;s/^x//'; echo k3d-c-serverlb ;;
+  inspect) eval last=\\${{$#}}; cat {self.root}/node/$last ;;
+  logs) echo "the log of $3" ;;
+esac
+""")
+        stub(self.bin, "kubectl", f"cat {self.root}/ready\n")
+        stub(self.bin, "date", f"cat {self.root}/now\n")
+        os.makedirs(os.path.join(self.root, "node"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def nodes(self, now, ready=True, **nodes):
+        """Each node keyword: (running, restarting, restarts)."""
+        for name in os.listdir(os.path.join(self.root, "node")):
+            os.remove(os.path.join(self.root, "node", name))
+        lines = []
+        for name, (running, restarting, restarts) in nodes.items():
+            node = "k3d-c-" + name.replace("_", "-")
+            with open(os.path.join(self.root, "node", node), "w") as f:
+                f.write(f"{str(running).lower()} {str(restarting).lower()} {restarts} 0 false\n")
+            lines.append(f"{node} {'True' if ready is True or (ready and name not in ready) else 'False'}")
+        with open(os.path.join(self.root, "ready"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+        with open(os.path.join(self.root, "now"), "w") as f:
+            f.write(f"{now}\n")
+
+    def ask(self):
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", E2E_K3D_STEADY_SECONDS="30")
+        return subprocess.run(["sh", os.path.join(E2E, "nodes-steady.sh"), "c", self.state],
+                              capture_output=True, text=True, env=env)
+
+    def test_nodes_ready_and_never_restarted_pass_once_steady_for_long_enough(self):
+        self.nodes(1000, server_0=(True, False, 0), agent_0=(True, False, 0))
+        self.assertEqual(self.ask().returncode, 1)
+        self.nodes(1020, server_0=(True, False, 0), agent_0=(True, False, 0))
+        early = self.ask()
+        self.assertEqual(early.returncode, 1)
+        self.assertIn("have held for 20s of 30s", early.stdout)
+        self.nodes(1031, server_0=(True, False, 0), agent_0=(True, False, 0))
+        done = self.ask()
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("has not restarted for 31s", done.stdout)
+
+    def test_a_node_restart_looping_never_passes(self):
+        # Agent-2's loop of queue run 45395079443: running at every look,
+        # its count higher at each.
+        for turn in range(12):
+            self.nodes(1000 + 18 * turn, server_0=(True, False, 0), agent_2=(True, False, turn))
+            done = self.ask()
+            self.assertEqual(done.returncode, 1, f"turn {turn}: {done.stdout}")
+        self.assertIn("a node container restarted", done.stdout)
+        self.assertIn("were k3d-c-agent-2=10 k3d-c-server-0=0, now k3d-c-agent-2=11 k3d-c-server-0=0", done.stdout)
+
+    def test_a_node_container_restarting_or_stopped_fails_and_starts_the_clock_again(self):
+        self.nodes(1000, server_0=(True, False, 0), agent_0=(True, False, 1))
+        self.ask()
+        self.nodes(1040, server_0=(True, False, 0), agent_0=(False, True, 1))
+        down = self.ask()
+        self.assertEqual(down.returncode, 1)
+        self.assertIn("k3d-c-agent-0 (running false, restarting true, restarts 1, last exit 0, OOMKilled false)", down.stdout)
+        # Up again with its count unchanged: the clock started again.
+        self.nodes(1050, server_0=(True, False, 0), agent_0=(True, False, 1))
+        self.assertEqual(self.ask().returncode, 1)
+        self.nodes(1081, server_0=(True, False, 0), agent_0=(True, False, 1))
+        self.assertEqual(self.ask().returncode, 0)
+
+    def test_a_node_not_ready_fails_though_its_container_is_steady(self):
+        self.nodes(1000, ready={"agent_1"}, server_0=(True, False, 0), agent_1=(True, False, 0))
+        self.ask()
+        self.nodes(1100, ready={"agent_1"}, server_0=(True, False, 0), agent_1=(True, False, 0))
+        done = self.ask()
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("a node is not Ready: k3d-c-agent-1 (Ready False)", done.stdout)
+        # Ready later: steady since the first look, so it passes at once.
+        self.nodes(1101, server_0=(True, False, 0), agent_1=(True, False, 0))
+        self.assertEqual(self.ask().returncode, 0)
+
+    def test_no_node_container_fails(self):
+        self.nodes(1000)
+        done = self.ask()
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no node container", done.stdout)
+
+    def test_the_bring_up_asks_it_as_the_cluster_is_made_and_in_its_last_wait(self):
+        with open(os.path.join(TOOLS, "..", "Makefile")) as f:
+            make = f.read()
+        recipe = make[make.index("\ne2e-cluster-k3d:"):]
+        recipe = recipe[:recipe.index("the cluster is ready, ")]
+        first = recipe.index("e2e/cluster/nodes-steady.sh")
+        self.assertLess(first, recipe.index('ready "the API server'))
+        self.assertIn('ready "every node Ready, its container running and not restarting', recipe)
 
 
 class SdkRef(unittest.TestCase):
