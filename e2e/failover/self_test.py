@@ -650,5 +650,30 @@ class BrokerRolledLate(unittest.TestCase):
         self.assertLess(ready, analytics)
 
 
+class NoLossAllowed(unittest.TestCase):
+    """Roadmap v31a item 10: the ha whole-run check passed a lake row lost
+    after it was acknowledged, as a note (`lake_may_lose`, fault 7). No
+    caller may allow loss now: in every profile a lost acknowledged row
+    fails the check and names the row."""
+
+    def lost(self, lake_lost):
+        return {"book": {"acknowledged": 3, "lost": [], "lost_s": 0, "by_database": {"each": [3], "none": 0}},
+                "lake": {"acknowledged": 5, "lost": lake_lost, "lost_s": 0.4,
+                         "by_database": {"each": [5 - len(lake_lost)], "none": len(lake_lost)}}}
+
+    def test_no_caller_can_allow_the_lake_to_lose(self):
+        import inspect
+        self.assertNotIn("lake_may_lose", inspect.signature(run.driver_rpo_held).parameters)
+
+    def test_a_lake_row_lost_in_the_ha_whole_run_fails_and_is_named(self):
+        for profile in ("ha", "tolerant"):
+            checks = Checks()
+            with mock.patch.object(run, "PROFILE", profile):
+                run.driver_rpo_held(checks, "the whole run", rpo=self.lost(["price 7"]))
+            failed = [what for ok, what in checks.said if not ok]
+            self.assertEqual(len(failed), 1, (profile, checks.said))
+            self.assertIn("every price the lake acknowledged is in it (1 lost: price 7", failed[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

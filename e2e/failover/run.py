@@ -2431,23 +2431,20 @@ def rpo_extra(rpo):
             "lake_rpo_s": rpo["lake"]["lost_s"]}
 
 
-def driver_rpo_held(s, after, rpo=None, lake_may_lose=False):
-    """Every acknowledged order kept, after a class; and every price, unless
-    the caller says the lake may lose some (no class does since the lake's
-    write-ahead stream, contract v30 stage E)."""
+def driver_rpo_held(s, after, rpo=None):
+    """Every acknowledged order and every acknowledged price kept, after a
+    class and for the whole run, in every profile. No caller may allow
+    loss (roadmap v31a item 10: the ha whole-run check once passed the
+    lake's losses as a note, fault 7's allowance)."""
     rpo = rpo or store_rpo()
     book, lake = rpo["book"], rpo["lake"]
     # Lost is in none of the store's databases; each one's count said.
     s.check(not book["lost"], f"{after}: every order and placement the book acknowledged is in it "
             f"({len(book['lost'])} lost{': ' + ', '.join(book['lost'][:5]) if book['lost'] else ''}; "
             f"{kept_words('held by', book['by_database'])})")
-    if lake_may_lose:
-        s.note(f"{after}: the lake lost {len(lake['lost'])} acknowledged row(s), within {lake['lost_s']}s "
-               f"(its commits are local; {kept_words('held by', lake['by_database'])})")
-    else:
-        s.check(not lake["lost"], f"{after}: every price the lake acknowledged is in it "
-                f"({len(lake['lost'])} lost{': ' + ', '.join(lake['lost'][:5]) if lake['lost'] else ''}; "
-                f"{kept_words('held by', lake['by_database'])})")
+    s.check(not lake["lost"], f"{after}: every price the lake acknowledged is in it "
+            f"({len(lake['lost'])} lost{': ' + ', '.join(lake['lost'][:5]) if lake['lost'] else ''}; "
+            f"{kept_words('held by', lake['by_database'])})")
     return rpo
 
 
@@ -7244,7 +7241,7 @@ def main():
                 s.check(False, f"{failure}: the stores' rows could not be read against the driver's: {stopped}")
     if DRIVEN:
         try:
-            driver_rpo_held(s, "the whole run", lake_may_lose=PROFILE == "ha")
+            driver_rpo_held(s, "the whole run")
         except SystemExit as stopped:
             s.check(False, f"the write driver's record could not be read: {stopped}")
         # Two writer groups (step 3d, stage G), last of the tolerant run's
