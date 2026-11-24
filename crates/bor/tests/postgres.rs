@@ -6956,6 +6956,8 @@ struct TwoDatabases {
     zero: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
     one: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
     mover: meridian_bor::partition_moves::Mover,
+    /// The members' broker: how many writes were handed on.
+    broker: Arc<GroupsBroker>,
     // Last, so the schemas are dropped after the stores over them.
     urls: Vec<Scratch>,
 }
@@ -7034,6 +7036,7 @@ fn databases(count: usize, interval: Option<u64>) -> TwoDatabases {
         zero,
         one,
         mover,
+        broker,
     }
 }
 
@@ -9208,6 +9211,7 @@ async fn m12_a_write_held_between_two_databases_is_answered_before_its_callers_d
         zero,
         one,
         mover,
+        broker: _broker,
     } = h;
     let moving = {
         let partition = partition.clone();
@@ -9663,4 +9667,186 @@ async fn a_command_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher
         "{refused}"
     );
     blocking(move || drop((one, two, three, store)));
+}
+
+// ---- A write between a cross-database move's close and its open ----------
+
+/// One write to `account` through `bus`, its caller waiting `within`.
+async fn write_within(
+    bus: &Bus,
+    account: &str,
+    reason: &str,
+    within: std::time::Duration,
+) -> Result<(), String> {
+    let request = SetAccountAttributeRequest {
+        account_id: account.to_string(),
+        attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+        reason: reason.into(),
+    };
+    let stamp = Stamp {
+        acting_for_subject: PERSON.to_string(),
+        account_scope: None,
+        ..Default::default()
+    };
+    bus.call_stamped(
+        SET_ACCOUNT_ATTRIBUTE,
+        "meridian.v1.SetAccountAttributeRequest",
+        request.encode_to_vec(),
+        None,
+        Some(within),
+        &stamp,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|failed| failed.to_string())
+}
+
+/// An account closed in group 1's database toward a partition of group 0's
+/// in another, its open not made: asked of group 0's member with nothing
+/// handed on, so the store's own answer is read. `looked` has group 0's
+/// member find the account where it was before the close, as a member
+/// that pre-routed one of its writes has.
+async fn held_between_two_databases(tag: &str, looked: bool) {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<Scratch> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    let (zero, one) = blocking(|| (spread(0), spread(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("{tag}-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    let from = blocking(|| one.place_first(&account, &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 0)
+        .unwrap();
+    let bus = |name: &str, store: Arc<meridian_bor::spread::Spread>| {
+        let bus = Arc::new(Bus::single(
+            name,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), store, bus.clock());
+        resolving_equities(&bus);
+        bus
+    };
+    let (bus_zero, bus_one) = (bus("held-0", zero.clone()), bus("held-1", one.clone()));
+    open(&bus_one, &account, &unique("INS-HELD")).await;
+    if looked {
+        assert_eq!(
+            blocking(|| zero.writer_group_of(&account)),
+            Some(1),
+            "found in {from}, group 1's, before its move"
+        );
+    }
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    // Closed by group 1; its open, group 0's, not asked yet.
+    let closed = send(
+        &bus_one,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    assert!(closed.is_err(), "the open is the new partition's group's");
+    // Never opened within its caller's wait: held that long, then answered
+    // "ask again" as a held write is -- never another group's, never
+    // "found in another partition".
+    let began = std::time::Instant::now();
+    let refused = write_within(
+        &bus_zero,
+        &account,
+        "held past its caller's wait",
+        std::time::Duration::from_millis(1_500),
+    )
+    .await
+    .expect_err("nothing is written before the open");
+    assert!(
+        refused.contains("is moving to"),
+        "held for its move's open, not refused otherwise: {refused}"
+    );
+    assert!(
+        began.elapsed() >= std::time::Duration::from_millis(700),
+        "it waited for the open inside the hold: {:?}",
+        began.elapsed()
+    );
+    // Opened meanwhile: the write waits for it and commits after it.
+    let writing = {
+        let (bus, account) = (bus_zero.clone(), account.clone());
+        tokio::spawn(async move {
+            write_within(
+                &bus,
+                &account,
+                "written after the open",
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    send(
+        &bus_zero,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .expect("opened by group 0");
+    writing
+        .await
+        .unwrap()
+        .expect("a write held by the move is written once it opens");
+    let journal = blocking(|| zero.journal(&account)).unwrap();
+    assert_eq!(
+        journal.last().map(|entry| entry.partition.as_str()),
+        Some(to.as_str()),
+        "numbered in its new partition, after the open"
+    );
+    blocking(move || drop((zero, one, bus_zero, bus_one)));
+}
+
+/// Section 6.8, across databases (PR CI 45339243058, ha: order 1005813,
+/// sent between ACC-DRIVE-01's close in database 0 and its open in
+/// database 1, was refused in 93 ms): a write to an account closed toward
+/// this member's database and not yet opened is held for the open, where
+/// this member last found the account in the partition it left. Its new
+/// database holds no row of it until the open, and the store read "the
+/// record" from the other database's store's memory of where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_between_a_cross_database_close_and_open_is_held_by_a_member_that_found_it_before()
+{
+    held_between_two_databases("ACC-HELD-LOOKED", true).await;
+}
+
+/// The same, by a member that never found the account before its move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_between_a_cross_database_close_and_open_is_held_by_a_member_that_never_found_it() {
+    held_between_two_databases("ACC-HELD-FRESH", false).await;
 }
