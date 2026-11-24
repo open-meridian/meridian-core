@@ -879,7 +879,26 @@ impl Bus {
                     &[],
                     crate::owners::NOT_THIS_GROUPS,
                 )),
-                Some(group) => hand(&route, group, &topic, kept),
+                Some(group) => {
+                    // Handed here and handed on again, by the record's
+                    // word: said, so two groups that each name the other
+                    // are read in their logs (PR CI 45339243058, whose
+                    // hand-ons no log line showed).
+                    if handed {
+                        tracing::warn!(
+                            topic = %topic,
+                            message_id = kept
+                                .meta
+                                .as_ref()
+                                .map(|meta| meta.message_id.as_str())
+                                .unwrap_or_default(),
+                            from_group = route.group,
+                            to_group = group,
+                            "a write handed to this writer group is handed on again"
+                        );
+                    }
+                    hand(&route, group, &topic, kept)
+                }
             }
         })
     }
