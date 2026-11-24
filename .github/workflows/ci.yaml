@@ -925,6 +925,17 @@ jobs:
           make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" IMAGES=pulled ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"} \
             PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones" 2>&1 | tee "$RUNNER_TEMP/make.log"
 
+      # k3s's, k3d's and the node's images were all loaded above, so making
+      # the cluster pulls from no registry: the make says what kube-system
+      # and the host pulled while it was made, and this fails the job where
+      # either is not none (run 45300919431 died on k3d's own pull).
+      - name: "Proof: making the cluster pulled nothing"
+        id: pulls
+        if: always() && (steps.make.outcome == 'success' || steps.make.outcome == 'failure')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof pulls "$RUNNER_TEMP/make.log"
+
       # What the runner can say from its own files and commands alone, after
       # a failed make and before any step touches the network: the runs that
       # died since 2026-11-17 gave up in one of the make's `ready` waits, and
@@ -1160,6 +1171,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+
   # The cluster runs the pull request's tier leaves to the merge queue, each
   # under its own name, as e2e-harness-left: running nothing, saying so,
   # never on the queue.
@@ -1367,6 +1379,17 @@ jobs:
           set -o pipefail
           make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster IMAGES=pulled 2>&1 | tee "$RUNNER_TEMP/make.log"
 
+      # k3s's, k3d's and the node's images were all loaded above, so making
+      # the cluster pulls from no registry: the make says what kube-system
+      # and the host pulled while it was made, and this fails the job where
+      # either is not none (run 45300919431 died on k3d's own pull).
+      - name: "Proof: making the cluster pulled nothing"
+        id: pulls
+        if: always() && (steps.make.outcome == 'success' || steps.make.outcome == 'failure')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof pulls "$RUNNER_TEMP/make.log"
+
       # What the runner can say from its own files and commands alone, after
       # a failed make and before any step touches the network: the runs that
       # died since 2026-11-17 gave up in one of the make's `ready` waits, and
@@ -1499,6 +1522,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/cargo
           key: ${{ steps.cargo.outputs.key }}
+
 
   # The release candidate, tagged once the run is green (ruling 1071): the
   # amd64 and arm64 images every check above ran, as one manifest list per

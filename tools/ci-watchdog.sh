@@ -63,7 +63,11 @@
 #                                 the step passes: only matched is red);
 #                                 answers: whether `ip -o link` and `docker
 #                                 ps` each answer within 3 s, said to the
-#                                 step's outputs as stalled=true|false.
+#                                 step's outputs as stalled=true|false;
+#                                 pulls (on every run, not only a failed
+#                                 one): the make's lines saying what
+#                                 kube-system and the host pulled while the
+#                                 cluster was made, red unless both none.
 #                                 Each is also appended to proof.log beside
 #                                 the make's log, the annotations' source,
 #                                 and to the step summary. A command is
@@ -535,6 +539,26 @@ case $cmd in
           exit 1
         fi
         printf '%s' "$report" | say notice "ip and docker each answered within 3 s"
+        ;;
+      pulls)
+        # The Makefile's two lines once the cluster is ready: what kube-system
+        # pulled (k3s's own images, which CI hands every node as the airgap
+        # tarball) and what the host's Docker pulled (k3d's and the node
+        # image, which CI loads first). Either not none fails the job: run
+        # 45300919431 died making the cluster on k3d's pull. A make that never
+        # got the cluster ready has nothing to judge, and has failed already.
+        system=$(sed -n 's/^e2e-cluster-k3d: images pulled while it was made: //p' "$make" 2>/dev/null | tail -n 1)
+        host=$(sed -n 's/^e2e-cluster-k3d: images the host pulled while it was made: //p' "$make" 2>/dev/null | tail -n 1)
+        if [ -z "$system" ] && [ -z "$host" ]; then
+          echo "the make never said what was pulled: the cluster was not made ready" | say notice "pulls: nothing to judge"
+          exit 0
+        fi
+        if [ "${system:-unknown}" != none ] || [ "${host:-unknown}" != none ]; then
+          printf 'kube-system pulled: %s\nthe host pulled: %s\n' "${system:-unknown}" "${host:-unknown}" \
+            | say error "pulls: making the cluster pulled from a registry"
+          exit 1
+        fi
+        echo "kube-system pulled none, and the host none" | say notice "pulls: making the cluster pulled nothing"
         ;;
       *) usage ;;
     esac

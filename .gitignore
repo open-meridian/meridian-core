@@ -41,6 +41,8 @@ deploy/nats/dev.conf
 # Written and removed by `make e2e-cluster-k3d`: the throwaway cluster's
 # credentials, which outlive it only if the run is interrupted.
 .e2e-k3d.kubeconfig
+# The host's pull listener while the cluster is made: its process id.
+.e2e-k3d-pulls.pid
 
 # Made and replaced by `make test-directory`: a throwaway CA and the ldaps://
 # test directory's certificate, trusted by nothing.

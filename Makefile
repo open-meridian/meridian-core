@@ -1049,6 +1049,16 @@ K3D_READY = ready() { \
 	  echo "e2e-cluster-k3d:   ready after $$(( $$(date +%s) - start ))s"; \
 	}
 
+# What the host's Docker pulled while the cluster was made (k3d's own
+# loadbalancer and tools images, the node image), as `docker events` heard
+# it from just before `k3d cluster create` until the cluster was ready: CI
+# loads each of them first (tools/ci-k3s-images.sh), and its cluster jobs
+# fail a run where this line or the kube-system one before it is not none
+# (tools/ci-watchdog.sh proof pulls). Run 45300919431 died making the
+# cluster when its runner could not pull k3d's images. The listener ends
+# with the cluster ready, or when making it fails.
+E2E_K3D_PULLS_END = kill $$(cat .e2e-k3d-pulls.pid 2>/dev/null) 2>/dev/null; rm -f .e2e-k3d-pulls.pid
+
 e2e-cluster-k3d:
 	@docker network inspect $(E2E_K3D_NETWORK) >/dev/null 2>&1 \
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
@@ -1056,6 +1066,8 @@ e2e-cluster-k3d:
 	@$(if $(E2E_K3D_SHARED),docker volume rm -f $(E2E_K3D_SHARED) >/dev/null && docker volume create $(E2E_K3D_SHARED) >/dev/null,:)
 	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)$(if $(E2E_K3S_AIRGAP), with its system images from $(E2E_K3S_AIRGAP))"
 	@$(if $(E2E_K3S_AIRGAP),test -s "$(E2E_K3S_AIRGAP)" || { echo "e2e-cluster-k3d: E2E_K3S_AIRGAP names $(E2E_K3S_AIRGAP): it is not there" >&2; exit 1; },:)
+	@rm -f .e2e-k3d-pulls.log; { docker events --filter type=image --filter event=pull --format '{{.Actor.ID}}' \
+		>.e2e-k3d-pulls.log 2>&1 & echo $$! >.e2e-k3d-pulls.pid; }; sleep 1
 	@: >.e2e-k3d.log; made=; nodes=; at=0; \
 	if [ "$(E2E_K3D_AGENTS)" != 0 ]; then nodes="--agents $(E2E_K3D_AGENTS)"; fi; \
 	$(if $(E2E_K3D_SHARED),nodes="$$nodes --volume $(E2E_K3D_SHARED):$(E2E_K3D_SHARED_PATH)@server:*;agent:*";) \
@@ -1073,10 +1085,10 @@ e2e-cluster-k3d:
 	  tail -20 .e2e-k3d.log >&2; \
 	  $(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true; \
 	done; \
-	[ -n "$$made" ] || { echo "e2e-cluster-k3d: the cluster could not be made, twice" >&2; exit 1; }
+	[ -n "$$made" ] || { $(E2E_K3D_PULLS_END); echo "e2e-cluster-k3d: the cluster could not be made, twice" >&2; exit 1; }
 	@$(K3D) kubeconfig get $(E2E_K3D_CLUSTER) > $(E2E_K3D_KUBECONFIG)
 	@$(K3D_READY); export KUBECONFIG=$(E2E_K3D_KUBECONFIG); began=$$(date +%s); \
-	seen=$$(mktemp); trap 'rm -f "$$seen"' EXIT; \
+	seen=$$(mktemp); trap 'rm -f "$$seen"; $(E2E_K3D_PULLS_END)' EXIT; \
 	ready "the API server (/readyz)" kubectl get --raw /readyz \
 	&& ready "the default service account" kubectl -n default get serviceaccount default \
 	&& ready "kube-system's deployments to exist: $(E2E_K3D_SYSTEM)" kubectl -n kube-system get deployment $(E2E_K3D_SYSTEM) \
@@ -1087,7 +1099,9 @@ e2e-cluster-k3d:
 	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made" \
 	&& pulled=$$(kubectl get events -A --field-selector reason=Pulling \
 		-o jsonpath='{range .items[*]}{.message}{"; "}{end}' 2>/dev/null | sed 's/Pulling image //g'; true) \
-	&& echo "e2e-cluster-k3d: images pulled while it was made: $${pulled:-none}"
+	&& echo "e2e-cluster-k3d: images pulled while it was made: $${pulled:-none}" \
+	&& host=$$($(E2E_K3D_PULLS_END); sort -u .e2e-k3d-pulls.log 2>/dev/null | paste -sd ' ' -) \
+	&& echo "e2e-cluster-k3d: images the host pulled while it was made: $${host:-none}"
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
 		E2E_IMAGE_LOAD="e2e/cluster/image-load.sh $(K3D) $(E2E_K3D_CLUSTER)" E2E_CLUSTER_HTTP_PORT=$(E2E_K3D_HTTP); \
 	  held=$$?; \
@@ -1202,12 +1216,17 @@ ci-tier-check:
 # The cluster harnesses' own tests, no cluster (PR CI 44604574060): what a
 # finished rollout is (e2e/cluster/rollout.py), and the failover run's waits
 # after an upgrade and its client of the dashboard, whose forward ends with
-# the pod it landed on (e2e/failover/self_test.py).
+# the pod it landed on (e2e/failover/self_test.py). And the cluster jobs'
+# own scripts with stand-ins (tools/test_ci_scripts.py): k3s's and k3d's
+# images, the pulls proof and a failed job's last line.
 e2e-harness-check:
 	@$(PY) e2e/cluster/rollout.py --self-test
 	@said="$$($(PY) e2e/failover/self_test.py 2>&1)" \
 		|| { echo "$$said" >&2; echo "e2e-harness-check FAILED" >&2; exit 1; }
 	@echo "failover harness: self-test OK"
+	@said="$$($(PY) tools/test_ci_scripts.py 2>&1)" \
+		|| { echo "$$said" >&2; echo "e2e-harness-check FAILED: the cluster jobs' scripts" >&2; exit 1; }
+	@echo "cluster jobs' scripts (tools/test_ci_scripts.py): self-test OK"
 
 claims-check:
 	@$(PY) tools/claims.py --self-test >/dev/null
