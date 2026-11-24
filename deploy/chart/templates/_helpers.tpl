@@ -97,6 +97,61 @@ is refused (requirement 1, ruling 1047). Each takes the chart.
 {{- end -}}
 
 {{/*
+Who may connect to the brought database from past its own pod: pg_hba.conf
+lines, as a JSON list (v31a item 6). database.brought.pgHba where it is set;
+otherwise the chart's own, by the shape it runs in and by internal TLS, as
+they were before they became a value. Under internal TLS (ruling 1084) a
+line that would admit a connection in the clear is refused: every remote
+line is hostssl, or rejects. Takes (dict "top" . "patroni" bool "tls" bool).
+*/}}
+{{- define "meridian-runtime.databaseAccess" -}}
+{{- $rules := .top.Values.database.brought.pgHba | default list -}}
+{{- if not $rules -}}
+{{- if and .patroni .tls -}}
+{{- $rules = list "hostnossl all all 0.0.0.0/0 reject" "hostnossl all all ::/0 reject" "hostnossl replication all 0.0.0.0/0 reject" "hostssl replication postgres 0.0.0.0/0 scram-sha-256" "hostssl all all 0.0.0.0/0 scram-sha-256" "hostssl all all ::/0 scram-sha-256" -}}
+{{- else if .patroni -}}
+{{- $rules = list "host replication postgres 0.0.0.0/0 scram-sha-256" "host all all 0.0.0.0/0 scram-sha-256" "host all all ::/0 scram-sha-256" -}}
+{{- else if .tls -}}
+{{- $rules = list "hostnossl all all all reject" "hostnossl replication all all reject" "hostssl all all all scram-sha-256" -}}
+{{- else -}}
+{{- /* What postgres:16-alpine's entrypoint appended at initdb, unsynced,
+       into the data directory, where a power loss took it (LazyFS run 2). */ -}}
+{{- $rules = list "host all all all scram-sha-256" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "slice" $rules) -}}
+{{- fail (printf "database.brought.pgHba is %v; it takes a list of pg_hba.conf lines, one per item" $rules) -}}
+{{- end -}}
+{{- range $rules -}}
+{{- $words := splitList " " (. | toString | trim | replace "\t" " ") | compact -}}
+{{- if not (has (first $words | default "") (list "local" "host" "hostssl" "hostnossl" "hostgssenc" "hostnogssenc")) -}}
+{{- fail (printf "database.brought.pgHba has %q; each line starts local, host, hostssl, hostnossl, hostgssenc or hostnogssenc, as pg_hba.conf's do" .) -}}
+{{- end -}}
+{{- if and $.tls (has (first $words) (list "host" "hostnossl" "hostgssenc" "hostnogssenc")) (ne (last $words) "reject") -}}
+{{- fail (printf "database.brought.pgHba has %q, which admits a connection in the clear; with tls.internal.enabled every remote line is hostssl or ends reject (ruling 1084)" .) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $rules -}}
+{{- end -}}
+
+{{/*
+The brought database's pg_hba.conf when it runs alone: its own pod's
+connections, as the image's initdb admits them, then the access rules.
+Takes (dict "top" . "tls" bool).
+*/}}
+{{- define "meridian-runtime.databaseHbaFile" -}}
+local all all trust
+host all all 127.0.0.1/32 trust
+host all all ::1/128 trust
+local replication all trust
+host replication all 127.0.0.1/32 trust
+host replication all ::1/128 trust
+{{- range (include "meridian-runtime.databaseAccess" (dict "top" .top "patroni" false "tls" .tls) | fromJsonArray) }}
+{{ . }}
+{{- end }}
+{{- end -}}
+
+{{/*
 The brought database's record-read replicas (contract v30, stage C; the
 resilience spec's sections 4, 5 and 11, approved 2026-11-11):
 database.brought.readReplicas, 0 by default, or 1, the shape CI tests

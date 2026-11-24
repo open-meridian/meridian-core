@@ -3662,6 +3662,45 @@ chart-check:
 		&& { echo "chart-check FAILED: Patroni's REST API is given TLS with internal TLS off" >&2; exit 1; }; \
 	echo "$$plain" | grep -qF 'value: "$$(POD_IP):8008"' \
 		|| { echo "chart-check FAILED: without internal TLS Patroni's members no longer reach each other by address" >&2; exit 1; }
+	@# Who may connect to the brought database (v31a item 6): pg_hba.conf
+	@# from a ConfigMap, never from the data directory, where the image's
+	@# entrypoint wrote its line unsynced and a power loss took it (LazyFS
+	@# run 2). database.brought.pgHba's lines after the pod's own, in order;
+	@# a change restarts the server alone (checksum/access) and is in
+	@# Patroni's pg_hba; a line that is not pg_hba.conf's, or one admitting a
+	@# connection in the clear under internal TLS, is refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render by default" >&2; exit 1; }; \
+	hba="$$(echo "$$plain" | awk '/^---/{c=0;p=0} /^kind: ConfigMap$$/{c=1} c&&/^  name: check-meridian-runtime-database-hba$$/{p=1} p&&/^    /{sub(/^    /,""); print}')"; \
+	[ "$$(echo "$$hba" | tail -n 1)" = "host all all all scram-sha-256" ] && echo "$$hba" | grep -qx "local all all trust" \
+		|| { echo "chart-check FAILED: alone, without TLS, the database's access rules are not in a ConfigMap, its own pod's then every role by password: $$hba" >&2; exit 1; }; \
+	echo "$$plain" | grep -qx -- "            - hba_file=/etc/meridian-hba/pg_hba.conf" \
+		|| { echo "chart-check FAILED: alone, without TLS, the database does not read its access rules from the ConfigMap (hba_file)" >&2; exit 1; }; \
+	first="$$(echo "$$plain" | sed -n 's/^ *checksum\/access: //p')"; \
+	[ -n "$$first" ] || { echo "chart-check FAILED: alone, the database's pods carry no checksum/access, so a change to its rules is never read" >&2; exit 1; }; \
+	set="$$($(HELM_TEMPLATE) check deploy/chart $$base --set 'database.brought.pgHba[0]=host all e2e_hba_refused all reject' --set 'database.brought.pgHba[1]=host all all 10.0.0.0/8 scram-sha-256' 2>/dev/null)" \
+		|| { echo "chart-check FAILED: database.brought.pgHba of two lines did not render" >&2; exit 1; }; \
+	hba="$$(echo "$$set" | awk '/^---/{c=0;p=0} /^kind: ConfigMap$$/{c=1} c&&/^  name: check-meridian-runtime-database-hba$$/{p=1} p&&/^    /{sub(/^    /,""); print}')"; \
+	[ "$$(echo "$$hba" | tail -n 2 | tr '\n' '|')" = "host all e2e_hba_refused all reject|host all all 10.0.0.0/8 scram-sha-256|" ] \
+		&& ! echo "$$hba" | grep -qx "host all all all scram-sha-256" \
+		|| { echo "chart-check FAILED: database.brought.pgHba's lines are not the rules, in order, after the pod's own: $$hba" >&2; exit 1; }; \
+	[ -n "$$(echo "$$set" | sed -n 's/^ *checksum\/access: //p')" ] && [ "$$(echo "$$set" | sed -n 's/^ *checksum\/access: //p')" != "$$first" ] \
+		|| { echo "chart-check FAILED: a change to database.brought.pgHba leaves checksum/access as it was, so the server never restarts with it" >&2; exit 1; }; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set 'database.brought.pgHba[0]=host replication postgres 10.0.0.0/8 scram-sha-256' --set 'database.brought.pgHba[1]=host all all 10.0.0.0/8 scram-sha-256' 2>/dev/null)" \
+		|| { echo "chart-check FAILED: database.brought.pgHba did not render in the ha profile" >&2; exit 1; }; \
+	[ "$$(echo "$$ha" | grep -A4 '^      pg_hba:$$' | sed -n 's/^        - //p' | tr '\n' '|')" = "local all all trust|host all all 127.0.0.1/32 trust|host replication postgres 10.0.0.0/8 scram-sha-256|host all all 10.0.0.0/8 scram-sha-256|" ] \
+		|| { echo "chart-check FAILED: under Patroni, pg_hba is not the members' own lines then database.brought.pgHba's" >&2; exit 1; }; \
+	for refused in "allow all all" "trust all all all"; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set "database.brought.pgHba[0]=$$refused" >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: database.brought.pgHba rendered \"$$refused\", not a pg_hba.conf line" >&2; exit 1; }; \
+	done; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set tls.internal.enabled=true --set 'database.brought.pgHba[0]=host all all all scram-sha-256' 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: with internal TLS, database.brought.pgHba rendered a line admitting a connection in the clear" >&2; exit 1; }; \
+	echo "$$said" | grep -q "admits a connection in the clear" \
+		|| { echo "chart-check FAILED: a line in the clear under internal TLS was refused without saying so: $$said" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set tls.internal.enabled=true --set 'database.brought.pgHba[0]=host all all 10.0.0.0/8 reject' --set 'database.brought.pgHba[1]=hostssl all all all scram-sha-256' >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: with internal TLS, a rejecting host line and a hostssl line were refused" >&2; exit 1; }
 	@# An external database's private CA (database.caSecret, ruled
 	@# 2026-11-08): its Secret's ca.crt mounted, and named to the runtime,
 	@# in every pod that connects to the database -- the five stores, the

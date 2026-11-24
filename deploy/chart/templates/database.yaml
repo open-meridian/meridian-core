@@ -377,28 +377,24 @@ data:
           sslmode: verify-ca
           sslrootcert: /run/meridian-tls/ca.crt
           {{- end }}
+      # Who may connect (database.brought.pgHba, or the chart's own): the
+      # members' own pods first, then the value's lines in order. Patroni
+      # writes them to pg_hba.conf at every start.
       pg_hba:
         - local all all trust
         - host all all 127.0.0.1/32 trust
-        {{- if $tls }}
-        # Over TLS or not at all, from anywhere but this pod.
-        - hostnossl all all 0.0.0.0/0 reject
-        - hostnossl all all ::/0 reject
-        - hostnossl replication all 0.0.0.0/0 reject
-        - hostssl replication postgres 0.0.0.0/0 scram-sha-256
-        - hostssl all all 0.0.0.0/0 scram-sha-256
-        - hostssl all all ::/0 scram-sha-256
-        {{- else }}
-        - host replication postgres 0.0.0.0/0 scram-sha-256
-        - host all all 0.0.0.0/0 scram-sha-256
-        - host all all ::/0 scram-sha-256
+        {{- range (include "meridian-runtime.databaseAccess" (dict "top" . "patroni" true "tls" $tls) | fromJsonArray) }}
+        - {{ . }}
         {{- end }}
 {{- end }}
-{{- if and $tls (not $patroni) }}
+{{- if not $patroni }}
 ---
-# Who may connect, alone and over TLS (tls.internal; ruling 1084): the
-# server's own pod as the image's initdb admits it, and everyone else over
-# TLS or not at all.
+# Who may connect (v31a item 6): the server's own pod, as the image's initdb
+# admits it, then database.brought.pgHba's lines, or the chart's own -- under
+# internal TLS (ruling 1084) everyone else over TLS or not at all. Read from
+# here, never from the data directory, where the image's entrypoint wrote
+# its line unsynced and a power loss took it (LazyFS run 2: every
+# connection refused). A change restarts the server with it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -407,15 +403,7 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 data:
   pg_hba.conf: |
-    local all all trust
-    host all all 127.0.0.1/32 trust
-    host all all ::1/128 trust
-    local replication all trust
-    host replication all 127.0.0.1/32 trust
-    host replication all ::1/128 trust
-    hostnossl all all all reject
-    hostnossl replication all all reject
-    hostssl all all all scram-sha-256
+    {{- include "meridian-runtime.databaseHbaFile" (dict "top" . "tls" $tls) | nindent 4 }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -458,10 +446,16 @@ spec:
       meridian.dev/component: {{ $component }}
   template:
     metadata:
-      {{- if $archive }}
-      # The database's own container for `kubectl exec`, beside the archive's.
+      {{- if or $archive (not $patroni) }}
       annotations:
+        {{- if $archive }}
+        # The database's own container for `kubectl exec`, beside the archive's.
         kubectl.kubernetes.io/default-container: postgres
+        {{- end }}
+        {{- if not $patroni }}
+        # Its access rules read at start: a change restarts it with them.
+        checksum/access: {{ include "meridian-runtime.databaseHbaFile" (dict "top" . "tls" $tls) | sha256sum }}
+        {{- end }}
       {{- end }}
       # Not the release's version: postgres is the same image whichever
       # release this is, and a label that changes restarts it (see _helpers).
@@ -662,9 +656,10 @@ spec:
             - ssl_key_file=/run/meridian-tls/tls.key
             - -c
             - ssl_ca_file=/run/meridian-tls/ca.crt
+            {{- end }}
+            # Who may connect, from the ConfigMap beside it (v31a item 6).
             - -c
             - hba_file=/etc/meridian-hba/pg_hba.conf
-            {{- end }}
           env:
             - name: POSTGRES_USER
               value: postgres
@@ -710,10 +705,10 @@ spec:
             - name: internal-tls-server
               mountPath: /etc/meridian-internal-tls-server
               readOnly: true
+            {{- end }}
             - name: hba
               mountPath: /etc/meridian-hba
               readOnly: true
-            {{- end }}
             {{- if $archive }}
             - name: socket
               mountPath: /var/run/postgresql
@@ -774,7 +769,7 @@ spec:
             name: {{ $name }}-patroni
         {{- end }}
         {{- with (include "meridian-runtime.internalTlsServerVolume" (dict "top" . "server" "database")) }}{{ . | nindent 8 }}{{- end }}
-        {{- if and $tls (not $patroni) }}
+        {{- if not $patroni }}
         - name: hba
           configMap:
             name: {{ $name }}-hba
