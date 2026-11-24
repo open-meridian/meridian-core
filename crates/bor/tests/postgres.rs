@@ -10218,3 +10218,18 @@ async fn a_database_that_does_not_answer_holds_no_other_accounts_write_of_the_pa
         drop(h)
     });
 }
+
+/// The review's fourth finding: a move's open is the book's own act, kept
+/// by its own key, and the one act an account between its close and its
+/// open takes. A caller's command under a key of that shape is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_command_keyed_as_a_moves_open_is_refused() {
+    let (bus, _) = wired();
+    let account = unique("ACC");
+    let mut request = opening(&account, "INS-AAPL");
+    request.idempotency_key = format!("account-open:{account}:P0:1");
+    let refused = send(&bus, RECORD_OPENING_BALANCE, &request, Some(PERSON))
+        .await
+        .expect_err("a key the book keeps for its own");
+    assert!(refused.contains("idempotency_key"), "{refused}");
+}
