@@ -255,7 +255,9 @@ impl NatsBackend {
                 }
             }
         });
+        let address = answering_first(url, address).await?;
         let client = options
+            .retain_servers_order()
             .connect(&address)
             .await
             .map_err(|failed| BusError::HandlerFailed {
@@ -307,7 +309,9 @@ impl NatsBackend {
     /// Its heartbeat runs as long as the process does.
     pub async fn client(url: &str) -> Result<async_nats::Client, BusError> {
         let (options, address) = credential_in(url);
+        let address = answering_first(url, address).await?;
         let client = options
+            .retain_servers_order()
             .connect(&address)
             .await
             .map_err(|failed| BusError::HandlerFailed {
@@ -448,6 +452,102 @@ fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
         with_internal_tls(options, std::env::var(INTERNAL_TLS_CA).ok()),
         servers,
     )
+}
+
+/// The listed servers, those that answer first, so a connection is made to
+/// a server that answers without first waiting [`UNANSWERED`] on one that
+/// does not (the #147 known gap 2: a shard takeover with one server
+/// unreachable waited on it once for each connection it made, in sequence,
+/// past its 10 s).
+///
+/// Every listed server is asked at once, and one answers when it sends the
+/// INFO line a broker's server sends every client first. Those that answer
+/// together with the first, in any order, so clients spread across them;
+/// then the rest, as listed, for the library to move to when one is lost.
+/// A connection is made in this order ([`async_nats::ConnectOptions::
+/// retain_servers_order`]), so a dead server costs it no wait at all, and a
+/// server lost later costs a reconnection at most one. Where none answers
+/// within [`UNANSWERED`], the connection is refused then, naming each.
+/// One server is left to the library: there is nothing to put first.
+async fn answering_first(url: &str, servers: Vec<String>) -> Result<Vec<String>, BusError> {
+    use futures_util::stream::{FuturesUnordered, StreamExt as _};
+
+    if servers.len() < 2 {
+        return Ok(servers);
+    }
+    let mut asking: FuturesUnordered<_> = servers
+        .iter()
+        .enumerate()
+        .map(|(at, server)| async move { (at, answers(server).await) })
+        .collect();
+    let mut until = tokio::time::Instant::now() + UNANSWERED;
+    let mut answered = Vec::new();
+    while let Ok(Some((at, said))) = tokio::time::timeout_at(until, asking.next()).await {
+        if said {
+            if answered.is_empty() {
+                until = until.min(tokio::time::Instant::now() + ANSWERED_TOGETHER);
+            }
+            answered.push(at);
+        }
+    }
+    if answered.is_empty() {
+        return Err(BusError::HandlerFailed {
+            topic: redacted(url),
+            detail: format!(
+                "no server of the broker answered within {} s",
+                UNANSWERED.as_secs()
+            ),
+        });
+    }
+    shuffle(&mut answered);
+    let rest = (0..servers.len()).filter(|at| !answered.contains(at));
+    let order: Vec<usize> = answered.iter().copied().chain(rest).collect();
+    Ok(order.into_iter().map(|at| servers[at].clone()).collect())
+}
+
+/// How long after the first server answers the others are taken as
+/// answering with it: the servers of one cluster answer within a few
+/// milliseconds of each other, and one that does not answer is waited on
+/// no longer than this.
+const ANSWERED_TOGETHER: Duration = Duration::from_millis(100);
+
+/// Whether the server at `address` (`nats://host:port`) sends its INFO line
+/// within [`UNANSWERED`]. Nothing is sent to it: the connection is closed
+/// once it has said it.
+async fn answers(address: &str) -> bool {
+    use tokio::io::AsyncReadExt as _;
+
+    let (_, rest) = address.split_once("://").unwrap_or(("nats", address));
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = if host
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+    {
+        host.to_string()
+    } else {
+        format!("{host}:4222")
+    };
+    let said = tokio::time::timeout(UNANSWERED, async {
+        let mut socket = tokio::net::TcpStream::connect(host).await.ok()?;
+        let mut first = [0u8; 4];
+        socket.read_exact(&mut first).await.ok()?;
+        Some(&first == b"INFO")
+    })
+    .await;
+    matches!(said, Ok(Some(true)))
+}
+
+/// In place, in an order of the process's own: [`std::collections::hash_map::RandomState`]
+/// is seeded anew each time it is made.
+fn shuffle(items: &mut [usize]) {
+    use std::hash::{BuildHasher as _, Hasher as _};
+
+    for last in (1..items.len()).rev() {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_usize(last);
+        let pick = (hasher.finish() % (last as u64 + 1)) as usize;
+        items.swap(last, pick);
+    }
 }
 
 /// Over TLS, and only over TLS, where the deployment's internal TLS is on:
@@ -1341,5 +1441,104 @@ mod address_tests {
             redacted("nats://lake:pw@b-0.m:4222,b-1.m:4222"),
             "nats://b-0.m:4222,nats://b-1.m:4222"
         );
+    }
+}
+
+#[cfg(test)]
+mod dead_server_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    /// A server that takes a connection and never says a word: a broker
+    /// server on a node that stopped, or a process stopped where its port
+    /// is still open. Every connection is held, never answered.
+    async fn black_holed() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        port
+    }
+
+    /// Enough of a broker server for a client to connect: its INFO, then a
+    /// PONG for every PING.
+    async fn answering() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = socket.into_split();
+                    let info = format!(
+                        "INFO {{\"server_id\":\"live\",\"server_name\":\"live\",\"version\":\"2.10.29\",\
+                         \"host\":\"127.0.0.1\",\"port\":{port},\"headers\":true,\"max_payload\":1048576,\
+                         \"proto\":1}}\r\n"
+                    );
+                    if write.write_all(info.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line.starts_with("PING") && write.write_all(b"PONG\r\n").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// The #147 known gap 2: a shard takeover with one broker server
+    /// unreachable waited [`UNANSWERED`] on the dead address once for each
+    /// connection it made, in sequence. Listed first, the dead server costs
+    /// no connection a wait: every one connects well inside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_server_listed_first_costs_no_connection_a_wait() {
+        let (dead, live) = (black_holed().await, answering().await);
+        let url = format!("nats://b4r:pw@127.0.0.1:{dead},127.0.0.1:{live}");
+        let within = UNANSWERED / 2;
+        for attempt in 0..8 {
+            let started = std::time::Instant::now();
+            let client = tokio::time::timeout(UNANSWERED * 3, NatsBackend::client(&url))
+                .await
+                .expect("connected within three waits")
+                .expect("connected");
+            let took = started.elapsed();
+            assert!(
+                took < within,
+                "connection {attempt} took {took:?}, waiting on the dead server; the bound is {within:?}"
+            );
+            assert_eq!(client.server_info().server_id, "live");
+            let started = std::time::Instant::now();
+            let backend = NatsBackend::connect(&url).await.expect("connected");
+            let took = started.elapsed();
+            assert!(
+                took < within,
+                "backend {attempt} took {took:?}, waiting on the dead server; the bound is {within:?}"
+            );
+            drop(backend);
+        }
+    }
+
+    /// Every server dead: refused within one wait, naming each address and
+    /// never the credential.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_server_dead_is_refused_within_one_wait() {
+        let (a, b) = (black_holed().await, black_holed().await);
+        let url = format!("nats://b4r:pw@127.0.0.1:{a},127.0.0.1:{b}");
+        let started = std::time::Instant::now();
+        let refused = match NatsBackend::client(&url).await {
+            Ok(_) => panic!("connected to no server"),
+            Err(refused) => refused.to_string(),
+        };
+        let took = started.elapsed();
+        assert!(took < UNANSWERED + UNANSWERED / 2, "refused after {took:?}");
+        assert!(refused.contains(&format!("127.0.0.1:{a}")), "{refused}");
+        assert!(!refused.contains("pw"), "{refused}");
     }
 }
