@@ -222,6 +222,11 @@ pub(crate) async fn admitted(
 /// meridian_changes::serving).
 pub const CANCELLED_QUERY: &str = "[sqlstate 57014]";
 
+/// What a store's error carries in its words when the database had no room
+/// in its shared lock table for the statement's locks (SQLSTATE 53200, out
+/// of shared memory): the statements beside it hold them until they commit.
+const OUT_OF_LOCKS: &str = "[sqlstate 53200]";
+
 /// How long a request whose query was cancelled is told to wait.
 const CANCELLED_RETRY_AFTER_SECONDS: u32 = 5;
 
@@ -240,6 +245,22 @@ pub(crate) fn cancelled_for_load(topic: &str, answered: HandlerReply) -> Handler
                 retry_after_seconds: CANCELLED_RETRY_AFTER_SECONDS,
                 words: format!(
                     "overloaded: {topic}'s query ran past its statement_timeout and was cancelled"
+                ),
+            }))
+        }
+        // The database's lock table full under the statements beside this
+        // one (SQLSTATE 53200, out of shared memory): the same refusal for
+        // load, the statement tried again once theirs commit (v31a.17).
+        Err(said) if said.contains(OUT_OF_LOCKS) => {
+            tracing::warn!(
+                topic,
+                "a statement found the database's lock table full: {said}"
+            );
+            meridian_budget::count_refusal();
+            Err(crate::backend::overloaded(&meridian_budget::Overloaded {
+                retry_after_seconds: CANCELLED_RETRY_AFTER_SECONDS,
+                words: format!(
+                    "overloaded: {topic}'s statement found the database's lock table full"
                 ),
             }))
         }
@@ -1298,6 +1319,17 @@ mod tests {
         let other = super::cancelled_for_load("t", Err("db error [sqlstate 23505]".into()));
         assert_eq!(other.unwrap_err(), "db error [sqlstate 23505]");
         assert!(super::cancelled_for_load("t", Ok(("k".into(), vec![1]))).is_ok());
+    }
+
+    #[test]
+    fn a_statement_the_lock_table_had_no_room_for_is_refused_for_load_with_a_retry_after() {
+        let said = "the lake's store is unavailable: db error: ERROR: out of shared memory: \
+                    HINT: You might need to increase max_locks_per_transaction. [sqlstate 53200]";
+        let refused =
+            super::cancelled_for_load("platform.lake.query.list-prices", Err(said.into()))
+                .unwrap_err();
+        assert_eq!(crate::backend::refusal_retry_after(&refused), Some(5));
+        assert!(refused.contains("lock table"), "{refused}");
     }
     use super::*;
     use crate::MemoryBackend;

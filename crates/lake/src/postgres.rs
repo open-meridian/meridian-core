@@ -170,6 +170,15 @@ pub struct PostgresStore {
     /// The month tables this store's batches first wrote, to be analysed
     /// once their batch commits (migration 24; step 3d).
     unanalysed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
+    /// The month tables a batch was refused for, more than its transaction
+    /// makes (v31a.17): made before the next batch's begins.
+    owed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
+    /// Each dataset's open ranges as its last batch here read them, under
+    /// its lock: where [`Self::months_first`] places the next batch's rows
+    /// to make their months before it. Only ever a prediction -- a range
+    /// split since is found by the batch itself -- and let go whenever a
+    /// batch fails.
+    ranges_seen: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::range::Open>>>,
     /// When this store last let go of its group's parts of writes kept
     /// past their time (`lake_write_ahead_part`): once a minute at most.
     parts_let_go_at: std::sync::atomic::AtomicI64,
@@ -450,6 +459,8 @@ impl PostgresStore {
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            owed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            ranges_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
             parts_let_go_at: std::sync::atomic::AtomicI64::new(0),
             stream: std::sync::atomic::AtomicI64::new(0),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -974,21 +985,71 @@ fn latest_of_each<'a>(
         partitions_of(client, &[dataset.to_string()])?
     };
     let found = if from_latest {
-        client.query(
-            "SELECT k.data_type, k.row_key, r.body, l.anchor
-               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
-              CROSS JOIN LATERAL (
-                    SELECT partition, sequence, valid_from_ns, anchor FROM lake_latest
-                     WHERE row_key = k.row_key AND (dataset || '') = $1
-                       AND data_type = k.data_type
-                     LIMIT 1) AS l
-              CROSS JOIN LATERAL (
-                    SELECT body FROM lake_row
-                     WHERE partition = l.partition AND valid_from_ns = l.valid_from_ns
-                       AND dataset = $1 AND sequence = l.sequence AND row_key = k.row_key
-                     LIMIT 1) AS r",
-            &[&dataset, &types, &keys],
-        )
+        // In two statements, both under the dataset's lock (v31a.17, the
+        // lake's lock budget): where each key's latest version is, then
+        // its row, the ranges and valid times found named to the second as
+        // values. Named only by the first's rows, in one statement, no
+        // month was ruled out before it ran, and it locked every month
+        // table of every dataset the lake keeps -- 14 relations each, held
+        // until the batch committed -- to read one row a key.
+        let at = client
+            .query(
+                "SELECT k.data_type, k.row_key, l.partition, l.sequence, l.valid_from_ns, l.anchor
+                   FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
+                  CROSS JOIN LATERAL (
+                        SELECT partition, sequence, valid_from_ns, anchor FROM lake_latest
+                         WHERE row_key = k.row_key AND (dataset || '') = $1
+                           AND data_type = k.data_type
+                         LIMIT 1) AS l",
+                &[&dataset, &types, &keys],
+            )
+            .map_err(unavailable)?;
+        if at.is_empty() {
+            Ok(Vec::new())
+        } else {
+            let column = |n: usize| {
+                at.iter()
+                    .map(|row| row.get::<_, i64>(n))
+                    .collect::<Vec<i64>>()
+            };
+            let (types, keys): (Vec<i16>, Vec<String>) = at
+                .iter()
+                .map(|row| (row.get::<_, i16>(0), row.get::<_, String>(1)))
+                .unzip();
+            let (ranges, anchors): (Vec<String>, Vec<i32>) = at
+                .iter()
+                .map(|row| (row.get::<_, String>(2), row.get::<_, i32>(5)))
+                .unzip();
+            let (sequences, valid) = (column(3), column(4));
+            let in_ranges: Vec<String> = ranges
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let at_times: Vec<i64> = valid
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            client.query(
+                "SELECT k.data_type, k.row_key, r.body, k.anchor
+                   FROM unnest($2::smallint[], $3::text[], $4::text[], $5::bigint[], $6::bigint[],
+                               $7::integer[])
+                        AS k(data_type, row_key, partition, sequence, valid_from_ns, anchor)
+                  CROSS JOIN LATERAL (
+                        SELECT body FROM lake_row
+                         WHERE partition = k.partition AND valid_from_ns = k.valid_from_ns
+                           AND partition = ANY($8::text[]) AND valid_from_ns = ANY($9::bigint[])
+                           AND dataset = $1 AND sequence = k.sequence AND row_key = k.row_key
+                         LIMIT 1) AS r",
+                &[
+                    &dataset, &types, &keys, &ranges, &sequences, &valid, &anchors, &in_ranges,
+                    &at_times,
+                ],
+            )
+        }
     } else {
         client.query(
             "SELECT k.data_type, k.row_key, r.body, r.anchor
@@ -1530,8 +1591,16 @@ SELECT r.body FROM (SELECT DISTINCT dataset, partition, sequence, row_key, valid
      WHERE f.dataset = c.dataset AND f.sequence = c.sequence
        AND f.row_key = c.row_key AND f.valid_from_ns = c.valid_from_ns
        AND coalesce(f.partition, f.dataset) = c.partition
-       AND (f.partition = ANY($11) OR f.partition IS NULL)) r
+       AND (f.partition = ANY($11) OR f.partition IS NULL){within}) r
  ORDER BY r.dataset, r.sequence",
+        within = if from_latest {
+            // Chosen from `lake_latest`, now and unwindowed.
+            ""
+        } else {
+            // Every row chosen is within the read's window: named to the
+            // fetch too, so the months after it are not locked (v31a.17).
+            " AND f.valid_from_ns >= $8 AND f.valid_from_ns < $9 AND f.valid_from_ns <= $10"
+        },
         first = next_key("d.dataset", "s.subject", "r.latest_key IS NOT NULL"),
         next = next_key(
             "k.dataset",
@@ -1806,6 +1875,11 @@ SELECT body FROM lake_row
 /// force (found on dev 2026-11-09: a chain's statistics over its dates, 49,412
 /// rows in force of 358,688 versions, every version read and decoded to
 /// choose them, a page at a time, took the lake past its 1 GiB twice).
+/// Each row in force is chosen within the read's window and fetched by its
+/// own place. The window is named to the fetch too (v31a.17, the lake's
+/// lock budget): every row chosen is within it, and named only by the rows
+/// chosen, the fetch ruled no month out before it ran and locked every
+/// month its datasets keep -- 5,043 locks to read one month of thirty years.
 const IN_FORCE: &str = "
 SELECT r.body FROM lake_row r
   JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence, row_key, valid_from_ns
@@ -1821,6 +1895,7 @@ SELECT r.body FROM lake_row r
     ON r.dataset = f.dataset AND r.sequence = f.sequence AND r.row_key = f.row_key
    AND r.valid_from_ns = f.valid_from_ns
  WHERE (r.partition = ANY($11) OR r.partition IS NULL)
+   AND r.valid_from_ns >= $8 AND r.valid_from_ns < $9 AND r.valid_from_ns <= $10
  ORDER BY r.dataset, r.sequence";
 
 /// [`IN_FORCE`] as published by a time (contract v27, W10.6): a rate's row
@@ -1848,6 +1923,7 @@ SELECT r.body FROM lake_row r
     ON r.dataset = f.dataset AND r.sequence = f.sequence AND r.row_key = f.row_key
    AND r.valid_from_ns = f.valid_from_ns
  WHERE (r.partition = ANY($11) OR r.partition IS NULL)
+   AND r.valid_from_ns >= $8 AND r.valid_from_ns < $9 AND r.valid_from_ns <= $10
  ORDER BY r.dataset, r.sequence";
 
 /// [`EVERY_VERSION`] a row key at a time, each key's versions together:
@@ -2070,15 +2146,33 @@ impl PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         self.prepare(&mut conn, &[dataset])?;
+        // Kept to be recorded again where its transaction can be refused
+        // for the months it would make (v31a.17).
+        let kept = self.may_owe_months(dataset, &parts).then(|| parts.clone());
         // How long the dataset's lane was busy (step 3d; the profile's
         // advice on writer groups, approved 2026-11-14).
         let began = std::time::Instant::now();
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        // Each part's plugin shard's epoch checked first, its row held for
-        // the transaction (step 3d, checkpoint 5, item 32).
-        let done = shards_checked(&mut tx, (0..parts.len()).map(|at| shard_at(shards, at)))
-            .and_then(|fenced| self.record_dataset(&mut tx, dataset, parts, &fenced, now_ns))
-            .and_then(|done| tx.commit().map_err(unavailable).map(|()| done));
+        let (mut done, mut owed) = self.record_once(&mut conn, dataset, parts, shards, now_ns);
+        if owed {
+            // Refused for more month tables than its transaction makes:
+            // those its rows were not placed in before it (a key anchored
+            // by a subject merged into the one it now names; a range split
+            // since its ranges were read). They are owed: made, a few a
+            // transaction, and the batch recorded again, once, here.
+            self.forget_made();
+            if let Some(parts) = kept {
+                (done, owed) = self.record_once(&mut conn, dataset, parts, shards, now_ns);
+            }
+            if owed {
+                // Refused again, or not kept: for load, with a retry-after
+                // ([`StoreError::on_the_bus`]). What it was owed is made
+                // before the batch that asks again.
+                done = Err(StoreError::Held(format!(
+                    "dataset {dataset}'s batch needs more month tables than one transaction \
+                     makes: they are made before it; ask again in a moment"
+                )));
+            }
+        }
         meridian_changes::busy::record(dataset, began.elapsed(), meridian_changes::now_ns());
         if done.is_err() {
             self.forget_made();
@@ -2086,6 +2180,67 @@ impl PostgresStore {
             self.analyse_months(&mut *conn);
         }
         done
+    }
+
+    /// [`Self::record_together`]'s batch, its months made first and then
+    /// its one transaction: what it did, and whether it was refused for
+    /// more month tables than its transaction makes ([`Self::leaves_for`]),
+    /// nothing committed.
+    fn record_once(
+        &self,
+        conn: &mut Connection,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        shards: &[Option<ShardStamp>],
+        now_ns: i64,
+    ) -> (Result<Vec<Result<Recorded>>>, bool) {
+        let rows = parts.iter().map(|rows| (dataset, rows.as_slice()));
+        if let Err(failed) = self.months_first(conn, rows, false) {
+            return (Err(failed), false);
+        }
+        let mut tx = match conn.transaction().map_err(unavailable) {
+            Ok(tx) => tx,
+            Err(failed) => return (Err(failed), false),
+        };
+        let mut months = MonthsMade::default();
+        // Each part's plugin shard's epoch checked first, its row held for
+        // the transaction (step 3d, checkpoint 5, item 32).
+        let done = shards_checked(&mut tx, (0..parts.len()).map(|at| shard_at(shards, at)))
+            .and_then(|fenced| {
+                self.record_dataset(&mut tx, dataset, parts, &fenced, now_ns, &mut months)
+            })
+            .and_then(|done| tx.commit().map_err(unavailable).map(|()| done));
+        let owed = done.is_err() && months.refused;
+        (done, owed)
+    }
+
+    /// Whether `parts`' transaction could be refused for the month tables
+    /// it would make: its rows' months, one in each range the dataset's
+    /// last batch here read open, more than a transaction makes. Where no
+    /// batch of the dataset has been seen, by its rows' number.
+    fn may_owe_months(&self, dataset: &str, parts: &[Vec<Observation>]) -> bool {
+        let most = crate::leaves::MONTHS_A_TRANSACTION;
+        let rows: usize = parts.iter().map(Vec::len).sum();
+        if rows <= most {
+            return false;
+        }
+        let Some(ranges) = self
+            .ranges_seen
+            .lock()
+            .expect("seen poisoned")
+            .get(dataset)
+            .map(Vec::len)
+        else {
+            return true;
+        };
+        let mut months = std::collections::BTreeSet::new();
+        for row in parts.iter().flatten() {
+            months.insert(crate::leaves::Month::of(row.meta().valid_from_ns));
+            if months.len() * ranges.max(1) > most {
+                return true;
+            }
+        }
+        false
     }
 
     /// One dataset's parts recorded in `tx` (step 3d; sections 6.1 and 6.5):
@@ -2106,6 +2261,7 @@ impl PostgresStore {
         parts: Vec<Vec<Observation>>,
         fenced: &[Option<ShardFenced>],
         now_ns: i64,
+        months: &mut MonthsMade,
     ) -> Result<Vec<Result<Recorded>>> {
         lock_dataset_to_record(tx, dataset)?;
         // With several groups, each open range's row taken for the batch
@@ -2117,6 +2273,7 @@ impl PostgresStore {
         } else {
             (open_ranges(tx, dataset)?, BTreeMap::new())
         };
+        self.ranges_seen_are(dataset, &ranges);
         let from_latest = self.latest_all(tx)?;
         let latest = latest_of_each(tx, dataset, parts.iter().flatten(), from_latest)?;
         // The aliases, read only where a key held names another subject.
@@ -2207,7 +2364,7 @@ impl PostgresStore {
                 .iter()
                 .flat_map(|part| part.rows.iter().cloned())
                 .collect();
-            self.leaves_for(tx, &partition, &numbered)?;
+            self.leaves_for(tx, &partition, &numbered, months)?;
             insert_all(tx, dataset, &partition, &anchors, &numbered, epoch)?;
             // A key `lake_latest` held no version of, read under the
             // dataset's lock, is new to it: inserted, never upserted.
@@ -2334,12 +2491,16 @@ impl PostgresStore {
     }
 
     /// The month tables `rows` need in `partition`, made where they are not
-    /// (step 3d; section 6.2), in `tx`.
+    /// (step 3d; section 6.2), in `tx`: with those `months` counts made in
+    /// it already -- in its other ranges, and its other datasets -- at most
+    /// [`crate::leaves::MONTHS_A_TRANSACTION`] (v31a.17). Past that the
+    /// batch is refused, `months` saying so, and these are owed.
     fn leaves_for(
         &self,
         tx: &mut Transaction<'_>,
         partition: &str,
         rows: &[Observation],
+        months: &mut MonthsMade,
     ) -> Result<()> {
         let needed: std::collections::BTreeSet<(String, crate::leaves::Month)> = rows
             .iter()
@@ -2367,7 +2528,23 @@ impl PostgresStore {
                 "range {partition}'s table is not made yet: ask again"
             )));
         }
-        let made = crate::leaves::ensure_months(tx, &needed).map_err(unavailable)?;
+        // At most a few made in the batch's own transaction, whatever its
+        // ranges and datasets, which holds each one's locks until it
+        // commits (v31a.17): more are owed, made before the batch that asks
+        // again ([`Self::months_first`]).
+        let missing = crate::leaves::months_missing(tx, &needed).map_err(unavailable)?;
+        if months.made + missing.len() > crate::leaves::MONTHS_A_TRANSACTION {
+            let (owed, made) = (missing.len(), months.made);
+            months.refused = true;
+            self.owed.lock().expect("owed poisoned").extend(missing);
+            return Err(StoreError::Unavailable(format!(
+                "range {partition} needs {owed} month tables not made yet, with the {made} \
+                 its batch's transaction has made more than one transaction makes: they are \
+                 made before the batch, ask again"
+            )));
+        }
+        let made = crate::leaves::ensure_months(tx, &missing).map_err(unavailable)?;
+        months.made += made;
         if made > 0 {
             tracing::info!(partition, made, "the lake made its range's month tables");
         }
@@ -2377,6 +2554,110 @@ impl PostgresStore {
             .extend(needed.iter().cloned());
         self.made.lock().expect("made poisoned").extend(needed);
         Ok(())
+    }
+
+    /// The month tables a batch's `parts` -- each a dataset and its rows,
+    /// the whole batch's, whatever its datasets -- need made before its
+    /// transaction begins, a few a transaction of their own (v31a.17;
+    /// [`crate::leaves::make_months`]): those a batch refused for was owed,
+    /// and each row's month in the open range its first subject's hash is
+    /// placed in -- a new key's range -- by the ranges its dataset's last
+    /// batch here read open ([`Self::ranges_now`]). A batch of no more
+    /// rows than a transaction makes months is not looked at: its own
+    /// transaction makes them within its bound. A key held keeps its valid
+    /// time (the lake's rule 5), so its month was made with its first
+    /// version; one whose range split since, or whose key is anchored by
+    /// another subject, is found by the batch itself, which makes the few
+    /// and is refused for more, owed to the next. Only in ranges whose
+    /// table is made here and this member's group owns. `unbounded` for
+    /// the write-ahead stream's batch, which waits without the serving
+    /// session's `statement_timeout`.
+    fn months_first<'a>(
+        &self,
+        conn: &mut Connection,
+        parts: impl Iterator<Item = (&'a str, &'a [Observation])> + Clone,
+        unbounded: bool,
+    ) -> Result<()> {
+        use crate::leaves::Month;
+        let mut needed: std::collections::BTreeSet<(String, Month)> =
+            std::mem::take(&mut *self.owed.lock().expect("owed poisoned"));
+        let rows: usize = parts.clone().map(|(_, rows)| rows.len()).sum();
+        if rows > crate::leaves::MONTHS_A_TRANSACTION {
+            // Each dataset's parts together; a subject's month looked at
+            // once.
+            let mut by_dataset: BTreeMap<&str, std::collections::HashSet<(&str, Month)>> =
+                BTreeMap::new();
+            for (dataset, rows) in parts {
+                let months = by_dataset.entry(dataset).or_default();
+                for row in rows {
+                    months.insert((row.subject(), Month::of(row.meta().valid_from_ns)));
+                }
+            }
+            let mine = self.groups.mine();
+            for (dataset, months) in by_dataset {
+                let ranges = self.ranges_now(conn, dataset)?;
+                let mut hashed: std::collections::HashMap<&str, u16> =
+                    std::collections::HashMap::new();
+                let made = self.made.lock().expect("made poisoned");
+                for (subject, month) in months {
+                    let hash = *hashed
+                        .entry(subject)
+                        .or_insert_with(|| crate::range::hash(subject));
+                    let partition = crate::range::placed(dataset, &ranges, hash);
+                    let need = (partition.into_owned(), month);
+                    if made.contains(&need)
+                        || self.groups.several() && self.groups.owner_by(&need.0, dataset) != mine
+                    {
+                        continue;
+                    }
+                    needed.insert(need);
+                }
+            }
+        }
+        needed.retain(|need| !self.made.lock().expect("made poisoned").contains(need));
+        if needed.is_empty() {
+            return Ok(());
+        }
+        let mut made_ranges = std::collections::BTreeMap::new();
+        for (partition, _) in &needed {
+            if !made_ranges.contains_key(partition) {
+                let made =
+                    crate::leaves::range_made(&mut **conn, partition).map_err(unavailable)?;
+                made_ranges.insert(partition.clone(), made);
+            }
+        }
+        needed.retain(|(partition, _)| made_ranges[partition]);
+        let made =
+            crate::leaves::make_months(&mut **conn, &needed, unbounded).map_err(unavailable)?;
+        if made > 0 {
+            tracing::info!(made, "the lake made month tables before their batch");
+        }
+        self.unanalysed
+            .lock()
+            .expect("unanalysed poisoned")
+            .extend(needed.iter().cloned());
+        self.made.lock().expect("made poisoned").extend(needed);
+        Ok(())
+    }
+
+    /// `dataset`'s open ranges as its last batch here read them, read now
+    /// where none has: a prediction's, for [`Self::months_first`].
+    fn ranges_now(&self, conn: &mut Connection, dataset: &str) -> Result<Vec<crate::range::Open>> {
+        if let Some(seen) = self.ranges_seen.lock().expect("seen poisoned").get(dataset) {
+            return Ok(seen.clone());
+        }
+        let ranges = open_ranges(&mut **conn, dataset)?;
+        self.ranges_seen_are(dataset, &ranges);
+        Ok(ranges)
+    }
+
+    /// `dataset`'s open ranges as a batch just read them, kept for the
+    /// next's months ([`Self::ranges_now`]).
+    fn ranges_seen_are(&self, dataset: &str, ranges: &[crate::range::Open]) {
+        let mut seen = self.ranges_seen.lock().expect("seen poisoned");
+        if seen.get(dataset).map(Vec::as_slice) != Some(ranges) {
+            seen.insert(dataset.to_string(), ranges.to_vec());
+        }
     }
 
     /// Each month table a committed batch first wrote analysed, where it
@@ -2423,6 +2704,7 @@ impl PostgresStore {
     fn forget_made(&self) {
         self.made.lock().expect("made poisoned").clear();
         self.ranges_made.lock().expect("ranges poisoned").clear();
+        self.ranges_seen.lock().expect("seen poisoned").clear();
         self.datasets_made
             .lock()
             .expect("datasets poisoned")
@@ -2572,8 +2854,9 @@ impl PostgresStore {
         let mut tx = conn.transaction().map_err(unavailable)?;
         crate::leaves::ensure_ranges(&mut tx, &ranges).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
+        // A few months a transaction, before the page's own (v31a.17).
+        crate::leaves::make_months(&mut *conn, &needed, false).map_err(unavailable)?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        crate::leaves::ensure_months(&mut tx, &needed).map_err(unavailable)?;
         let columns: String = tx
             .query_one(
                 "SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position)
@@ -2816,6 +3099,15 @@ fn offer_latest(
     Ok(())
 }
 
+/// The month tables one batch's transaction has made, across its ranges
+/// and its datasets, and whether it was refused for more than a
+/// transaction makes ([`crate::leaves::MONTHS_A_TRANSACTION`]; v31a.17).
+#[derive(Default)]
+struct MonthsMade {
+    made: usize,
+    refused: bool,
+}
+
 /// What refuses a write-ahead batch whole (step 3d): a part held by a
 /// move's switch, or a part with a range another writer group owns.
 pub(crate) fn write_ahead_refusal<'a>(
@@ -2844,6 +3136,17 @@ impl PostgresStore {
             .map(|(dataset, _)| dataset.as_str())
             .collect();
         self.prepare(&mut conn, &datasets.into_iter().collect::<Vec<_>>())?;
+        // The whole batch's months, every dataset's, before its one
+        // transaction, and as unbounded as it is (v31a.17).
+        self.months_first(
+            &mut conn,
+            batch
+                .parts
+                .iter()
+                .map(|(dataset, rows)| (dataset.as_str(), rows.as_slice())),
+            true,
+        )?;
+        let mut months = MonthsMade::default();
         let mut tx = conn.transaction().map_err(unavailable)?;
         // The stream's batch is written whatever its size, and waits on its
         // position's lock: without the serving session's statement_timeout
@@ -2898,7 +3201,8 @@ impl PostgresStore {
                 .iter()
                 .map(|place| fenced.get(*place).cloned().flatten())
                 .collect();
-            let done = self.record_dataset(&mut tx, &dataset, rows, &theirs, now_ns)?;
+            let done =
+                self.record_dataset(&mut tx, &dataset, rows, &theirs, now_ns, &mut months)?;
             for (place, part) in places.into_iter().zip(done) {
                 answered[place] = part;
             }
@@ -4135,6 +4439,29 @@ impl Store for PostgresStore {
             let at = out.entry(r.get(0)).or_default();
             at.0 += r.get::<_, i64>(2) as u64;
             at.1 += r.get::<_, i64>(3) as u64;
+        }
+        Ok(out)
+    }
+
+    fn rows_in_force(&self) -> Result<BTreeMap<String, u64>> {
+        // The catalogue's own figure, kept as each batch commits: no row
+        // read, no month table locked (v31a.17).
+        let mut conn = self.conn()?;
+        let served = self.served_everywhere(&mut *conn)?;
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        for row in conn
+            .query(
+                "SELECT dataset, in_force FROM lake_partition WHERE in_force > 0",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let partition: String = row.get(0);
+            if served.as_ref().is_some_and(|served| !served(&partition)) {
+                continue;
+            }
+            *out.entry(crate::range::dataset_of(&partition).to_string())
+                .or_default() += row.get::<_, i64>(1) as u64;
         }
         Ok(out)
     }

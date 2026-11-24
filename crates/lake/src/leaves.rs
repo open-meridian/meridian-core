@@ -10,6 +10,74 @@
 //! could not always carry (63 bytes; any character). The writer asks; the
 //! functions migration 23 made, run as `lake_row`'s owner, make them, so
 //! the lake's own login needs no right to create in the schema.
+//!
+//! # The lock budget (v31a.17), and every statement of `lake_row`
+//!
+//! Postgres locks each relation a statement touches and holds the lock to
+//! its transaction's end, not its statement's; a month's table is 14
+//! relations (16 with TOAST); the lock table is the cluster's, 64 a
+//! connection by default. A statement that names its months as values known
+//! before it runs locks those alone. One that finds them as it runs -- by
+//! another table's rows, a lateral join -- or names none locks every month
+//! it could read. Measured on Postgres 16 over 360 to 424 months where a
+//! figure is given, and classed by reading the statement where none is.
+//! "Statements" counts each naming of `lake_row` in the file's SQL: 59 in
+//! `postgres.rs` and 6 in `postgres/moves.rs`, of which 6 are bounded, 1 is
+//! latest, 34 are a range's gap and 24 the lake's.
+//!
+//! The classes: **bounded** (its months named, or few by rule), **latest**
+//! (served by `lake_latest` or the catalogue; no month, or the months it
+//! names), and **KNOWN GAP**, either *range* (14 x the months of the ranges
+//! the statement reads) or *lake* (14 x every month the lake keeps). None
+//! is walked a month a transaction yet.
+//!
+//! | Statement of `lake_row` (`postgres.rs`) | Statements | Class | Locks |
+//! |---|---|---|---|
+//! | months made before the rows (`make_months`: write, move, legacy conversion) | by function | bounded | eight a transaction, of one range, about 19 each |
+//! | months made in a batch's own transaction (`leaves_for`) | by function | bounded | eight a transaction across its ranges and datasets; refused past that, and they are made before it is taken again |
+//! | rows per dataset on retention's timer (`rows_in_force`) | none | latest | the catalogue's, 2 |
+//! | a batch's keys' latest versions (`latest_of_each`, every key held) | 1 | latest | 14 a month those versions are in |
+//! | a read by its window (`EVERY_VERSION`, `EVERY_VERSION_BY_KEY`, `IN_FORCE`, `IN_FORCE_PUBLISHED`) | 6 | bounded | 14 a month of the window; with no window, range |
+//! | a batch's rows written (`insert_all`) | 1 | KNOWN GAP, range | 16 a month written, to commit: a batch is not held to a number of months |
+//! | a legacy page converted (`convert_page`) | 1 | KNOWN GAP, range | 16 a month of the page's rows, 4,096 rows at most |
+//! | a subject's last sequence (`previous_of_each`) | 1 | KNOWN GAP, range | every write; M4's subject head. `lake_latest` cannot give it: it keeps a row a key, under the subject of the key's version in force, so a subject's last row is not there once its key is restated under another subject (a merge's alias), nor is a row of the range's lineage before a split told from one after; and it has no index by sequence |
+//! | a batch's keys' latest versions before `lake_latest` holds every key | 1 | KNOWN GAP, range | until the conversion ends |
+//! | the latest read (`LATEST`, `LATEST_BY_PUBLISHED`, `LATEST_NOW`) | 7 | KNOWN GAP, range | a row naming the subject after its first is found in the rows alone: `lake_latest` keeps no later subject |
+//! | a series listing (`LISTING`) | 2 | KNOWN GAP, range | |
+//! | whether a counted row is superseded, before `lake_latest` holds every key (`SUPERSEDED`) | 1 | KNOWN GAP, lake | within the counts below |
+//! | rows after a watermark (`read_each`, `When::After`) | 3 | KNOWN GAP, lake | its ranges are named by a join; it cuts at a sequence |
+//! | rows at their places (`rows_at`) | 1 | KNOWN GAP, lake | names no range |
+//! | `counts` | 2 | KNOWN GAP, lake | no timer reads it now |
+//! | `unconverted_counts`, `closed_day_counts` | 4 | KNOWN GAP, lake | the datasets' listing; the catalogue keeps no such figure |
+//! | `quality_counts` | 3 | KNOWN GAP, lake | 5,986 over 424 months; `lake_latest` keeps each key's quality in force, and would serve it by an index it lacks |
+//! | `lowest_kept`, `dated_range`, `dated_on`, `row_version` | 5 | KNOWN GAP, range | |
+//! | a dataset read whole (`read_dataset`, `read_dataset_each`, `read_dataset_versions`) | 4 | KNOWN GAP, range | |
+//! | the change log's page (`read_changes`) | 1 | KNOWN GAP, range | one range; it cuts at a sequence |
+//! | retention (`remove_before`) | 5 | KNOWN GAP, range | by recorded time, not valid time |
+//! | the backfills at every start (`backfill_latest_keys`, `backfill_listing`, `backfill_published`) | 6 | KNOWN GAP, lake | |
+//! | the scrub (`scrub_rows`) | 4 | KNOWN GAP, lake | |
+//!
+//! | Statement of `lake_row` (`postgres/moves.rs`) | Statements | Class | Locks |
+//! |---|---|---|---|
+//! | a range's last row, and a span's digest | 2 | KNOWN GAP, range | one range |
+//! | a move's copy read from its source | 3 | KNOWN GAP, range | one snapshot of the source, so nothing later is copied ahead of an earlier row |
+//! | a move's copy written | 1 | KNOWN GAP, range | 16 a month of the range, in the copy's one transaction |
+//!
+//! A statement split in two inside one transaction holds both halves'
+//! locks: only a transaction of its own, or a month named, bounds them.
+//!
+//! KNOWN GAP, months left empty: a month made before a batch stays when
+//! the batch is then refused or fenced, and one is made where no row will
+//! be written when a row's range is not the one its subject's hash names
+//! (a key anchored by a subject merged into it; a range split since the
+//! dataset's last batch). An empty month adds its 14 relations to every
+//! statement of its range that names no month. None is removed.
+//!
+//! KNOWN GAP, range tables made together: a batch's new datasets' range
+//! tables are all made in one transaction before it (`prepare`,
+//! [`ensure_ranges`]), each one's relations locked until it commits. It
+//! is not held to a number of ranges: a write-ahead batch of many
+//! datasets never written before makes every one's there.
 
 use std::collections::BTreeSet;
 
@@ -226,6 +294,65 @@ pub fn ensure_months(
             )?
             .get(0);
         made += usize::from(fresh);
+    }
+    Ok(made)
+}
+
+/// The most month tables one transaction makes (v31a.17, the lake's lock
+/// budget), across every range and dataset it writes: making one takes a
+/// lock on each of its relations -- the table, its TOAST table and its 13
+/// indexes, about 19 with its range's -- held until the transaction
+/// commits, and the lock table is the whole cluster's. So a history's
+/// months are made a few a transaction, before the rows that need them,
+/// and never as many as the history is long; a batch whose own
+/// transaction would make more is refused, and they are made before it is
+/// taken again.
+pub const MONTHS_A_TRANSACTION: usize = 8;
+
+/// Those of `needed`'s month tables not yet made.
+pub fn months_missing(
+    client: &mut impl GenericClient,
+    needed: &BTreeSet<(String, Month)>,
+) -> Result<BTreeSet<(String, Month)>, postgres::Error> {
+    let mut missing = BTreeSet::new();
+    for need in needed {
+        if !exists(client, &month_table(&need.0, need.1))? {
+            missing.insert(need.clone());
+        }
+    }
+    Ok(missing)
+}
+
+/// Make each of `needed`'s month tables not yet made, in transactions of
+/// `client`'s own, each committed before the next begins: `client` is in
+/// no transaction, and holds no lock from one's making while it makes the
+/// next. Each transaction makes at most [`MONTHS_A_TRANSACTION`] months,
+/// of one range: it holds that range's months' lock and no other's, so it
+/// never waits on a second range's while holding a first's, as a batch
+/// making its own ranges' months in its own order would wait on it. A
+/// month another made meanwhile -- a release before this one, making it
+/// in its batch's transaction during a rolling upgrade -- is found made
+/// under its range's lock and left. `unbounded` for the write-ahead
+/// stream's batch, whose statements wait without the serving session's
+/// `statement_timeout`: its months' making waits on a range's lock as it
+/// does. Answers how many it made.
+pub fn make_months(
+    client: &mut impl GenericClient,
+    needed: &BTreeSet<(String, Month)>,
+    unbounded: bool,
+) -> Result<usize, postgres::Error> {
+    // In each range's order, the ranges in theirs.
+    let missing: Vec<(String, Month)> = months_missing(client, needed)?.into_iter().collect();
+    let mut made = 0;
+    for of_one in missing.chunk_by(|a, b| a.0 == b.0) {
+        for some in of_one.chunks(MONTHS_A_TRANSACTION) {
+            let mut tx = client.transaction()?;
+            if unbounded {
+                meridian_changes::serving::unbounded(&mut tx)?;
+            }
+            made += ensure_months(&mut tx, &some.iter().cloned().collect())?;
+            tx.commit()?;
+        }
     }
     Ok(made)
 }

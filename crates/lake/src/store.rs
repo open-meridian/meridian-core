@@ -46,6 +46,8 @@ pub enum StoreError {
     /// A write to a range a move is switching (step 3d; section 6.8, the
     /// hold): tried again until the switch ends, at most
     /// `moves.holdSeconds`, then refused OVERLOADED with a retry-after.
+    /// And a batch refused twice for more month tables than its
+    /// transaction makes (v31a.17): they are made before it is asked again.
     #[error("{0}")]
     Held(String),
 
@@ -1103,8 +1105,23 @@ pub trait Store: Send + Sync {
     /// Each partition's head.
     fn heads(&self) -> Result<BTreeMap<String, u64>>;
 
-    /// Rows kept per dataset, and of them those carrying a value as reported.
+    /// Rows kept per dataset, and of them those carrying a value as reported:
+    /// every row kept is read to count it, in every month of every dataset,
+    /// so never on a timer (v31a.17) -- [`Store::rows_in_force`] is.
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
+
+    /// Per dataset holding any, its rows in force -- its row keys, each at
+    /// its version in force -- as the catalogue keeps the figure
+    /// (`lake_partition.in_force`): what the lake says of its size on a
+    /// timer, reading no row (v31a.17, the lake's lock budget). The sum of
+    /// [`Store::quality_counts`]' three, which reads the flagged rows too.
+    fn rows_in_force(&self) -> Result<BTreeMap<String, u64>> {
+        Ok(self
+            .quality_counts()?
+            .into_iter()
+            .map(|(dataset, (valid, suspicious, invalid))| (dataset, valid + suspicious + invalid))
+            .collect())
+    }
 
     /// Per dataset holding any, the rows in force carrying a value as
     /// reported -- each row key at its version in force ([`force_order`];

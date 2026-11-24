@@ -304,6 +304,10 @@ impl Store for ReaderStore {
         self.now().counts()
     }
 
+    fn rows_in_force(&self) -> Result<BTreeMap<String, u64>> {
+        self.now().rows_in_force()
+    }
+
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
         self.now().unconverted_counts()
     }

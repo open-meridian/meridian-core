@@ -1282,6 +1282,10 @@ impl Store for Spread {
         )
     }
 
+    fn rows_in_force(&self) -> Result<BTreeMap<String, u64>> {
+        self.summed(|store| store.rows_in_force(), |sum, n| *sum += n)
+    }
+
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
         self.summed(|store| store.unconverted_counts(), |sum, n| *sum += n)
     }
