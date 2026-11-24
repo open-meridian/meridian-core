@@ -43,6 +43,12 @@ use crate::backend::{Answer, Backend, BusError, Handler, Subscription};
 /// The stream's name.
 pub const STREAM: &str = "LAKE_WRITE_AHEAD";
 
+/// The words the lake's writer says its stream is stuck full with, first in
+/// its member's report (`ComponentReport.detail`; v31a item 5, 0-J): what
+/// the dashboard's judge files its standing notice from, and `meridian
+/// status` shows. The lake's guard says it (`meridian_lake::write_ahead::guard`).
+pub const STUCK_FULL: &str = "the lake's write-ahead stream is stuck full";
+
 /// Where a dataset's writes go: its instance and its key, one subject a
 /// dataset; a plugin's credential publishes on its own instance's alone.
 /// Spelled as the topic registry names it.

@@ -13,7 +13,11 @@
 //! its admins, from its sidecar's report as it carries them. The conductor
 //! not answering three asks in a row is a notice too, `component-unheard`
 //! about the conductor, to the deployment admins (approved 2026-11-20):
-//! nobody's health is judged while it is silent.
+//! nobody's health is judged while it is silent. The lake's write-ahead
+//! stream stuck full, as the lake's writer says first in its report's words
+//! (v31a item 5, 0-J), is a standing notice to the deployment admins,
+//! `component-write-ahead-stuck-full`, and its clearing once no member says
+//! so, `component-write-ahead-drained`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -99,6 +103,9 @@ pub struct Opened {
 pub struct Judge {
     members: BTreeMap<String, Kept>,
     unheard: Unheard,
+    /// The core components whose write-ahead stream stands stuck full, as
+    /// one of their members said last (v31a item 5).
+    stuck_full: BTreeSet<String>,
 }
 
 fn mib(bytes: u64) -> u64 {
@@ -247,6 +254,60 @@ impl Judge {
                 .back()
                 .is_some_and(|last| last.at_ns >= now_ns - KEPT_NS)
         });
+        opened.extend(self.stuck_full(members, now_ns));
+        opened
+    }
+
+    /// The lake's write-ahead stream stuck full, as a core member's report
+    /// says first in its words (v31a item 5, 0-J): a standing notice, opened
+    /// once while any member of the component says so, and its drained
+    /// notice once none of those reporting does. Its window is the hour, as
+    /// every kind's but a restart's (decision 40).
+    fn stuck_full(&mut self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
+        let stuck = meridian_bus::write_ahead::STUCK_FULL;
+        let window_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
+        let mut said: BTreeMap<&str, Option<&ComponentReport>> = BTreeMap::new();
+        for report in members
+            .iter()
+            .filter(|r| !r.component.starts_with("sidecar-"))
+        {
+            let saying = said.entry(report.component.as_str()).or_default();
+            if saying.is_none() && report.detail.starts_with(stuck) {
+                *saying = Some(report);
+            }
+        }
+        let mut opened = Vec::new();
+        for (component, saying) in said {
+            let open = self.stuck_full.contains(component);
+            let (name, about) = match (saying, open) {
+                (Some(report), false) => (
+                    "write-ahead-stuck-full",
+                    format!(
+                        "{component}/{}: {}. Standing until it drains; its cause goes to a diagnosis",
+                        report.member, report.detail
+                    ),
+                ),
+                (None, true) => (
+                    "write-ahead-drained",
+                    format!("{component}: the lake's write-ahead stream drained, no longer at a bound"),
+                ),
+                _ => continue,
+            };
+            if open {
+                self.stuck_full.remove(component);
+            } else {
+                self.stuck_full.insert(component.to_string());
+            }
+            let kind = format!("component-{name}");
+            opened.push(Opened {
+                of: component.to_string(),
+                plugin: false,
+                event: format!("{kind}|{component}|{window_ns}"),
+                kind,
+                about,
+                window_ns,
+            });
+        }
         opened
     }
 
@@ -496,6 +557,52 @@ mod tests {
             kinds(&judge.judge(&[lake(100 * MIB, 650 * MIB, 2, 1)], T0 + 5 * MINUTE)),
             vec!["component-over-budget"]
         );
+    }
+
+    /// v31a item 5 (0-J): the lake's writer saying its write-ahead stream
+    /// is stuck full opens a standing notice to the deployment admins, once
+    /// while any member says so -- the writer moved, its successor saying
+    /// it too -- and its drained notice once none does; a later stuck opens
+    /// again.
+    #[test]
+    fn a_stream_stuck_full_opens_a_standing_notice_once_and_a_drained_notice_when_it_drains() {
+        let stuck = |member: &str| ComponentReport {
+            member: member.into(),
+            detail: format!(
+                "{} for 30s: holds 256.0 MiB of its 256.0 MiB bound",
+                meridian_bus::write_ahead::STUCK_FULL
+            ),
+            ..lake(MIB, 0, 0, 0)
+        };
+        let mut judge = Judge::default();
+        assert!(judge.judge(&[lake(MIB, 0, 0, 0)], T0).is_empty());
+        let opened = judge.judge(&[stuck("meridian-lake-0")], T0 + MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-stuck-full"]);
+        assert!(!opened[0].plugin && opened[0].of == "lake");
+        assert!(
+            opened[0].about.contains("meridian-lake-0")
+                && opened[0]
+                    .about
+                    .contains("holds 256.0 MiB of its 256.0 MiB bound"),
+            "{}",
+            opened[0].about
+        );
+        assert!(judge
+            .judge(&[stuck("meridian-lake-0")], T0 + 2 * MINUTE)
+            .is_empty());
+        assert!(
+            judge
+                .judge(&[stuck("meridian-lake-1")], T0 + 3 * MINUTE)
+                .is_empty(),
+            "the writer moved, the stream still stuck: nothing new"
+        );
+        let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
+        assert!(judge
+            .judge(&[lake(MIB, 0, 0, 0)], T0 + 5 * MINUTE)
+            .is_empty());
+        let opened = judge.judge(&[stuck("meridian-lake-1")], T0 + 120 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-stuck-full"]);
     }
 
     #[test]

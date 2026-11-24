@@ -24,6 +24,7 @@
 //! stream and nothing here runs.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +37,8 @@ use prost::Message as _;
 
 use crate::service::Lake;
 use crate::store::{Dropped, StoreError, WriteAheadBatch, WriteAheadPosition};
+
+pub mod guard;
 
 /// The database connections the writer adds to the lake's pool in `ha`:
 /// its batch's transaction and its position's read (ruled 2026-11-08: the
@@ -1225,7 +1228,7 @@ pub async fn write_forever(
     lake: Arc<Lake>,
     client: async_nats::Client,
     bounds: Bounds,
-    waiting: impl Fn(Option<String>),
+    waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) -> Result<(), String> {
     let context = jetstream::new(client.clone());
     let config = stream_config(&bounds);
@@ -1273,6 +1276,15 @@ pub async fn write_forever(
         }
     };
     let mut writer = started(&lake, identity).await;
+    let place = Arc::new(AtomicU64::new(writer.next()));
+    let guarding = tokio::spawn(guard_forever(
+        context.clone(),
+        Arc::clone(&lake),
+        Arc::clone(&place),
+        bounds,
+        waiting,
+    ));
+    let _guarding = AbortOnDrop(guarding);
     // The gaps the last writer was asking for again, asked again by this
     // one (W10.14): their wants were in its memory.
     // Group 0's, which holds the lake's wants (step 3d).
@@ -1331,6 +1343,7 @@ pub async fn write_forever(
         let mut stall = Stall::new(STALL_AFTER);
         loop {
             let next = writer.next();
+            place.store(next, Ordering::Relaxed);
             let batch = match read(&mut messages, &mut stall, next, &mut stream, &writer).await {
                 Read::Batch(batch) => batch,
                 Read::TakenBack => {
@@ -1416,6 +1429,76 @@ pub async fn write_forever(
                     break;
                 }
             }
+        }
+    }
+}
+
+/// A task ended when this is dropped: the guard ends with its writer.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The stream looked at every [`guard::LOOK_EVERY`] against the writer's
+/// place (v31a item 5): stuck full, its member says so, degraded, with its
+/// figures; drained, it says so no longer. A look the broker does not
+/// answer changes nothing said.
+async fn guard_forever(
+    context: jetstream::Context,
+    lake: Arc<Lake>,
+    place: Arc<AtomicU64>,
+    bounds: Bounds,
+    waiting: impl Fn(Option<String>) + Send + Sync + 'static,
+) {
+    let mut full = guard::Full::new(guard::STUCK_AFTER);
+    let mut said = false;
+    loop {
+        tokio::time::sleep(guard::LOOK_EVERY).await;
+        let looked = match context.get_stream(STREAM).await {
+            Ok(mut stream) => stream
+                .info()
+                .await
+                .map(|info| info.state.clone())
+                .map_err(|f| f.to_string()),
+            Err(failed) => Err(failed.to_string()),
+        };
+        let state = match looked {
+            Ok(state) => state,
+            Err(failed) => {
+                tracing::debug!(%failed, "the write-ahead stream's guard could not look at it");
+                continue;
+            }
+        };
+        let standing = guard::Standing::of(&state);
+        let next = place.load(Ordering::Relaxed);
+        match full.looked(
+            tokio::time::Instant::now(),
+            &standing,
+            next,
+            &bounds,
+            lake.now_ns(),
+        ) {
+            Some(words) => {
+                if !said {
+                    tracing::warn!(stream = STREAM, "{words}");
+                }
+                waiting(Some(words));
+                said = true;
+            }
+            None if said => {
+                tracing::info!(
+                    stream = STREAM,
+                    bytes = standing.bytes,
+                    past = standing.past(next),
+                    "the lake's write-ahead stream drained: no longer at a bound"
+                );
+                waiting(None);
+                said = false;
+            }
+            None => {}
         }
     }
 }
