@@ -696,6 +696,9 @@ def main():
             "--set", "ingress.plainHttp=true",
             "--set", f"registry.hostPort={REGISTRY_PORT}",
         ]
+        if ACCESS_RULES_HERE:
+            values += [arg for n, rule in enumerate(ACCESS_RULES)
+                       for arg in ("--set", f"database.brought.pgHba[{n}]={rule}")]
         run(HELM, "upgrade", "--install", RELEASE, *chart, "--namespace", NAMESPACE, *values)
 
         wait_for(
@@ -830,6 +833,8 @@ def main():
         psql("select has_schema_privilege('meridian_app','public','CREATE')") == "f",
         "and the serving role may not create tables",
     )
+    if ACCESS_RULES_HERE:
+        access_rules(s)
 
     footprint(s)
 
@@ -1381,6 +1386,38 @@ def edge_storage(s):
     ]:
         ok, said = admitted(roles, volume)
         s.check(not ok and words in said, f"a plugin's pod mounting {why} is refused: {said}")
+
+
+# Who may connect to the brought database, as a chart value (v31a item 6):
+# one role refused by name, then every role by password, as the chart's own
+# rule does. This checkout's chart alone, where it brings the database: a
+# published one installed for an upgrade has no such value.
+ACCESS_RULES = ("host all e2e_hba_refused all reject", "host all all all scram-sha-256")
+ACCESS_RULES_HERE = ROUTE == "brought" and not UPGRADE_FROM
+
+
+def access_rules(s):
+    """database.brought.pgHba in force at the server: a role the rules admit
+    connects over the network by password, and the role they refuse by name
+    is refused by them, with the right password. Over the pod's own address,
+    never the loopback, which the pod's own lines admit before the rules."""
+    psql("create role e2e_hba_admitted login password 'e2e-hba'; "
+         "create role e2e_hba_refused login password 'e2e-hba'")
+
+    def connects(role):
+        done = subprocess.run(
+            ["kubectl", "--namespace", NAMESPACE, "exec", f"{RELEASE}-meridian-runtime-database-0", "--",
+             "sh", "-c", f'PGPASSWORD=e2e-hba psql -h "$(hostname -i | cut -d" " -f1)" -U {role} '
+             f'-d meridian -Atc "select 1"'],
+            capture_output=True, text=True, errors="replace")
+        return done.returncode, (done.stdout + done.stderr).strip()
+
+    admitted, refused = connects("e2e_hba_admitted"), connects("e2e_hba_refused")
+    psql("drop role e2e_hba_admitted; drop role e2e_hba_refused")
+    s.check(admitted == (0, "1"),
+            f"the database's access rules from database.brought.pgHba admit a role over the network: {admitted}")
+    s.check(refused[0] != 0 and "pg_hba.conf rejects connection" in refused[1],
+            f"and refuse the role they name, its password right: {refused}")
 
 
 def footprint(s):

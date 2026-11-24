@@ -533,5 +533,39 @@ class SdkRef(unittest.TestCase):
             self.assertNotIn("git ls-remote --exit-code --heads \"$SDK\"", text, workflow)
 
 
+class NightRun(unittest.TestCase):
+    """v31a item 6a, the first NIGHT job: failover-repeat runs, by hand,
+    the NIGHT classes no profile runs by default (broker-crash-loop), and
+    each run that fails ends, as ci's cluster jobs do, with the verdict's
+    line naming the failed check. Not every night yet (the 4b-restarts
+    review, finding 6): the kubelet's restart backoff puts the fifth crash
+    at least 80 s out, past the class's 60 s, so a schedule would be red
+    every night until the broker's restart backoff is bounded, which is a
+    proposal and not yet a ruled design."""
+
+    def workflow(self):
+        with open(os.path.join(TOOLS, "..", ".github", "workflows", "failover-repeat.yaml")) as f:
+            return f.read()
+
+    def test_it_runs_the_night_classes_by_hand_and_on_no_schedule_yet(self):
+        text = self.workflow()
+        triggers = text.split("\non:\n", 1)[1].split("\npermissions:\n", 1)[0]
+        self.assertNotRegex(triggers, r"(?m)^  schedule:", "the night run fails every night by construction")
+        self.assertRegex(triggers, r"(?m)^  workflow_dispatch:$")
+        self.assertIn("\n      failure:\n", triggers)
+        self.assertIn("broker-crash-loop", text.split("\non:\n", 1)[0])
+        self.assertIn("FAILURE: ${{ needs.failover-images.outputs.failure }}", text)
+
+    def test_a_failed_run_ends_with_the_failed_assertion(self):
+        text = self.workflow()
+        run_job = text.split("\n  failover-repeat:\n", 1)[1].split("\n  failover-verdict:\n", 1)[0]
+        steps = [line.strip()[len("- name: "):] for line in run_job.splitlines()
+                 if line.startswith("      - name: ")]
+        self.assertEqual(steps[-1], "The failed assertion", steps)
+        self.assertIn('tools/ci-watchdog.sh verdict "$RUNNER_TEMP/make.log"', run_job)
+        self.assertIn('| tee "$RUNNER_TEMP/make.log"', run_job)
+        self.assertIn("id: make", run_job)
+
+
 if __name__ == "__main__":
     unittest.main()

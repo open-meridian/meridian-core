@@ -650,5 +650,136 @@ class BrokerRolledLate(unittest.TestCase):
         self.assertLess(ready, analytics)
 
 
+class NoLossAllowed(unittest.TestCase):
+    """Roadmap v31a item 10: the ha whole-run check passed a lake row lost
+    after it was acknowledged, as a note (`lake_may_lose`, fault 7). No
+    caller may allow loss now: in every profile a lost acknowledged row
+    fails the check and names the row."""
+
+    def lost(self, lake_lost):
+        return {"book": {"acknowledged": 3, "lost": [], "lost_s": 0, "by_database": {"each": [3], "none": 0}},
+                "lake": {"acknowledged": 5, "lost": lake_lost, "lost_s": 0.4,
+                         "by_database": {"each": [5 - len(lake_lost)], "none": len(lake_lost)}}}
+
+    def test_no_caller_can_allow_the_lake_to_lose(self):
+        import inspect
+        self.assertNotIn("lake_may_lose", inspect.signature(run.driver_rpo_held).parameters)
+
+    def test_a_lake_row_lost_in_the_ha_whole_run_fails_and_is_named(self):
+        for profile in ("ha", "tolerant"):
+            checks = Checks()
+            with mock.patch.object(run, "PROFILE", profile):
+                run.driver_rpo_held(checks, "the whole run", rpo=self.lost(["price 7"]))
+            failed = [what for ok, what in checks.said if not ok]
+            self.assertEqual(len(failed), 1, (profile, checks.said))
+            self.assertIn("every price the lake acknowledged is in it (1 lost: price 7", failed[0])
+
+
+class Broker:
+    """The broker's one server as the crash loop sees it: each crash
+    restarts it; `back` says, by crash, whether the stores answer again."""
+
+    def __init__(self, back=lambda n: True, history=""):
+        self.crashes, self.back, self.history, self.rpo = 0, back, history, []
+        self.claims = []
+
+    def patched(self):
+        return [
+            mock.patch.object(run, "pods", lambda component: [
+                {"metadata": {"name": f"{run.FULL}-broker-0"},
+                 "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]),
+            mock.patch.object(run, "crash", self.crash),
+            mock.patch.object(run, "restarts", lambda pod: self.crashes),
+            mock.patch.object(run, "answering", lambda component: {"answers": {"ok": True}}
+                              if self.back(self.crashes) else None),
+            mock.patch.object(run, "acked_since", lambda began_ms: self.back(self.crashes)),
+            mock.patch.object(run, "members_settled", lambda component: True),
+            mock.patch.object(run, "driver_rpo_held", lambda s, after: self.rpo.append(after)),
+            mock.patch.object(run, "driver_file", lambda instance, path: self.history),
+            mock.patch.object(run, "claim", lambda s, *said: self.claims.append(said)),
+            mock.patch.object(run, "DRIVEN", True),
+            mock.patch.object(run.time, "sleep", lambda _: None),
+        ]
+
+    def crash(self, pod, component):
+        assert component == "broker", component
+        self.crashes += 1
+
+    def loop(self, checks):
+        patches = self.patched()
+        for patch in patches:
+            patch.start()
+        try:
+            run.FAILURES["broker-crash-loop"](checks)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+
+
+class BrokerCrashLoop(unittest.TestCase):
+    """Roadmap v31a item 6a: the broker's server crashed five times in a
+    row, a NIGHT class (failover-repeat, by hand) and no profile's
+    default. Each crash held to the tolerant broker bound, 60 s, and then
+    no acknowledged write lost and none doubled."""
+
+    def test_a_night_class_in_no_profiles_default(self):
+        self.assertIn("broker-crash-loop", run.FAILURES)
+        for profile, failures in run.DEFAULT_FAILURES.items():
+            self.assertNotIn("broker-crash-loop", failures, profile)
+        self.assertIn("broker-crash-loop", run.RPO_IN_CLASS)
+
+    def test_five_crashes_each_back_within_60_s_none_lost_none_doubled(self):
+        broker, checks = Broker(history='{:type :ok, :f :txn, :value [[:r "book/ACC-DRIVE-1" [1 2 3]]]}\n'), Checks()
+        broker.loop(checks)
+        self.assertEqual(broker.crashes, 5)
+        self.assertEqual(broker.rpo, [f"broker-crash-loop: crash {n} of 5" for n in range(1, 6)])
+        self.assertTrue(all(ok for ok, _ in checks.said), checks.said)
+        for n in range(1, 6):
+            self.assertTrue(any(f"crash {n} of 5" in what and "within 60s" in what for _, what in checks.said),
+                            (n, checks.said))
+
+    def test_a_crash_not_back_within_60_s_fails_naming_it_and_ends_the_loop(self):
+        broker, checks = Broker(back=lambda n: n < 4), Checks()
+        with mock.patch.object(run, "happens", lambda ready, seconds, every=2.0: ready()):
+            broker.loop(checks)
+        self.assertEqual(broker.crashes, 4)
+        failed = [what for ok, what in checks.said if not ok]
+        self.assertEqual(len(failed), 1, checks.said)
+        self.assertIn("broker-crash-loop: crash 4 of 5", failed[0])
+        self.assertIn("within 60s", failed[0])
+
+    def test_a_crash_not_back_within_60_s_is_claimed_as_not_held(self):
+        """The 4b-restarts review, finding 6: the crash that missed its
+        bound left no figure, so the ledger held only the crashes that made
+        it. It is claimed too: past its bound, and said not recovered."""
+        broker, checks, now = Broker(back=lambda n: n < 4), Checks(), [1000.0]
+
+        def happens(ready, seconds, every=2.0):
+            # Given up only once the whole wait has passed.
+            if not ready():
+                now[0] += seconds + 0.5
+                return False
+            return True
+        with mock.patch.object(run, "happens", happens), mock.patch.object(run.time, "time", lambda: now[0]):
+            broker.loop(checks)
+        self.assertEqual([said[4]["crash"] for said in broker.claims], [1, 2, 3, 4], broker.claims)
+        failure, component, seconds, bound, extra = broker.claims[-1]
+        self.assertEqual((failure, component, bound), ("broker-crash-loop", "bor", 60))
+        self.assertGreater(seconds, bound)
+        self.assertIs(extra["recovered"], False)
+        self.assertTrue(all("recovered" not in said[4] for said in broker.claims[:-1]), broker.claims)
+
+    def test_an_order_read_twice_in_its_account_fails_naming_it(self):
+        history = ('{:type :ok, :f :txn, :value [[:r "book/ACC-DRIVE-1" [1 2 2 3]]], :process 0}\n'
+                   '{:type :ok, :f :txn, :value [[:r "book/ACC-DRIVE-2" [4 5]]], :process 0}\n'
+                   '{:type :invoke, :f :txn, :value [[:r "book/ACC-DRIVE-3" nil]], :process 0}\n')
+        self.assertEqual(run.doubled(history), ["book/ACC-DRIVE-1: 2"])
+        broker, checks = Broker(history=history), Checks()
+        broker.loop(checks)
+        failed = [what for ok, what in checks.said if not ok]
+        self.assertEqual(len(failed), 5, checks.said)
+        self.assertIn("book/ACC-DRIVE-1: 2", failed[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

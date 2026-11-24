@@ -51,7 +51,10 @@ for 30 s under the driver's load: no takeover, no write outage, no
 readiness flap); `write-ahead-bound` (HA only, stage C: the lake's writer
 cut from the broker past a short `lake.writeAhead.maxAge`, so the stream
 drops what it held: the gap recorded with the next batch, asked again
-where its dataset declares backfill, and read where the dataset is).
+where its dataset declares backfill, and read where the dataset is);
+`broker-crash-loop` (v31a item 6a, a NIGHT class in no profile's default:
+the broker's server killed outright five times in a row, each back within
+60 s, nothing acknowledged lost and nothing doubled).
 
 The buy-side trust targets (contract v30, stage C; the resilience spec's
 section 15), after every class: the data driver reads its own price back
@@ -292,7 +295,7 @@ SCALE_FIGURES = os.environ.get("E2E_WRITE_SCALE_FIGURES", ".e2e-write-scale.json
 
 # The classes that read RPO through the stores themselves, and say it in
 # their claims; after every other, the driver's rows are held all the same.
-RPO_IN_CLASS = {"db-primary", "torn-write", "zone"}
+RPO_IN_CLASS = {"db-primary", "torn-write", "zone", "broker-crash-loop"}
 # The oms driver's history (Jepsen's invoke/ok/fail/info), kept for Elle.
 HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
@@ -2431,30 +2434,32 @@ def rpo_extra(rpo):
             "lake_rpo_s": rpo["lake"]["lost_s"]}
 
 
-def driver_rpo_held(s, after, rpo=None, lake_may_lose=False):
-    """Every acknowledged order kept, after a class; and every price, unless
-    the caller says the lake may lose some (no class does since the lake's
-    write-ahead stream, contract v30 stage E)."""
+def driver_rpo_held(s, after, rpo=None):
+    """Every acknowledged order and every acknowledged price kept, after a
+    class and for the whole run, in every profile. No caller may allow
+    loss (roadmap v31a item 10: the ha whole-run check once passed the
+    lake's losses as a note, fault 7's allowance)."""
     rpo = rpo or store_rpo()
     book, lake = rpo["book"], rpo["lake"]
     # Lost is in none of the store's databases; each one's count said.
     s.check(not book["lost"], f"{after}: every order and placement the book acknowledged is in it "
             f"({len(book['lost'])} lost{': ' + ', '.join(book['lost'][:5]) if book['lost'] else ''}; "
             f"{kept_words('held by', book['by_database'])})")
-    if lake_may_lose:
-        s.note(f"{after}: the lake lost {len(lake['lost'])} acknowledged row(s), within {lake['lost_s']}s "
-               f"(its commits are local; {kept_words('held by', lake['by_database'])})")
-    else:
-        s.check(not lake["lost"], f"{after}: every price the lake acknowledged is in it "
-                f"({len(lake['lost'])} lost{': ' + ', '.join(lake['lost'][:5]) if lake['lost'] else ''}; "
-                f"{kept_words('held by', lake['by_database'])})")
+    s.check(not lake["lost"], f"{after}: every price the lake acknowledged is in it "
+            f"({len(lake['lost'])} lost{': ' + ', '.join(lake['lost'][:5]) if lake['lost'] else ''}; "
+            f"{kept_words('held by', lake['by_database'])})")
     return rpo
+
+
+def acked_since(began_ms):
+    """Whether both stores have acknowledged the driver's writes since `began_ms`."""
+    return all(any(at > began_ms for at in driver_acked().get(kind, {}).values())
+               for kind in ("price", "order"))
 
 
 def acks_again(began_ms, seconds=90):
     """The driver acknowledged by both stores again after `began_ms`."""
-    return happens(lambda: all(any(at > began_ms for at in driver_acked().get(kind, {}).values())
-                               for kind in ("price", "order")), seconds, every=2)
+    return happens(lambda: acked_since(began_ms), seconds, every=2)
 
 
 BOOK_SAID = ".e2e-failover-book.log"
@@ -3117,6 +3122,85 @@ def broker_lost(s):
     s.check(healed, "broker: the killed server back")
     if PROFILE == "ha":
         made_again_since(s, began, "broker: a server cut off and killed")
+
+
+# The broker's server crashed this many times in a row (v31a item 6a).
+CRASH_LOOP = 5
+
+
+def doubled(history):
+    """Each order the driver's history read twice in one account, as
+    `key: number`: what an acknowledged write recorded twice looks like
+    there, from its acknowledged reads alone."""
+    found = set()
+    for line in history.splitlines():
+        if ":type :ok" not in line:
+            continue
+        read = re.search(r'\[\[:r "([^"]+)" \[([0-9 ]*)\]\]\]', line)
+        if not read:
+            continue
+        seen = set()
+        for number in read.group(2).split():
+            if number in seen:
+                found.add(f"{read.group(1)}: {number}")
+            seen.add(number)
+    return sorted(found)
+
+
+def broker_crash_loop(s):
+    """The broker's server killed outright five times in a row (v31a item
+    6a), each as soon as the last is answered for: a NIGHT class, run by
+    failover-repeat by hand (FAILURE=broker-crash-loop), in no profile's
+    default list. Each crash is held to the tolerant broker bound (60 s):
+    the server restarted, the book answering, and both stores acknowledging
+    the driver's writes again. Then nothing acknowledged is lost and no
+    order is in its account twice. The first crash not answered for ends
+    the loop, named and claimed as not held. The kubelet's restart backoff
+    grows with each crash (10, 20, 40, 80 s; the fault-injection report of
+    2026-11-20: 6.8 s to 90.7 s over five), so the fifth is past the bound
+    by construction until the broker's restart backoff is bounded: a
+    proposal, not yet a ruled design, and why no schedule runs this yet."""
+    print(f"F: broker-crash-loop: the broker's server killed outright {CRASH_LOOP} times in a row", flush=True)
+    wait_for("bor settled", lambda: members_settled("bor"), seconds=300)
+    bound = TOLERANT_BROKER
+    for n in range(1, CRASH_LOOP + 1):
+        what = f"broker-crash-loop: crash {n} of {CRASH_LOOP}"
+        servers = [p["metadata"]["name"] for p in pods("broker")]
+        victim = servers[0]
+        before = restarts(victim)
+        began = time.time()
+        crash(victim, "broker")
+        said = {}
+
+        def back():
+            said["restarted"] = restarts(victim) > before
+            said["book"] = said["restarted"] and answering("bor") is not None
+            said["acknowledged"] = said["book"] and (not DRIVEN or acked_since(int(began * 1000)))
+            return said["acknowledged"]
+        recovered = happens(back, bound, every=0.5)
+        took = time.time() - began
+        s.check(recovered, f"{what}: the broker's server restarted, the book answering and both stores "
+                f"acknowledging the driver's writes again within {bound}s"
+                + ("" if recovered else f" (restarted {said.get('restarted', False)}, the book answering "
+                   f"{said.get('book', False)}, writes acknowledged {said.get('acknowledged', False)})"))
+        if not recovered:
+            # Claimed too, so the ledger holds the crash that missed its
+            # bound and not only those that made it: how long it was waited
+            # on, past the bound, and that it was not back by then.
+            claim(s, "broker-crash-loop", "bor", took, bound,
+                  {"crash": n, "servers": len(servers), "recovered": False})
+            return
+        claim(s, "broker-crash-loop", "bor", took, bound, {"crash": n, "servers": len(servers)})
+        if DRIVEN:
+            driver_rpo_held(s, what)
+            twice = doubled(driver_file("drive-oms", "/tmp/history.edn"))
+            s.check(not twice, f"{what}: no order the driver was told was recorded is in its account twice "
+                    f"({len(twice)}{': ' + ', '.join(twice[:5]) if twice else ''})")
+        # Ready again before the next crash.
+        healed = happens(lambda: len(pods("broker")) == len(servers) and all(ready(p) for p in pods("broker")), 180)
+        s.check(healed, f"{what}: the broker's server ready again")
+        if not healed:
+            return
 
 
 # ── Storage: bit rot, a torn write, a volume lost (step 3b part 2) ─────────
@@ -6747,6 +6831,7 @@ FAILURES = {
     "network-policy": network_policy,
     "db-primary": db_primary,
     "broker": broker_lost,
+    "broker-crash-loop": broker_crash_loop,
     "bit-rot": bit_rot,
     "torn-write": torn_write,
     "volume-lost": volume_lost,
@@ -7244,7 +7329,7 @@ def main():
                 s.check(False, f"{failure}: the stores' rows could not be read against the driver's: {stopped}")
     if DRIVEN:
         try:
-            driver_rpo_held(s, "the whole run", lake_may_lose=PROFILE == "ha")
+            driver_rpo_held(s, "the whole run")
         except SystemExit as stopped:
             s.check(False, f"the write driver's record could not be read: {stopped}")
         # Two writer groups (step 3d, stage G), last of the tolerant run's

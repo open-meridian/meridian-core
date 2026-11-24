@@ -137,6 +137,27 @@ database:
     replicaScrub:
       schedule: "40 3 * * *"
       reclone: true
+    # Who may connect to it from past its own pod (v31a item 6): pg_hba.conf
+    # lines, in order, the first that matches deciding; its own pod's
+    # connections are admitted before them. Empty takes the chart's own:
+    # every role by password from anywhere, and with tls.internal.enabled
+    # over TLS or not at all (hostssl; every other remote line rejected,
+    # and a line here that admits one in the clear is refused). Each item
+    # is one whole line as pg_hba.conf has it, with no #, and one the server
+    # would not start with is refused; trust is for local lines only. Read
+    # from a ConfigMap, never from the data directory: a pg_hba.conf edited
+    # by hand in the data directory is no longer read, so the upgrade to
+    # this chart replaces its rules with these, and restarts a server
+    # running alone once. Put such lines here before upgrading. Alone, a
+    # change restarts the server with it; under Patroni (standbys or read
+    # replicas) each member takes it at its next start, and a value without
+    # a line admitting the postgres role's replication is refused.
+    # `meridian upgrade-deployment -f` sets it like any other value. For
+    # example:
+    #   pgHba:
+    #     - host all all 10.0.0.0/8 scram-sha-256
+    #     - host all all all reject
+    pgHba: []
 
 key:
   # Let the instrument store make its own key, inside the cluster, in a volume only it
