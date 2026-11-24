@@ -20,6 +20,9 @@ of `make e2e-harness-check`.
   node's container state (restarts, exit code, OOMKilled) and its log's last
   200 lines (e2e/cluster/node-state.sh), as the watchdog's evidence does for
   every node (v31a item 11).
+- tools/ci-watchdog.sh kernel-again: the kernel's log read again at the end
+  for stall lines, which a hung task writes about two minutes after it
+  blocks, after the proof's read; said, and never failing (v31a item 11).
 - tools/ci-sdk.sh: interop reads the SDK release tools/ci-sdk.txt pins, and
   another ref only where a run names it, said as a warning (v31a item 11).
 """
@@ -256,6 +259,63 @@ class Watchdog(unittest.TestCase):
         line = self.last_line(log=self.READY.format(system="none", host="x:1"),
                               steps={"make": {"outcome": "success"}, "pulls": {"outcome": "failure"}})
         self.assertEqual(line, "FAILED: the step pulls (failure), after the make")
+
+
+class KernelAgain(unittest.TestCase):
+    """ci-watchdog.sh kernel-again, with sudo, dmesg and journalctl stood
+    in for: the kernel's log is a file the test writes."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="c4b2-kernel-")
+        self.bin = os.path.join(self.dir, "bin")
+        os.makedirs(self.bin)
+        self.make = os.path.join(self.dir, "make.log")
+        self.dmesg = os.path.join(self.dir, "dmesg")
+        stub(self.bin, "sudo", "exit 1\n")
+        stub(self.bin, "dmesg", f"cat {self.dmesg}\n")
+        stub(self.bin, "journalctl", "exit 1\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir)
+
+    def again(self, kernel):
+        with open(self.dmesg, "w") as f:
+            f.write(kernel)
+        env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT")}
+        env["PATH"] = f"{self.bin}:{env['PATH']}"
+        return subprocess.run(["bash", os.path.join(TOOLS, "ci-watchdog.sh"), "kernel-again", self.make],
+                              capture_output=True, text=True, cwd=self.dir, env=env)
+
+    HUNG = ("[  1.0] NET: Registered PF_NETLINK/PF_ROUTE protocol family\n"
+            "[ 245.1] INFO: task containerd:4242 blocked for more than 120 seconds.\n"
+            "[ 245.2] hung_task: blocked tasks\n")
+
+    def test_a_hung_task_logged_after_the_proof_is_said_and_fails_nothing(self):
+        done = self.again(self.HUNG)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("kernel, read again: matched, 2 blocked-task", done.stdout)
+        self.assertIn("::warning title=kernel, read again: matched", done.stdout)
+        with open(os.path.join(self.dir, "proof.log")) as f:
+            self.assertIn("INFO: task containerd:4242 blocked", f.read())
+
+    def test_a_clean_kernel_is_said_clean(self):
+        done = self.again("[  1.0] NET: Registered PF_NETLINK/PF_ROUTE protocol family\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("kernel, read again: clean, 1 lines read by dmesg", done.stdout)
+        self.assertNotIn("::warning", done.stdout)
+
+    def test_an_unreadable_kernel_is_said_unreadable(self):
+        done = self.again("")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("kernel, read again: unreadable", done.stdout)
+
+    def test_the_evidence_and_its_beacon_read_it_again(self):
+        with open(os.path.join(TOOLS, "ci-watchdog.sh")) as f:
+            watchdog = f.read()
+        evidence = watchdog[watchdog.index("\n  evidence)"):watchdog.index("\n  beacon)")]
+        beacon = watchdog[watchdog.index("\n  beacon)"):watchdog.index("\n  kernel-again)")]
+        self.assertIn('kernel-again "$file"', evidence)
+        self.assertIn("kernel_scan", beacon)
 
 
 E2E = os.path.join(TOOLS, "..", "e2e", "cluster")

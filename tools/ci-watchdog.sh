@@ -87,6 +87,20 @@
 #                                 make, the make's own innermost target, a
 #                                 make cancelled by the job's limit, or one
 #                                 after it. File reads alone
+#   ci-watchdog.sh kernel-again <make-log>
+#                                 the kernel's log read again for the
+#                                 proof's stall lines, said as matched,
+#                                 clean or unreadable, appended to
+#                                 proof.log, and a ::warning:: where it
+#                                 matched; exit 0 whatever it found. A
+#                                 hung task is logged about two minutes
+#                                 after it blocks, and under fail-fast the
+#                                 make can fail sooner than that, so the
+#                                 proof's read comes too early to see it
+#                                 (v31a item 11). The evidence runs it,
+#                                 and its beacon reads the kernel again
+#                                 every turn, adding any stall line not
+#                                 said before to what it sends
 #   ci-watchdog.sh probe <which> <make-log>
 #                                 one fact as a step's result, which arrives
 #                                 when nothing else does: names, hub, blob,
@@ -112,9 +126,9 @@
 
 set -euo pipefail
 
-usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | proof|probe <which> <make-log> | verdict <make-log>" >&2; exit 2; }
+usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | proof|probe <which> <make-log> | verdict <make-log> | kernel-again <make-log>" >&2; exit 2; }
 case ${1:-}:$# in
-  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|proof:3|probe:3|probe-one:3|verdict:2) ;;
+  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|proof:3|probe:3|probe-one:3|verdict:2|kernel-again:2) ;;
   *) usage ;;
 esac
 cmd=$1 file=$2
@@ -152,6 +166,28 @@ within() {
   fi
   within_rc="" within_out=""
   return 1
+}
+
+# The lines a stall writes, and netlink only beside an error, a timeout or
+# "stuck": a bare `netlink` matched every boot's "NET: Registered
+# PF_NETLINK" and "audit: initializing netlink subsys" lines.
+STALLS='blocked for more than|hung_task|unregister_netdevice: waiting|rcu_sched self-detected stall|INFO: task .* blocked|netlink.*(error|timeout|stuck)|(error|timeout|stuck).*netlink'
+
+# The kernel's log, as root where it can be, since dmesg is root's on
+# GitHub's runners; the journal's kernel lines where dmesg says nothing. Each
+# try's seconds first, 8 in all: sudo can itself wait on a name lookup. Sets
+# kernel_by (empty where nothing could be read), kernel_read (how many lines)
+# and kernel_found (the stall lines, the last 30).
+kernel_scan() {
+  local how
+  kernel_by="" kernel_read=0 kernel_found=""
+  for how in "4 sudo -n dmesg" "2 dmesg" "2 journalctl -k -q --no-pager"; do
+    # shellcheck disable=SC2086 # the words are the seconds and the command
+    if within $how && [ "$within_rc" = 0 ] && [ -n "$within_out" ]; then kernel_by=${how#* }; break; fi
+  done
+  [ -n "$kernel_by" ] || return 0
+  kernel_read=$(printf '%s\n' "$within_out" | grep -c .)
+  kernel_found=$(printf '%s\n' "$within_out" | grep -i -E "$STALLS" | tail -n 30 || true)
 }
 
 # The hosts a cluster job needs after its start: the images' registry, the
@@ -423,6 +459,11 @@ case $cmd in
       net_state
       echo "-- containers"; bounded 4 docker ps -a --format '{{.Names}} {{.Status}}'
       echo "-- the kernel's last lines"; { timeout 3 sudo -n dmesg 2>/dev/null || timeout 3 dmesg 2>&1 || true; } | tail -n 25
+      # The proof's stall lines, read again: a hung task is logged about two
+      # minutes after it blocks, after the proof's own read on a make that
+      # failed fast (v31a item 11). Said, never failing anything.
+      echo "-- the kernel's stall lines, read again"
+      bounded 12 "$0" kernel-again "$file" | grep -v '^::'
       # A cluster the make gave up on is left running: why its pods are not
       # ready, and what its node can resolve and holds.
       echo "== the cluster, if it was left"
@@ -477,6 +518,7 @@ case $cmd in
     id=$(cat "$watch.check" 2>/dev/null || true)
     api=$(check_api)
     deadline=$((SECONDS + ${BEACON_MINUTES:-30} * 60))
+    stalls_said=0
     : >>"$after"
     sleep "${BEACON_FIRST:-3}"
     while [ -d "$(dirname "$watch")" ] && [ "$SECONDS" -lt "$deadline" ]; do
@@ -490,9 +532,34 @@ case $cmd in
         echo "--- $(date -u +%H:%M:%SZ) load $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?') $(net_line)"
         # The worker, the listener and what the worker runs: age and state.
         bounded 3 ps -eo pid,ppid,etimes,stat,pcpu,args --sort=pid | grep -E 'Runner\.(Worker|Listener)|externals/node|upload' | grep -v grep | cut -c1-160 || true
+        # The kernel read again (v31a item 11): stall lines not said before,
+        # since a hung task is logged about two minutes after it blocks.
+        kernel_scan
+        if [ -n "$kernel_found" ] && [ "$(printf '%s\n' "$kernel_found" | grep -c .)" -gt "$stalls_said" ]; then
+          echo "--- the kernel, read again: stall lines"
+          printf '%s\n' "$kernel_found" | tail -n +"$((stalls_said + 1))"
+          stalls_said=$(printf '%s\n' "$kernel_found" | grep -c .)
+        fi
       } >>"$after" 2>&1
       sleep "${BEACON_EVERY:-15}"
     done
+    ;;
+  kernel-again)
+    # $file is the make's log; proof.log beside it. Never fails.
+    proof="$(dirname "$file")/proof.log"
+    kernel_scan
+    if [ -z "$kernel_by" ]; then
+      said="kernel, read again: unreadable, sudo -n dmesg, dmesg and journalctl -k gave nothing"
+    elif [ -n "$kernel_found" ]; then
+      said="kernel, read again: matched, $(printf '%s\n' "$kernel_found" | grep -c .) blocked-task, hung-task, RCU-stall, unregister_netdevice or netlink-fault lines in $kernel_read read by $kernel_by"
+    else
+      said="kernel, read again: clean, $kernel_read lines read by $kernel_by"
+    fi
+    { echo "== $(date -u +%H:%M:%SZ) $said"; [ -z "$kernel_found" ] || printf '%s\n' "$kernel_found"; } | tee -a "$proof" 2>/dev/null || true
+    if [ -n "$kernel_found" ]; then
+      echo "::warning title=$said::$(printf '%s' "$kernel_found" | tail -c 3500 | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}')"
+    fi
+    exit 0
     ;;
   proof)
     # $file names the fact, $3 is the make's log. Nothing here touches the
@@ -522,37 +589,28 @@ case $cmd in
         echo "the last wait the make began: ${last:-none}" | say notice "no ready wait gave up"
         ;;
       kernel)
-        # As root where it can be, since dmesg is root's on GitHub's runners;
-        # the journal's kernel lines where dmesg says nothing. Three
-        # outcomes, each said in words and as kernel=<it> in the step's
-        # outputs: matched, the step's only red, so a red means a stall
-        # line; clean; and unreadable, a warning on a passing step, since
-        # nothing was found either way. The lines a stall writes, and
-        # netlink only beside an error, a timeout or "stuck": a bare
-        # `netlink` matched every boot's "NET: Registered PF_NETLINK" and
-        # "audit: initializing netlink subsys" lines.
-        pattern='blocked for more than|hung_task|unregister_netdevice: waiting|rcu_sched self-detected stall|INFO: task .* blocked|netlink.*(error|timeout|stuck)|(error|timeout|stuck).*netlink'
-        read_by=""
-        # Each try's seconds first, 8 in all, inside the step's 10: sudo can
-        # itself wait on a name lookup.
-        for how in "4 sudo -n dmesg" "2 dmesg" "2 journalctl -k -q --no-pager"; do
-          # shellcheck disable=SC2086 # the words are the seconds and the command
-          if within $how && [ "$within_rc" = 0 ] && [ -n "$within_out" ]; then read_by=${how#* }; break; fi
-        done
+        # kernel_scan, inside the step's 10 s. Three outcomes, each said in
+        # words and as kernel=<it> in the step's outputs: matched, the
+        # step's only red, so a red means a stall line; clean; and
+        # unreadable, a warning on a passing step, since nothing was found
+        # either way. A hung task is logged about two minutes after it
+        # blocks, which can be after this read: `kernel-again` reads it
+        # again in the evidence and its beacon, and fails nothing.
+        kernel_scan
+        read_by=$kernel_by found=$kernel_found
         if [ -z "$read_by" ]; then
           [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=unreadable" >>"$GITHUB_OUTPUT"
           echo "sudo -n dmesg (4 s), dmesg (2 s) and journalctl -k (2 s) gave nothing: whether the kernel logged a stall is not known" \
             | say warning "kernel: unreadable, its log could not be read"
           exit 0
         fi
-        found=$(printf '%s\n' "$within_out" | grep -i -E "$pattern" | tail -n 30 || true)
         if [ -n "$found" ]; then
           [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=matched" >>"$GITHUB_OUTPUT"
           printf '%s\n' "$found" | say error "kernel: matched, $(printf '%s\n' "$found" | grep -c .) blocked-task, hung-task, RCU-stall, unregister_netdevice or netlink-fault lines"
           exit 1
         fi
         [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=clean" >>"$GITHUB_OUTPUT"
-        echo "$(printf '%s\n' "$within_out" | grep -c .) lines read by $read_by" | say notice "kernel: clean, no blocked task, hung task, RCU stall, unregister_netdevice wait or netlink fault"
+        echo "$kernel_read lines read by $read_by" | say notice "kernel: clean, no blocked task, hung task, RCU stall, unregister_netdevice wait or netlink fault"
         ;;
       answers)
         stalled=false
