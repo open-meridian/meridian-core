@@ -10255,11 +10255,14 @@ async fn r149b_a_callers_key_shaped_as_a_close_does_not_steer_a_held_write() {
         .find(|a| meridian_bor::store::placement_of(a, 8) == home)
         .unwrap();
     blocking(|| zero_spread.place_first(&account, &account)).unwrap();
+    // Refused of a caller now; were one kept, it would not be read as a
+    // close (its kind is not a move's).
     let mut forged = opening(&account, "INS-AAPL");
     forged.idempotency_key = format!("account-move:{account}:{home}:{away}:forged");
     send(&zero_bus, RECORD_OPENING_BALANCE, &forged, Some(PERSON))
         .await
-        .expect("an ordinary caller's opening under that key is kept");
+        .expect_err("a key the book keeps for its own");
+    open(&zero_bus, &account, "INS-AAPL").await;
     let there = MoveAccountRequest {
         account_id: account.clone(),
         target_partition: away.clone(),
@@ -10327,4 +10330,19 @@ async fn r149b_a_callers_key_shaped_as_a_close_does_not_steer_a_held_write() {
     );
     assert!(handed <= 2, "handed on {handed} times");
     blocking(move || drop(h));
+}
+
+/// A move's close is the book's own act too, kept by its own key: a
+/// caller's command under a key of that shape is refused, as one shaped
+/// as the open is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_command_keyed_as_a_moves_close_is_refused() {
+    let (bus, _) = wired();
+    let account = unique("ACC");
+    let mut request = opening(&account, "INS-AAPL");
+    request.idempotency_key = format!("account-move:{account}:P0:P1");
+    let refused = send(&bus, RECORD_OPENING_BALANCE, &request, Some(PERSON))
+        .await
+        .expect_err("a key the book keeps for its own");
+    assert!(refused.contains("idempotency_key"), "{refused}");
 }
