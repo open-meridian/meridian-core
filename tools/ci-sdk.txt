@@ -1,0 +1,13 @@
+# The Python SDK's release interop is tested against (v31a item 11): a tag of
+# meridian-python, so a commit to the SDK's main never changes what core's CI
+# passes or fails. tools/ci-sdk.sh reads it for ci's images job and for
+# failover-repeat.
+#
+# To test against the SDK's main or a branch, on purpose and in view:
+#   - a pull request sets the line below to `main` or the branch's name, in
+#     its own diff (a contract change whose SDK side is held unmerged), and
+#     every run of it then says so in a warning, as main's would until the
+#     line names a release again;
+#   - a run by hand (workflow_dispatch) gives the `sdk_ref` input, for that
+#     run alone.
+v0.37.1

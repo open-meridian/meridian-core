@@ -12,6 +12,8 @@ of `make e2e-harness-check`.
   three-agent jobs).
 - tools/ci-watchdog.sh verdict: a failed job's last line names the failed
   check, or the step that died where no check ran (v31a item 11).
+- tools/ci-sdk.sh: interop reads the SDK release tools/ci-sdk.txt pins, and
+  another ref only where a run names it, said as a warning (v31a item 11).
 """
 
 import hashlib
@@ -246,6 +248,67 @@ class Watchdog(unittest.TestCase):
         line = self.last_line(log=self.READY.format(system="none", host="x:1"),
                               steps={"make": {"outcome": "success"}, "pulls": {"outcome": "failure"}})
         self.assertEqual(line, "FAILED: the step pulls (failure), after the make")
+
+
+class SdkRef(unittest.TestCase):
+    """ci-sdk.sh: which meridian-python ref interop reads."""
+
+    def choose(self, *args, pin=None):
+        root = tempfile.mkdtemp(prefix="c4b2-sdk-")
+        self.addCleanup(shutil.rmtree, root)
+        shutil.copy(os.path.join(TOOLS, "ci-sdk.sh"), root)
+        if pin is None:
+            shutil.copy(os.path.join(TOOLS, "ci-sdk.txt"), root)
+        else:
+            with open(os.path.join(root, "ci-sdk.txt"), "w") as f:
+                f.write("# a comment naming main\n\n" + pin + "\n")
+        out = os.path.join(root, "out")
+        env = dict(os.environ, GITHUB_OUTPUT=out)
+        done = subprocess.run(["sh", os.path.join(root, "ci-sdk.sh"), *args], capture_output=True, text=True, env=env)
+        ref = None
+        if os.path.exists(out):
+            with open(out) as f:
+                ref = f.read().strip()
+        return done, ref
+
+    def test_the_pin_is_a_release_and_is_read_by_default(self):
+        done, ref = self.choose()
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertRegex(ref, r"^ref=v[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertNotIn("::warning", done.stdout)
+        self.assertIn("the release tools/ci-sdk.txt names", done.stdout)
+
+    def test_an_empty_input_reads_the_pin(self):
+        done, ref = self.choose("", pin="v1.2.3")
+        self.assertEqual((done.returncode, ref), (0, "ref=v1.2.3"), done.stdout)
+
+    def test_a_run_s_input_is_read_and_said_where_it_is_no_release(self):
+        done, ref = self.choose("main", pin="v1.2.3")
+        self.assertEqual((done.returncode, ref), (0, "ref=main"), done.stdout)
+        self.assertIn("::warning title=interop reads no release::", done.stdout)
+        self.assertIn("sdk_ref input", done.stdout)
+
+    def test_a_branch_pinned_is_said_on_every_run(self):
+        done, ref = self.choose(pin="contract-31")
+        self.assertEqual((done.returncode, ref), (0, "ref=contract-31"), done.stdout)
+        self.assertIn("::warning", done.stdout)
+        self.assertIn("tools/ci-sdk.txt", done.stdout)
+
+    def test_a_ref_with_other_characters_fails(self):
+        done, ref = self.choose("main;id")
+        self.assertEqual((done.returncode, ref), (1, None), done.stdout)
+        self.assertIn("::error::", done.stdout)
+
+    def test_a_pin_file_naming_nothing_fails(self):
+        done, ref = self.choose(pin="")
+        self.assertEqual((done.returncode, ref), (1, None), done.stdout)
+
+    def test_ci_reads_no_sdk_branch_by_the_pull_request_s_name(self):
+        for workflow in ("ci.yaml", "failover-repeat.yaml"):
+            with open(os.path.join(TOOLS, "..", ".github", "workflows", workflow)) as f:
+                text = f.read()
+            self.assertIn("tools/ci-sdk.sh", text, workflow)
+            self.assertNotIn("git ls-remote --exit-code --heads \"$SDK\"", text, workflow)
 
 
 if __name__ == "__main__":
