@@ -3701,6 +3701,27 @@ chart-check:
 		|| { echo "chart-check FAILED: a line in the clear under internal TLS was refused without saying so: $$said" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set tls.internal.enabled=true --set 'database.brought.pgHba[0]=host all all 10.0.0.0/8 reject' --set 'database.brought.pgHba[1]=hostssl all all all scram-sha-256' >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: with internal TLS, a rejecting host line and a hostssl line were refused" >&2; exit 1; }
+	@# The 4b-restarts review, finding 2: a line was judged by its last word,
+	@# so "host all all all trust # reject" passed under internal TLS, and so
+	@# did a second line inside one item. An item is one whole line -- no #,
+	@# no line break, no \ at its end -- and its method is read where
+	@# pg_hba.conf has it; trust is for local lines only.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	refused() { said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$1 --set-json "database.brought.pgHba=$$2" 2>&1 >/dev/null)" \
+			&& { echo "chart-check FAILED: database.brought.pgHba rendered $$2: $$3" >&2; exit 1; }; \
+		echo "$$said" | grep -qF -- "$$4" \
+			|| { echo "chart-check FAILED: database.brought.pgHba's $$2 was refused without saying \"$$4\": $$said" >&2; exit 1; }; }; \
+	tls="--set tls.internal.enabled=true"; \
+	refused "$$tls" '["host all all all trust # reject"]' "under internal TLS a comment hid its method, trust, in the clear" "no #"; \
+	refused "$$tls" '["hostssl all all all scram-sha-256\nhost all all all trust"]' "under internal TLS a second line rode in one item" "no line break"; \
+	refused "" '["host all all all scram-sha-256\r"]' "a carriage return in an item" "no line break"; \
+	refused "" '["host all all all \\"]' "a line joined to the next" "at its end"; \
+	refused "$$tls" '["host all all all scram-sha-256 x=reject"]' "under internal TLS its last word, not its method, was reject" "admits a connection in the clear"; \
+	refused "" '["host all all all trust"]' "a remote line with no credential asked" "trust is for local lines only"; \
+	refused "" '["hostssl all all 10.0.0.0 255.0.0.0 trust"]' "a remote line, by address and mask, with no credential asked" "trust is for local lines only"; \
+	refused "" '["host all all all allow"]' "a method pg_hba.conf does not have" "whose method"; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set-json 'database.brought.pgHba=["local all all trust","hostssl all all 10.0.0.0 255.0.0.0 cert clientcert=verify-full","host all all all reject"]' >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: database.brought.pgHba refused a local trust line, a line by address and mask, or a rejecting line" >&2; exit 1; }
 	@# An external database's private CA (database.caSecret, ruled
 	@# 2026-11-08): its Secret's ca.crt mounted, and named to the runtime,
 	@# in every pod that connects to the database -- the five stores, the

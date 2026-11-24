@@ -100,9 +100,13 @@ is refused (requirement 1, ruling 1047). Each takes the chart.
 Who may connect to the brought database from past its own pod: pg_hba.conf
 lines, as a JSON list (v31a item 6). database.brought.pgHba where it is set;
 otherwise the chart's own, by the shape it runs in and by internal TLS, as
-they were before they became a value. Under internal TLS (ruling 1084) a
-line that would admit a connection in the clear is refused: every remote
-line is hostssl, or rejects. Takes (dict "top" . "patroni" bool "tls" bool).
+they were before they became a value. Each item is one whole line, with no
+comment, line break or continuation in it, and is judged by its fields
+where pg_hba.conf has them, never by how it ends: its method is one of
+pg_hba.conf's, trust only on a local line, and under internal TLS (ruling
+1084) a line that would admit a connection in the clear is refused -- every
+remote line is hostssl, or its method is reject.
+Takes (dict "top" . "patroni" bool "tls" bool).
 */}}
 {{- define "meridian-runtime.databaseAccess" -}}
 {{- $rules := .top.Values.database.brought.pgHba | default list -}}
@@ -122,13 +126,40 @@ line is hostssl, or rejects. Takes (dict "top" . "patroni" bool "tls" bool).
 {{- if not (kindIs "slice" $rules) -}}
 {{- fail (printf "database.brought.pgHba is %v; it takes a list of pg_hba.conf lines, one per item" $rules) -}}
 {{- end -}}
+{{- $methods := list "trust" "reject" "scram-sha-256" "md5" "password" "gss" "sspi" "ident" "peer" "ldap" "radius" "cert" "pam" "bsd" -}}
+{{- $anIp := "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$" -}}
 {{- range $rules -}}
-{{- $words := splitList " " (. | toString | trim | replace "\t" " ") | compact -}}
-{{- if not (has (first $words | default "") (list "local" "host" "hostssl" "hostnossl" "hostgssenc" "hostnogssenc")) -}}
+{{- if not (kindIs "string" .) -}}
+{{- fail (printf "database.brought.pgHba has %v; each item is one pg_hba.conf line, a string" .) -}}
+{{- end -}}
+{{- if or (contains "#" .) (contains "\n" .) (contains "\r" .) (hasSuffix "\\" (trim .)) -}}
+{{- fail (printf "database.brought.pgHba has %q; each item is one whole line: no #, which starts a comment that hides what follows it, no line break and no \\ at its end, which joins it to the next" .) -}}
+{{- end -}}
+{{- $words := splitList " " (. | trim | replace "\t" " ") | compact -}}
+{{- $type := first $words | default "" -}}
+{{- if not (has $type (list "local" "host" "hostssl" "hostnossl" "hostgssenc" "hostnogssenc")) -}}
 {{- fail (printf "database.brought.pgHba has %q; each line starts local, host, hostssl, hostnossl, hostgssenc or hostnogssenc, as pg_hba.conf's do" .) -}}
 {{- end -}}
-{{- if and $.tls (has (first $words) (list "host" "hostnossl" "hostgssenc" "hostnogssenc")) (ne (last $words) "reject") -}}
-{{- fail (printf "database.brought.pgHba has %q, which admits a connection in the clear; with tls.internal.enabled every remote line is hostssl or ends reject (ruling 1084)" .) -}}
+{{- /* Where its method is: after the database and the user, and past the
+       address of any line but a local one -- one word, or an IP address
+       and its mask. Everything is judged there, never by the line's end. */ -}}
+{{- $local := eq $type "local" -}}
+{{- $at := ternary 3 4 $local -}}
+{{- if and (not $local) (gt (len $words) 3) (regexMatch $anIp (index $words 3)) -}}
+{{- $at = 5 -}}
+{{- end -}}
+{{- if le (len $words) $at -}}
+{{- fail (printf "database.brought.pgHba has %q, with too few fields; a line is \"local DATABASE USER METHOD\", or \"%s DATABASE USER ADDRESS METHOD\" with the address all, samehost, samenet, a host name, a range (10.0.0.0/8) or an IP address then its mask. The server would not start with it" . (ternary "host" $type $local)) -}}
+{{- end -}}
+{{- $method := index $words $at -}}
+{{- if not (has $method $methods) -}}
+{{- fail (printf "database.brought.pgHba has %q, whose method, the field after its %s, is %q; it is one of %s" . (ternary "user" "address" $local) $method (join ", " $methods)) -}}
+{{- end -}}
+{{- if and (not $local) (eq $method "trust") -}}
+{{- fail (printf "database.brought.pgHba has %q, which admits a connection over the network with no credential; trust is for local lines only" .) -}}
+{{- end -}}
+{{- if and $.tls (has $type (list "host" "hostnossl" "hostgssenc" "hostnogssenc")) (ne $method "reject") -}}
+{{- fail (printf "database.brought.pgHba has %q, which admits a connection in the clear; with tls.internal.enabled every remote line is hostssl or its method is reject (ruling 1084)" .) -}}
 {{- end -}}
 {{- end -}}
 {{- toJson $rules -}}
