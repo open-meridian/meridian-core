@@ -83,7 +83,9 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           python3 tools/ci_tier.py plan --event "$EVENT" ${BASE:+--base "$BASE" --head "$HEAD"} ${BASE_REF:+--base-ref "$BASE_REF"} | tee -a "$GITHUB_OUTPUT"
-          { echo "## This run's tier ($EVENT)"; echo; python3 tools/ci_tier.py table; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## This run's tier ($EVENT)"; echo; python3 tools/ci_tier.py table; echo
+            python3 tools/ci_tier.py left --event "$EVENT" ${BASE:+--base "$BASE" --head "$HEAD"} ${BASE_REF:+--base-ref "$BASE_REF"}
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # The two stages that need no image: beside the builds, not after them.
   static:
@@ -734,8 +736,15 @@ jobs:
       matrix: ${{ fromJSON(needs.tier.outputs.harness_left) }}
     name: e2e-harness (${{ matrix.group }})
     steps:
+      # Its check passes, as a required check must; the summary and the
+      # notice say it did not run, so a green pull request is not read as
+      # these suites passing (the tier job's summary lists every job left).
       - name: Left to the merge queue
-        run: echo "::notice::e2e-harness (${{ matrix.group }}) is not in this pull request's tier; the merge queue runs it"
+        env:
+          JOB: e2e-harness (${{ matrix.group }})
+        run: |
+          echo "::notice title=Not run here::$JOB did not run: it is not in this pull request's tier, and its green check here means only that. The merge queue runs it."
+          echo "### $JOB: not run here, left to the merge queue" >> "$GITHUB_STEP_SUMMARY"
 
   # The four runs that install the chart on a real cluster and sign a person
   # in: spec/installation-and-first-run, paths 1 and 2 and path 1's other two
@@ -1184,8 +1193,13 @@ jobs:
       matrix: ${{ fromJSON(needs.tier.outputs.clusters_left) }}
     name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
     steps:
+      # As e2e-harness-left: its check passes, and it says it did not run.
       - name: Left to the merge queue
-        run: echo "::notice::this cluster run is not in this pull request's tier; the merge queue runs it"
+        env:
+          JOB: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
+        run: |
+          echo "::notice title=Not run here::$JOB did not run: it is not in this pull request's tier, and its green check here means only that. The merge queue runs it."
+          echo "### $JOB: not run here, left to the merge queue" >> "$GITHUB_STEP_SUMMARY"
 
   # arm64, tested and not only built (ruling 1071): the release candidate's
   # arm64 images, built natively on GitHub's arm64 runner as the amd64 ones
