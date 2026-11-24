@@ -2,7 +2,9 @@
 of `make e2e-harness-check`.
 
 - tools/ci-k3s-images.sh: k3d's own images are fetched, saved and loaded
-  beside the node image.
+  beside the node image, and the airgap tarball's fetch backs off between
+  tries, a bounded number of them, within the 300 s that bounded it before
+  (queue run 45307348738: a 403 on all seven tries inside one minute).
 - tools/ci-watchdog.sh proof pulls: making the cluster pulled nothing, or
   the job fails (run 45300919431 died on k3d's pull).
 """
@@ -103,6 +105,32 @@ esac
         done = self.run_script("key", "v1.0.0-k3s1")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue(done.stdout.strip().endswith(f"-k3d-{self.k3d()}"), done.stdout)
+
+    def test_a_refused_fetch_is_tried_again_after_waits_that_grow(self):
+        done = self.run_script("fetch", os.path.join(self.root, "images"), "v1.0.0-k3s1", fails=2)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.said("curl")), 3)
+        self.assertEqual(self.said("sleep")[:3], ["0", "15", "45"])
+        self.assertIn("try 2 for", done.stderr)
+        self.assertIn("(curl exit 22)", done.stderr)
+
+    def test_a_fetch_refused_every_time_stops_after_a_bounded_number_of_tries(self):
+        done = self.run_script("fetch", os.path.join(self.root, "images"), "v1.0.0-k3s1", fails=99)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(len(self.said("curl")), 4)
+        self.assertEqual(self.said("sleep"), ["0", "15", "45", "120"])
+        self.assertIn("was not fetched in 4 tries, within 300s", done.stderr)
+        self.assertEqual([c for c in self.said("docker") if c.startswith("pull")], [])
+
+    def test_no_try_begins_past_the_bound(self):
+        done = self.run_script("fetch", os.path.join(self.root, "images"), "v1.0.0-k3s1", fails=99,
+                               env={"FETCH_WITHIN": "50"})
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(self.said("sleep"), ["0", "15", "45"])
+
+    def test_each_try_ends_a_stalled_transfer(self):
+        self.run_script("fetch", os.path.join(self.root, "images"), "v1.0.0-k3s1")
+        self.assertIn("--speed-time 60", self.said("curl")[0])
 
 
 class Watchdog(unittest.TestCase):

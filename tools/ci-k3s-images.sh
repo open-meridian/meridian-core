@@ -64,6 +64,28 @@ k3d_version() {
 }
 k3d_images() { echo "ghcr.io/k3d-io/k3d-proxy:$(k3d_version) ghcr.io/k3d-io/k3d-tools:$(k3d_version)"; }
 
+# A tarball from the k3s release, on a miss in the cache. Tries after waits
+# that grow (back-off), FETCH_WAITS seconds, and only while the next try can
+# begin inside FETCH_WITHIN seconds of the first: the 300 that bounded
+# curl's own retries before. Each try also ends a transfer that stalls (under
+# 10 kB/s for 60 s, curl exit 28). Queue run 45307348738 met a 403 (curl
+# exit 22) on all seven of its tries, 10 s apart, inside one minute.
+fetched() {
+	url="$1" out="$2" began="$(date +%s)" try=0
+	for wait in ${FETCH_WAITS:-0 15 45 120}; do
+		if [ $(( $(date +%s) + wait - began )) -gt "${FETCH_WITHIN:-300}" ]; then break; fi
+		sleep "$wait"
+		try=$((try + 1))
+		rc=0
+		curl -fsSL --connect-timeout 20 --speed-limit 10000 --speed-time 60 -o "$out" "$url" || rc=$?
+		[ "$rc" != 0 ] || return 0
+		rm -f "$out"
+		echo "ci-k3s-images: try $try for $url failed (curl exit $rc) after a ${wait}s wait" >&2
+	done
+	echo "ci-k3s-images: $url was not fetched in $try tries, within ${FETCH_WITHIN:-300}s" >&2
+	exit 1
+}
+
 # An image from its registry, before any cluster is made: three tries at
 # most, after waits of 0, 20 and 60 s.
 pulled() {
@@ -99,7 +121,7 @@ fetch)
 		# The release's tag is the image's with + for its last -.
 		release="$(echo "$tag" | sed 's/-\(k3s[0-9]*\)$/+\1/')"
 		url="https://github.com/k3s-io/k3s/releases/download/$(echo "$release" | sed 's/+/%2B/')/$(airgap)"
-		curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o "$file.part" "$url"
+		fetched "$url" "$file.part"
 		echo "$want  $file.part" | sha256sum -c - >/dev/null \
 			|| { rm -f "$file.part"; echo "ci-k3s-images: $(airgap) for $tag does not match its digest" >&2; exit 1; }
 		mv "$file.part" "$file"
