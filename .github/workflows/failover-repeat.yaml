@@ -10,11 +10,18 @@
 #   gh workflow run failover-repeat --ref <branch> -f profiles=ha -f repeat=5
 #   gh workflow run failover-repeat --ref <branch> -f profiles=reconfigure -f repeat=1
 #
-# By hand only. Each run keeps its claims (failover-claims-<profile>-<n>), as
-# ci's failover jobs keep theirs for the claims ledger.
+# By hand, and every night on main (v31a item 6a, the first NIGHT job): the
+# NIGHT classes, which no profile runs by default, once in the tolerant
+# profile -- the broker's server crashed five times in a row
+# (broker-crash-loop). Each run keeps its claims
+# (failover-claims-<profile>-<n>), as ci's failover jobs keep theirs for the
+# claims ledger, and a failed run ends with a line naming the failed check,
+# as ci's cluster jobs do.
 name: failover-repeat
 
 on:
+  schedule:
+    - cron: "23 5 * * *"
   workflow_dispatch:
     inputs:
       profiles:
@@ -47,6 +54,7 @@ jobs:
     outputs:
       runs: ${{ steps.runs.outputs.runs }}
       profiles: ${{ steps.runs.outputs.profiles }}
+      failure: ${{ steps.runs.outputs.failure }}
     defaults:
       run:
         working-directory: workspace/meridian-core
@@ -54,10 +62,11 @@ jobs:
       - name: The runs
         id: runs
         working-directory: .
+        # The night's: no inputs, so its own profile, count and classes.
         env:
-          PROFILES: ${{ inputs.profiles }}
-          REPEAT: ${{ inputs.repeat }}
-          FAILURE: ${{ inputs.failure }}
+          PROFILES: ${{ github.event_name == 'schedule' && 'tolerant' || inputs.profiles }}
+          REPEAT: ${{ github.event_name == 'schedule' && '1' || inputs.repeat }}
+          FAILURE: ${{ github.event_name == 'schedule' && 'broker-crash-loop' || inputs.failure }}
           SDK_REF: ${{ inputs.sdk_ref }}
         run: |
           # Each profile named once, in the order given.
@@ -83,6 +92,7 @@ jobs:
           esac
           echo "profiles=[$profiles]" >> "$GITHUB_OUTPUT"
           echo "runs=[$(seq -s, 1 "$REPEAT")]" >> "$GITHUB_OUTPUT"
+          echo "failure=$FAILURE" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -185,17 +195,21 @@ jobs:
           version: ${{ matrix.profile == 'reconfigure' && 'v4.2.3' || 'v3.16.2' }}
 
       - name: make e2e-cluster-k3d
+        id: make
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
           PROFILE: ${{ matrix.profile }}
-          FAILURE: ${{ inputs.failure }}
+          FAILURE: ${{ needs.failover-images.outputs.failure }}
+        # Teed to a file the verdict reads, its exit status unchanged.
         run: |
+          set -o pipefail
           agents=0 zones=""
           if [ "$PROFILE" != tolerant ]; then agents=3 zones="zone-a zone-b zone-c"; fi
           if [ "$PROFILE" = reconfigure ]; then FAILURE=""; fi
           make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover IMAGES=pulled \
-            PROFILE="$PROFILE" FAILURE="$FAILURE" E2E_K3D_AGENTS="$agents" E2E_K3D_ZONES="$zones"
+            PROFILE="$PROFILE" FAILURE="$FAILURE" E2E_K3D_AGENTS="$agents" E2E_K3D_ZONES="$zones" \
+            2>&1 | tee "$RUNNER_TEMP/make.log"
 
       - name: Keep the failure classes' measurements
         if: ${{ !cancelled() }}
@@ -237,6 +251,20 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Last, after any failure: one line naming the failed check, as ci's
+      # cluster jobs end (v31a item 11; tools/ci-watchdog.sh verdict).
+      - name: The failed assertion
+        if: failure() || cancelled()
+        timeout-minutes: 1
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          if [ -x workspace/meridian-core/tools/ci-watchdog.sh ]; then
+            cd workspace/meridian-core && timeout 10 tools/ci-watchdog.sh verdict "$RUNNER_TEMP/make.log"
+          else
+            echo "FAILED: the job's first steps: core was not checked out"
+          fi
+
   # Green only when every run of every profile was.
   failover-verdict:
     name: failover-repeat (every run green)
@@ -250,7 +278,7 @@ jobs:
           IMAGES: ${{ needs.failover-images.result }}
           RUNS: ${{ needs.failover-repeat.result }}
           PROFILES: ${{ needs.failover-images.outputs.profiles }}
-          REPEAT: ${{ inputs.repeat }}
+          REPEAT: ${{ github.event_name == 'schedule' && '1' || inputs.repeat }}
         run: |
           if [ "$IMAGES" = success ] && [ "$RUNS" = success ]; then
             echo "failover-repeat: $REPEAT of $REPEAT runs green in each of $PROFILES"

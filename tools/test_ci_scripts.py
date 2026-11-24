@@ -533,5 +533,33 @@ class SdkRef(unittest.TestCase):
             self.assertNotIn("git ls-remote --exit-code --heads \"$SDK\"", text, workflow)
 
 
+class NightRun(unittest.TestCase):
+    """v31a item 6a, the first NIGHT job: failover-repeat runs every night
+    on main, in the tolerant profile, the NIGHT classes no profile runs by
+    default (broker-crash-loop), and each run that fails ends, as ci's
+    cluster jobs do, with the verdict's line naming the failed check."""
+
+    def workflow(self):
+        with open(os.path.join(TOOLS, "..", ".github", "workflows", "failover-repeat.yaml")) as f:
+            return f.read()
+
+    def test_it_runs_every_night_with_the_night_classes_in_the_tolerant_profile(self):
+        text = self.workflow()
+        self.assertRegex(text, r"\n  schedule:\n    - cron: \"[0-9]+ [0-9]+ \* \* \*\"\n")
+        self.assertIn("PROFILES: ${{ github.event_name == 'schedule' && 'tolerant' || inputs.profiles }}", text)
+        self.assertIn("FAILURE: ${{ github.event_name == 'schedule' && 'broker-crash-loop' || inputs.failure }}", text)
+        self.assertIn("FAILURE: ${{ needs.failover-images.outputs.failure }}", text)
+
+    def test_a_failed_run_ends_with_the_failed_assertion(self):
+        text = self.workflow()
+        run_job = text.split("\n  failover-repeat:\n", 1)[1].split("\n  failover-verdict:\n", 1)[0]
+        steps = [line.strip()[len("- name: "):] for line in run_job.splitlines()
+                 if line.startswith("      - name: ")]
+        self.assertEqual(steps[-1], "The failed assertion", steps)
+        self.assertIn('tools/ci-watchdog.sh verdict "$RUNNER_TEMP/make.log"', run_job)
+        self.assertIn('| tee "$RUNNER_TEMP/make.log"', run_job)
+        self.assertIn("id: make", run_job)
+
+
 if __name__ == "__main__":
     unittest.main()
