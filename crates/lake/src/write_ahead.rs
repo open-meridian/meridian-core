@@ -1037,14 +1037,24 @@ pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
 /// refused for load. The bound a write is held within at a high rate.
 pub const MAX_BYTES: i64 = 256 << 20;
 
+/// The least the stream's byte bound holds: this many of the broker's
+/// largest message (`broker.limits.maxPayload`). The chart refuses less
+/// too (`meridian-runtime.writeAheadMiB`).
+pub const LEAST_WRITES: u64 = 16;
+
 impl Bounds {
     /// The chart's bounds, `lake.writeAhead.maxAge` as `30s`, `10m` or `1h`
     /// and `lake.writeAhead.maxBytes` as `256MB` or `1GB`, each above 0;
-    /// this module's where it says nothing. Refused naming the value.
+    /// this module's where it says nothing. Refused naming the value. A
+    /// byte bound under [`LEAST_WRITES`] of the broker's largest message
+    /// (`max_payload` bytes, as the broker says it) is refused too: a
+    /// stream with less room than one write is at its bound for that
+    /// write, and one of a few writes is full at once.
     pub fn from_said(
         max_age: Option<&str>,
         max_bytes: Option<&str>,
         replicas: usize,
+        max_payload: u64,
     ) -> Result<Bounds, String> {
         let max_age = match max_age.map(str::trim).filter(|said| !said.is_empty()) {
             None => MAX_AGE,
@@ -1064,6 +1074,14 @@ impl Bounds {
                 )
             })?,
         };
+        let least = LEAST_WRITES.saturating_mul(max_payload);
+        if u64::try_from(max_bytes).unwrap_or(0) < least {
+            return Err(format!(
+                "lake.writeAhead.maxBytes is {max_bytes} bytes; at least {least}, {LEAST_WRITES} \
+                 times the broker's largest message (broker.limits.maxPayload, {max_payload} \
+                 bytes)"
+            ));
+        }
         Ok(Bounds {
             max_age,
             max_bytes,
@@ -1281,8 +1299,11 @@ pub async fn write_forever(
     let mut writer = started(&lake, identity).await;
     let kept = bring_to_bounds(&lake, &context, &config, &bounds, &writer).await;
     let place = Arc::new(AtomicU64::new(writer.next()));
+    // The room a write needs: the broker's largest message, as it says it.
+    let largest_write = u64::try_from(client.server_info().max_payload).unwrap_or(u64::MAX);
     let guarding = tokio::spawn(guard_forever(
         context.clone(),
+        largest_write,
         Arc::clone(&lake),
         Arc::clone(&place),
         kept,
@@ -1576,12 +1597,13 @@ impl Drop for AbortOnDrop {
 /// said.
 async fn guard_forever(
     context: jetstream::Context,
+    largest_write: u64,
     lake: Arc<Lake>,
     place: Arc<AtomicU64>,
     kept: Option<String>,
     waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) {
-    let mut full = guard::Full::new(guard::STUCK_AFTER);
+    let mut full = guard::Full::new(guard::STUCK_AFTER, largest_write);
     let mut said = false;
     if kept.is_some() {
         waiting(kept.clone());
@@ -2287,18 +2309,18 @@ mod tests {
 
     #[test]
     fn the_bounds_are_the_charts_or_these_and_a_bound_that_is_none_is_refused() {
-        let said = Bounds::from_said(Some("90s"), Some("64MB"), 3).unwrap();
+        let said = Bounds::from_said(Some("90s"), Some("64MB"), 3, 1 << 20).unwrap();
         assert_eq!(
             (said.max_age, said.max_bytes),
             (Duration::from_secs(90), 64 << 20)
         );
         assert_eq!(
-            Bounds::from_said(Some("2h"), Some("1GB"), 3)
+            Bounds::from_said(Some("2h"), Some("1GB"), 3, 1 << 20)
                 .unwrap()
                 .max_age,
             Duration::from_secs(7_200)
         );
-        let none = Bounds::from_said(None, Some(""), 3).unwrap();
+        let none = Bounds::from_said(None, Some(""), 3, 1 << 20).unwrap();
         assert_eq!((none.max_age, none.max_bytes), (MAX_AGE, MAX_BYTES));
         for (age, bytes, named) in [
             ("0s", "", "maxAge"),
@@ -2308,8 +2330,29 @@ mod tests {
             ("", "256Mi", "maxBytes"),
             ("", "lots", "maxBytes"),
         ] {
-            let refused = Bounds::from_said(Some(age), Some(bytes), 3).unwrap_err();
+            let refused = Bounds::from_said(Some(age), Some(bytes), 3, 1 << 20).unwrap_err();
             assert!(refused.contains(named), "{age} {bytes}: {refused}");
         }
+    }
+
+    /// The review of the stream guard, finding 5: a byte bound under 16 of
+    /// the broker's largest message is refused, naming both.
+    #[test]
+    fn a_byte_bound_under_sixteen_of_the_brokers_largest_message_is_refused() {
+        for small in ["512KB", "15MB", "16777215"] {
+            let refused = Bounds::from_said(None, Some(small), 3, 1 << 20).unwrap_err();
+            assert!(
+                refused.contains("lake.writeAhead.maxBytes")
+                    && refused.contains("broker.limits.maxPayload, 1048576 bytes"),
+                "{small}: {refused}"
+            );
+        }
+        let least = Bounds::from_said(None, Some("16MB"), 3, 1 << 20).unwrap();
+        assert_eq!(least.max_bytes, 16 << 20);
+        // The broker's largest message as the broker says it: 8 MiB takes
+        // 128 MiB, and this module's 256 MiB where the chart says nothing.
+        assert!(Bounds::from_said(None, Some("64MB"), 3, 8 << 20).is_err());
+        assert!(Bounds::from_said(None, None, 3, 8 << 20).is_ok());
+        assert!(Bounds::from_said(None, None, 3, 32 << 20).is_err());
     }
 }

@@ -1208,7 +1208,8 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
 /// the 30 s a stream stands at a bound before it is said -- its member is
 /// said stuck full only where the stream stands at the bound the stream
 /// itself has by then, never for the chart's while the stream has room; and
-/// the lower bound dropped none of its writes.
+/// none of its writes is dropped. (The chart's lower bound is not applied
+/// while the stream holds more: the test after this one.)
 ///
 /// By hand, as `a_write_naming_another_instances_inbox_is_recorded_and_
 /// answered_to_nobody` above; this test empties the broker of the lake's

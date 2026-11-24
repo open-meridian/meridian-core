@@ -42,11 +42,6 @@ pub const LOOK_EVERY: Duration = Duration::from_secs(5);
 /// a reader made again from its place has had its chance to drain it.
 pub const STUCK_AFTER: Duration = Duration::from_secs(30);
 
-/// The room a stream must have for a write not to be refused: the broker's
-/// largest message (`broker.limits.maxPayload`, 1 MiB), so a stream with
-/// less free is at its byte bound for some write.
-pub const LARGEST_WRITE: u64 = 1 << 20;
-
 /// The words a stuck-full stream is said with, first in the writer
 /// member's report (`ComponentReport.detail`): what the dashboard's judge
 /// reads to file its standing notice, and `meridian status` shows.
@@ -124,11 +119,14 @@ impl Standing {
     /// Whether it stands at its byte bound -- some write refused -- or the
     /// oldest write the lake has not recorded is about to be dropped at its
     /// age bound. Taken from the lake's place first ([`Self::from_place`]),
-    /// so that write is its oldest once drops have started.
-    pub fn at_a_bound(&self, bounds: &Bounds, next: u64, now_ns: i64) -> bool {
+    /// so that write is its oldest once drops have started. `largest_write`
+    /// is the room it must have for a write not to be refused: the broker's
+    /// largest message as the broker says it (`broker.limits.maxPayload`),
+    /// so a stream with less free is at its byte bound for some write.
+    pub fn at_a_bound(&self, bounds: &Bounds, largest_write: u64, next: u64, now_ns: i64) -> bool {
         // A bound of none (the broker's -1 bytes, 0 s) is never stood at.
         let max_bytes = u64::try_from(bounds.max_bytes).unwrap_or(0);
-        let by_bytes = max_bytes > 0 && self.bytes.saturating_add(LARGEST_WRITE) > max_bytes;
+        let by_bytes = max_bytes > 0 && self.bytes.saturating_add(largest_write) > max_bytes;
         let by_age = !bounds.max_age.is_zero()
             && self
                 .unrecorded_age(next, now_ns)
@@ -169,13 +167,19 @@ impl Standing {
 #[derive(Debug)]
 pub struct Full {
     after: Duration,
+    /// The broker's largest message, bytes.
+    largest_write: u64,
     /// Since when every look found the stream at a bound.
     since: Option<tokio::time::Instant>,
 }
 
 impl Full {
-    pub fn new(after: Duration) -> Self {
-        Self { after, since: None }
+    pub fn new(after: Duration, largest_write: u64) -> Self {
+        Self {
+            after,
+            largest_write,
+            since: None,
+        }
     }
 
     /// One look at `at`: the stream standing so, the lake's place `next`,
@@ -189,7 +193,7 @@ impl Full {
         bounds: &Bounds,
         now_ns: i64,
     ) -> Option<String> {
-        if !standing.at_a_bound(bounds, next, now_ns) {
+        if !standing.at_a_bound(bounds, self.largest_write, next, now_ns) {
             self.since = None;
             return None;
         }

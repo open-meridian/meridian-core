@@ -30,7 +30,7 @@ fn standing(first: u64, last: u64, bytes: u64, now_ns: i64, old_s: i64) -> Stand
 #[tokio::test(start_paused = true)]
 async fn a_stream_at_its_byte_bound_for_the_stuck_bound_is_said_stuck_full_until_it_drains() {
     let now = 1_700_000_000 * S;
-    let mut full = Full::new(STUCK_AFTER);
+    let mut full = Full::new(STUCK_AFTER, MIB);
     let start = tokio::time::Instant::now();
     let at = |s: u64| start + Duration::from_secs(s);
     // 256 MiB held of 256: no room for the broker's largest write. The lake
@@ -65,7 +65,7 @@ async fn a_stream_at_its_byte_bound_for_the_stuck_bound_is_said_stuck_full_until
 #[tokio::test(start_paused = true)]
 async fn a_stream_full_of_writes_the_lake_recorded_is_stuck_full_saying_none_is_past_its_place() {
     let now = 1_700_000_000 * S;
-    let mut full = Full::new(STUCK_AFTER);
+    let mut full = Full::new(STUCK_AFTER, MIB);
     let start = tokio::time::Instant::now();
     let recorded = standing(1, 4_000, 256 * MIB, now, 590);
     full.looked(start, &recorded, 4_001, &bounds(), now);
@@ -87,9 +87,9 @@ fn a_stream_is_at_its_age_bound_only_where_its_oldest_write_is_not_recorded_and_
     let now = 1_700_000_000 * S;
     let b = bounds();
     let unrecorded_old = standing(100, 200, MIB, now, 580);
-    assert!(unrecorded_old.at_a_bound(&b, 100, now));
+    assert!(unrecorded_old.at_a_bound(&b, MIB, 100, now));
     assert!(
-        !unrecorded_old.at_a_bound(&b, 201, now),
+        !unrecorded_old.at_a_bound(&b, MIB, 201, now),
         "every write recorded"
     );
     // Its oldest recorded, the lake at 150: its oldest write the lake has
@@ -102,19 +102,19 @@ fn a_stream_is_at_its_age_bound_only_where_its_oldest_write_is_not_recorded_and_
     let about_to_drop = recorded_old.from_place(150, now - 580 * S);
     assert_eq!((about_to_drop.first, about_to_drop.past(150)), (150, 51));
     assert!(
-        about_to_drop.at_a_bound(&b, 150, now),
+        about_to_drop.at_a_bound(&b, MIB, 150, now),
         "the write at the lake's place is about to be dropped"
     );
     assert!(!recorded_old
         .from_place(150, now - 60 * S)
-        .at_a_bound(&b, 150, now));
+        .at_a_bound(&b, MIB, 150, now));
     assert_eq!(
         recorded_old.from_place(100, now - 5 * S),
         recorded_old,
         "its oldest is the one at the place: nothing read"
     );
     let young = standing(100, 200, MIB, now, 60);
-    assert!(!young.at_a_bound(&b, 100, now));
+    assert!(!young.at_a_bound(&b, MIB, 100, now));
     let empty = Standing {
         messages: 0,
         bytes: 0,
@@ -122,7 +122,7 @@ fn a_stream_is_at_its_age_bound_only_where_its_oldest_write_is_not_recorded_and_
         last: 200,
         oldest_ns: 0,
     };
-    assert!(!empty.at_a_bound(&b, 1, now));
+    assert!(!empty.at_a_bound(&b, MIB, 1, now));
     assert_eq!(empty.past(1), 0);
 }
 
@@ -195,14 +195,23 @@ fn a_stream_is_judged_by_its_own_bounds_and_a_refused_bring_to_bounds_is_said() 
         max_bytes: 128 << 20,
         ..bounds()
     };
-    assert!(held.at_a_bound(&at_128, 1, now));
-    assert!(!held.at_a_bound(&bounds(), 1, now));
+    assert!(held.at_a_bound(&at_128, MIB, 1, now));
+    assert!(!held.at_a_bound(&bounds(), MIB, 1, now));
     let none = Bounds {
         max_bytes: -1,
         max_age: Duration::ZERO,
         ..bounds()
     };
-    assert!(!standing(1, 160, 137 * MIB, now, 86_400).at_a_bound(&none, 1, now));
+    assert!(!standing(1, 160, 137 * MIB, now, 86_400).at_a_bound(&none, MIB, 1, now));
+    // The room a write needs is the broker's largest message, as the
+    // broker says it (finding 5): 137 MiB of 140 has room for a 1 MiB
+    // write, not for a 4 MiB one.
+    let at_140 = Bounds {
+        max_bytes: 140 << 20,
+        ..bounds()
+    };
+    assert!(!held.at_a_bound(&at_140, MIB, 1, now));
+    assert!(held.at_a_bound(&at_140, 4 * MIB, 1, now));
     let kept = "the write-ahead stream LAKE_WRITE_AHEAD is kept as it is";
     assert_eq!(said(None, None), None);
     assert_eq!(said(None, Some(kept)).as_deref(), Some(kept));

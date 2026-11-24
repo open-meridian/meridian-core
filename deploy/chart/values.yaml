@@ -583,7 +583,8 @@ lake:
   # minutes at 3,600 rows a second, three at the lake's 12,000 -- beyond
   # the two minutes of the slowest recovery that stops the writer (a
   # zone's). Each server's JetStream store is sized to hold it beside the
-  # analytics units' queue.
+  # analytics units' queue. At least 16 times broker.limits.maxPayload, the
+  # broker's largest message; less is refused.
   writeAhead:
     maxAge: 10m
     maxBytes: 256MB

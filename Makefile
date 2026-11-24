@@ -3016,7 +3016,14 @@ chart-check:
 			|| { echo "chart-check FAILED: lake.writeAhead $${flag:-unset} does not tell the lake MERIDIAN_LAKE_WRITE_AHEAD_$$name=$$want" >&2; exit 1; }; \
 	done; \
 	! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.writeAhead.maxAge=ten >/dev/null 2>&1 \
-		|| { echo "chart-check FAILED: lake.writeAhead.maxAge=ten rendered; it takes a whole number of s, m or h" >&2; exit 1; }
+		|| { echo "chart-check FAILED: lake.writeAhead.maxAge=ten rendered; it takes a whole number of s, m or h" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set lake.writeAhead.maxBytes=16MB 2>/dev/null \
+		| grep -A1 'name: MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES$$' | grep -q 'value: "16MB"' \
+		|| { echo "chart-check FAILED: lake.writeAhead.maxBytes=16MB, 16 times the broker's 1MB largest message, does not reach the lake" >&2; exit 1; }; \
+	for small in "--set lake.writeAhead.maxBytes=15MB" "--set lake.writeAhead.maxBytes=64MB --set broker.limits.maxPayload=8MB" "--set lake.writeAhead.maxBytes=1GB --set broker.limits.maxPayload=1GB"; do \
+		! $(HELM_TEMPLATE) check deploy/chart $$base $$small >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: $$small rendered; the write-ahead stream holds at least 16 of the broker's largest message (broker.limits.maxPayload)" >&2; exit 1; }; \
+	done
 	@# Ruling 972: lake.mallocMmapThreshold reaches the lake as glibc's
 	@# MALLOC_MMAP_THRESHOLD_, 131072 by default, and only a whole number of
 	@# bytes above 0 renders.
