@@ -3150,13 +3150,16 @@ def doubled(history):
 def broker_crash_loop(s):
     """The broker's server killed outright five times in a row (v31a item
     6a), each as soon as the last is answered for: a NIGHT class, run by
-    failover-repeat's schedule in the tolerant profile, in no profile's
+    failover-repeat by hand (FAILURE=broker-crash-loop), in no profile's
     default list. Each crash is held to the tolerant broker bound (60 s):
     the server restarted, the book answering, and both stores acknowledging
     the driver's writes again. Then nothing acknowledged is lost and no
     order is in its account twice. The first crash not answered for ends
-    the loop, named; the kubelet's restart backoff grows with each crash
-    (the fault-injection report of 2026-11-20: 6.8 s to 90.7 s over five)."""
+    the loop, named and claimed as not held. The kubelet's restart backoff
+    grows with each crash (10, 20, 40, 80 s; the fault-injection report of
+    2026-11-20: 6.8 s to 90.7 s over five), so the fifth is past the bound
+    by construction until the broker's restart backoff is bounded: a
+    proposal, not yet a ruled design, and why no schedule runs this yet."""
     print(f"F: broker-crash-loop: the broker's server killed outright {CRASH_LOOP} times in a row", flush=True)
     wait_for("bor settled", lambda: members_settled("bor"), seconds=300)
     bound = TOLERANT_BROKER
@@ -3181,6 +3184,11 @@ def broker_crash_loop(s):
                 + ("" if recovered else f" (restarted {said.get('restarted', False)}, the book answering "
                    f"{said.get('book', False)}, writes acknowledged {said.get('acknowledged', False)})"))
         if not recovered:
+            # Claimed too, so the ledger holds the crash that missed its
+            # bound and not only those that made it: how long it was waited
+            # on, past the bound, and that it was not back by then.
+            claim(s, "broker-crash-loop", "bor", took, bound,
+                  {"crash": n, "servers": len(servers), "recovered": False})
             return
         claim(s, "broker-crash-loop", "bor", took, bound, {"crash": n, "servers": len(servers)})
         if DRIVEN:

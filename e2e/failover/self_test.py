@@ -681,6 +681,7 @@ class Broker:
 
     def __init__(self, back=lambda n: True, history=""):
         self.crashes, self.back, self.history, self.rpo = 0, back, history, []
+        self.claims = []
 
     def patched(self):
         return [
@@ -695,7 +696,7 @@ class Broker:
             mock.patch.object(run, "members_settled", lambda component: True),
             mock.patch.object(run, "driver_rpo_held", lambda s, after: self.rpo.append(after)),
             mock.patch.object(run, "driver_file", lambda instance, path: self.history),
-            mock.patch.object(run, "claim", lambda *args, **kwargs: None),
+            mock.patch.object(run, "claim", lambda s, *said: self.claims.append(said)),
             mock.patch.object(run, "DRIVEN", True),
             mock.patch.object(run.time, "sleep", lambda _: None),
         ]
@@ -717,7 +718,7 @@ class Broker:
 
 class BrokerCrashLoop(unittest.TestCase):
     """Roadmap v31a item 6a: the broker's server crashed five times in a
-    row, a NIGHT class (failover-repeat's schedule) and no profile's
+    row, a NIGHT class (failover-repeat, by hand) and no profile's
     default. Each crash held to the tolerant broker bound, 60 s, and then
     no acknowledged write lost and none doubled."""
 
@@ -746,6 +747,27 @@ class BrokerCrashLoop(unittest.TestCase):
         self.assertEqual(len(failed), 1, checks.said)
         self.assertIn("broker-crash-loop: crash 4 of 5", failed[0])
         self.assertIn("within 60s", failed[0])
+
+    def test_a_crash_not_back_within_60_s_is_claimed_as_not_held(self):
+        """The 4b-restarts review, finding 6: the crash that missed its
+        bound left no figure, so the ledger held only the crashes that made
+        it. It is claimed too: past its bound, and said not recovered."""
+        broker, checks, now = Broker(back=lambda n: n < 4), Checks(), [1000.0]
+
+        def happens(ready, seconds, every=2.0):
+            # Given up only once the whole wait has passed.
+            if not ready():
+                now[0] += seconds + 0.5
+                return False
+            return True
+        with mock.patch.object(run, "happens", happens), mock.patch.object(run.time, "time", lambda: now[0]):
+            broker.loop(checks)
+        self.assertEqual([said[4]["crash"] for said in broker.claims], [1, 2, 3, 4], broker.claims)
+        failure, component, seconds, bound, extra = broker.claims[-1]
+        self.assertEqual((failure, component, bound), ("broker-crash-loop", "bor", 60))
+        self.assertGreater(seconds, bound)
+        self.assertIs(extra["recovered"], False)
+        self.assertTrue(all("recovered" not in said[4] for said in broker.claims[:-1]), broker.claims)
 
     def test_an_order_read_twice_in_its_account_fails_naming_it(self):
         history = ('{:type :ok, :f :txn, :value [[:r "book/ACC-DRIVE-1" [1 2 2 3]]], :process 0}\n'
