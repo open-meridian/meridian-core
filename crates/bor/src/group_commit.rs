@@ -43,6 +43,11 @@ pub struct Command {
     /// Its plugin shard and epoch as its sidecar stamped it (step 3d,
     /// checkpoint 5, item 32): checked in its batch's transaction.
     pub shard: Option<meridian_changes::shard_fence::ShardStamp>,
+    /// No other database of the book held a row of its account when they
+    /// were asked, before this try (the review of 2026-11-24, finding 3):
+    /// with no row where it is acted on either, it is in the partition an
+    /// account starts in.
+    pub nowhere_else: bool,
 }
 
 /// What the leader asks a waiting caller.
@@ -293,6 +298,7 @@ mod tests {
             idempotency_key: String::new(),
             request: vec![0; bytes],
             shard: None,
+            nowhere_else: false,
         }
     }
 

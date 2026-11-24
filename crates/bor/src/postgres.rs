@@ -1736,6 +1736,28 @@ fn again(failed: &StoreError) -> StoreError {
     }
 }
 
+/// Where the record holds an account, as [`PostgresStore::found`] read it.
+enum Found {
+    /// In the partition this database's row names.
+    Here(String),
+    /// In no database's row: the partition an account starts in.
+    Nowhere(String),
+    /// In the partition another database's row names, that database its
+    /// home: placed or opened there.
+    Elsewhere(String),
+    /// Closed in another database toward this partition, and not opened
+    /// in it yet.
+    Opening(String),
+}
+
+/// An account's placement not read from every database of the book: its
+/// act is refused to be asked again, never decided on what was read.
+fn unread(account_id: &str, why: impl std::fmt::Display) -> StoreError {
+    StoreError::Unavailable(format!(
+        "account {account_id}'s placement was not read from every database of the book ({why}): ask again in a moment"
+    ))
+}
+
 impl PostgresStore {
     /// The partition `account_id` was last found in by this store; where it
     /// has not been, the partition an account starts in.
@@ -1748,9 +1770,20 @@ impl PostgresStore {
             .unwrap_or_else(|| first_partition_of(account_id).to_string())
     }
 
-    /// The partition the record holds `account_id` in now; where it holds
-    /// none, the partition an account starts in.
-    fn found(&self, account_id: &str) -> Result<String> {
+    /// Where the record holds `account_id` now (section 6.8: a writer
+    /// group hands a command on only after reading the record). Its row
+    /// here is the record where it names a partition this database is home
+    /// to. A row naming another database's partition is a close's: toward
+    /// it and not opened there yet, or opened there and not let go here (a
+    /// let-go that failed) -- so that database's row is read, and of two
+    /// rows that each name the other's database the one whose close no
+    /// database holds an open of is the account's (the review of
+    /// 2026-11-24, finding 2). Asked before any batch's transaction, never
+    /// under a partition's lock, and each other database for
+    /// [`HEAD_CHECKOUT`] at most (finding 3); one that does not answer
+    /// refuses the act to be asked again, never taken for holding no row
+    /// (finding 1).
+    fn found(&self, account_id: &str) -> Result<Found> {
         let here: Option<String> = self
             .conn()?
             .query_opt(
@@ -1759,17 +1792,184 @@ impl PostgresStore {
             )
             .map_err(unavailable)?
             .map(|row| row.get(0));
-        // Placed in another database (step 3d; section 6.4): found there.
-        let found = here.or_else(|| {
-            self.databases.get().and_then(|stores| {
-                stores
+        // Only an account moves between partitions, and only where the
+        // book has several: any other key's row here, or none, is its
+        // record, and no other database is asked for it.
+        if !crate::store::is_account(account_id) || self.partitions < 2 {
+            return Ok(match here {
+                Some(here) => Found::Here(here),
+                None => Found::Nowhere(first_partition_of(account_id).to_string()),
+            });
+        }
+        let others = self.other_databases();
+        let Some(here) = here else {
+            // No row here: every other database is asked.
+            let mut held = Vec::new();
+            for other in &others {
+                if let Some(named) = other.account_row_asked(account_id)? {
+                    held.push((other, named));
+                }
+            }
+            if held.is_empty() {
+                return Ok(Found::Nowhere(first_partition_of(account_id).to_string()));
+            }
+            if let Some((_, named)) = held.iter().find(|(other, named)| other.is_home_of(named)) {
+                return Ok(Found::Elsewhere(named.clone()));
+            }
+            // Closes' rows alone: the one not opened is where it goes.
+            if held.len() == 1 {
+                return Ok(Found::Opening(held.remove(0).1));
+            }
+            for (other, named) in &held {
+                if other.closed_unopened(account_id, named)? {
+                    return Ok(Found::Opening(named.clone()));
+                }
+            }
+            return Err(unread(
+                account_id,
+                "its databases' rows name no one partition",
+            ));
+        };
+        let Some(home) = self
+            .home_of(&here)
+            .filter(|home| !std::ptr::eq(home.as_ref(), self))
+        else {
+            return Ok(Found::Here(here));
+        };
+        match home.account_row_asked(account_id)? {
+            // Closed toward it, not opened there yet.
+            None => Ok(Found::Here(here)),
+            // Opened there, not let go here.
+            Some(there) if home.is_home_of(&there) => Ok(Found::Elsewhere(there)),
+            // Each names another's: the close not opened is the account's.
+            Some(_) if self.closed_unopened(account_id, &here)? => Ok(Found::Here(here)),
+            Some(there) if home.closed_unopened(account_id, &there)? => Ok(Found::Opening(there)),
+            Some(_) => Err(unread(
+                account_id,
+                "its databases' rows name no one partition",
+            )),
+        }
+    }
+
+    /// The book's other databases' stores; none where it has one database.
+    fn other_databases(&self) -> Vec<Arc<PostgresStore>> {
+        self.databases
+            .get()
+            .map(|linked| {
+                linked
                     .iter()
                     .filter_map(std::sync::Weak::upgrade)
                     .filter(|store| !std::ptr::eq(store.as_ref(), self))
-                    .find_map(|store| store.placement_held(account_id))
+                    .collect()
             })
-        });
-        Ok(found.unwrap_or_else(|| first_partition_of(account_id).to_string()))
+            .unwrap_or_default()
+    }
+
+    /// The store of the database `partition`'s writer group is at home in;
+    /// none where the book has one database.
+    fn home_of(&self, partition: &str) -> Option<Arc<PostgresStore>> {
+        let linked = self.databases.get().filter(|linked| linked.len() > 1)?;
+        let home = meridian_changes::databases::of_group(
+            self.groups.owner(partition),
+            linked.len() as u32,
+        );
+        linked.get(home as usize)?.upgrade()
+    }
+
+    /// Whether this database is the one `partition`'s writer group is at
+    /// home in.
+    fn is_home_of(&self, partition: &str) -> bool {
+        self.home_of(partition)
+            .is_some_and(|home| std::ptr::eq(home.as_ref(), self))
+    }
+
+    /// A read asked of this database for another's act (the review of
+    /// 2026-11-24, findings 1 and 3): on a connection waited for
+    /// [`HEAD_CHECKOUT`] at most, each statement given as long, and any
+    /// failure the act's refusal to be asked again -- never an answer.
+    fn asked<T>(
+        &self,
+        account_id: &str,
+        read: impl FnOnce(&mut Transaction<'_>) -> std::result::Result<T, postgres::Error>,
+    ) -> Result<T> {
+        let failed = |failed: &dyn std::fmt::Display| unread(account_id, failed);
+        let mut conn = self
+            .pool
+            .get_timeout(HEAD_CHECKOUT)
+            .map_err(|refused| failed(&refused))?;
+        let mut tx = conn.transaction().map_err(|refused| failed(&refused))?;
+        tx.batch_execute(&format!(
+            "SET LOCAL statement_timeout = {}",
+            HEAD_CHECKOUT.as_millis()
+        ))
+        .map_err(|refused| failed(&refused))?;
+        read(&mut tx).map_err(|refused| failed(&refused))
+    }
+
+    /// [`Self::account_row`], asked for another database's act.
+    fn account_row_asked(&self, account_id: &str) -> Result<Option<String>> {
+        self.asked(account_id, |tx| {
+            Ok(tx
+                .query_opt(
+                    "SELECT partition FROM book_account WHERE account_id = $1",
+                    &[&account_id],
+                )?
+                .map(|row| row.get(0)))
+        })
+    }
+
+    /// Whether this database holds a close of `account_id` toward
+    /// `partition` that no database of the book holds the open of: the
+    /// account is between that close and its open. A close is an entry of
+    /// the account-moved kind, read by what it carries -- never told by
+    /// its key's shape, which a caller's command kept before such keys
+    /// were refused may have (the second review of #149, 2026-11-24).
+    fn closed_unopened(&self, account_id: &str, partition: &str) -> Result<bool> {
+        let rows = self.asked(account_id, |tx| {
+            tx.query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1 AND kind = $2"
+                ),
+                &[&account_id, &crate::journal::ACCOUNT_MOVED],
+            )
+        })?;
+        let mut closes = Vec::new();
+        for row in &rows {
+            let entry = entry_of(row)?;
+            if crate::journal::closes(&entry).as_deref() != Some(partition) {
+                continue;
+            }
+            if let Some(moved) = crate::journal::moved_of(&entry) {
+                closes.push((moved.from_partition, moved.closing_sequence));
+            }
+        }
+        if closes.is_empty() {
+            return Ok(false);
+        }
+        let Some(linked) = self.databases.get() else {
+            return Ok(false);
+        };
+        let databases: Vec<Arc<PostgresStore>> =
+            linked.iter().filter_map(std::sync::Weak::upgrade).collect();
+        for (from, closing) in closes {
+            let key = crate::moves::open_key(account_id, &from, closing);
+            let mut opened = false;
+            for database in &databases {
+                opened |= database.asked(account_id, |tx| {
+                    Ok(tx
+                        .query_opt(
+                            "SELECT 1 FROM book_entry
+                              WHERE account_id = $1 AND idempotency_key = $2 AND kind = $3",
+                            &[&account_id, &key, &crate::journal::ACCOUNT_MOVED],
+                        )?
+                        .is_some())
+                })?;
+            }
+            if !opened {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn place(&self, account_id: &str, partition: &str) {
@@ -2046,14 +2246,32 @@ impl PostgresStore {
         } = &pending.command;
         // Its account's partition read again under the partition's lock
         // (section 6.3): an account found in another is acted on there.
-        let now: String = tx
+        let here: Option<String> = tx
             .query_opt(
                 "SELECT partition FROM book_account WHERE account_id = $1",
                 &[account_id],
             )
             .map_err(unavailable)?
-            .map(|row| row.get(0))
-            .unwrap_or_else(|| first_partition_of(account_id).to_string());
+            .map(|row| row.get(0));
+        // No row here, and the book has other databases (step 3d; section
+        // 6.8; PR CI 45339243058): closed in another toward this partition
+        // and not opened here yet -- this database holds no row of it
+        // until its open copies it -- or in none. Which, the other
+        // databases' rows say, and they are read before a transaction,
+        // never under this partition's lock (the review of 2026-11-24,
+        // findings 1 and 3): so it is answered moved to no partition,
+        // and its act asks them and comes again. Never taken for one in
+        // its first partition unasked.
+        if here.is_none()
+            && !pending.command.nowhere_else
+            && !crate::moves::is_open_key(idempotency_key)
+            && crate::store::is_account(account_id)
+            && self.partitions > 1
+            && self.databases.get().is_some_and(|linked| linked.len() > 1)
+        {
+            return Ok(Err(StoreError::Moved(String::new())));
+        }
+        let now = here.unwrap_or_else(|| first_partition_of(account_id).to_string());
         if now != partition {
             return Ok(Err(StoreError::Moved(now)));
         }
@@ -2280,6 +2498,31 @@ impl PostgresStore {
         }
     }
 
+    /// The partition the record holds `command`'s account in
+    /// ([`Self::found`]), for its act. Closed in another database toward a
+    /// partition this group writes and not opened in it: held but for the
+    /// open, as an account between its close and its open within one
+    /// database is (section 6.8). In no database's row: noted on the
+    /// command, so its batch takes it for one in its first partition.
+    fn found_for(&self, command: &mut Command) -> Result<String> {
+        match self.found(&command.account_id)? {
+            Found::Opening(to)
+                if self.groups.owns(&to)
+                    && !crate::moves::is_open_key(&command.idempotency_key) =>
+            {
+                Err(StoreError::Held(format!(
+                    "account {} is moving to {to}: ask again in a moment",
+                    command.account_id
+                )))
+            }
+            Found::Nowhere(first) => {
+                command.nowhere_else = true;
+                Ok(first)
+            }
+            Found::Here(now) | Found::Elsewhere(now) | Found::Opening(now) => Ok(now),
+        }
+    }
+
     /// One try of [`Store::act`].
     fn act_once(
         &self,
@@ -2295,12 +2538,13 @@ impl PostgresStore {
         if self.fence.epoch() == 0 {
             self.adopt_epoch(false)?;
         }
-        let command = Command {
+        let mut command = Command {
             account_id: account_id.to_string(),
             message_id: message_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             request: request.to_vec(),
             shard: shard.cloned(),
+            nowhere_else: false,
         };
         // An account never placed, with several partitions: placed by its
         // owner label first, never by its ID instead (step 3d; ruled
@@ -2326,7 +2570,7 @@ impl PostgresStore {
             if !self.groups.owns(&partition) {
                 // The guess read again from the record before the act is
                 // handed on: the account may have moved to this group's.
-                let found = self.found(account_id)?;
+                let found = self.found_for(&mut command)?;
                 if found != partition {
                     self.place(account_id, &found);
                     partition = found;
@@ -2348,6 +2592,13 @@ impl PostgresStore {
                     self.batch(&partition, batch, decider)
                 });
             match acted {
+                // No row of it here: where the other databases hold it,
+                // read outside its batch's transaction.
+                Err(StoreError::Moved(now)) if now.is_empty() => {
+                    let found = self.found_for(&mut command)?;
+                    self.place(account_id, &found);
+                    partition = found;
+                }
                 Err(StoreError::Moved(now)) => {
                     self.place(account_id, &now);
                     partition = now;

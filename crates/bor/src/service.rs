@@ -648,6 +648,16 @@ pub(crate) fn command_store(
     reply_type: &str,
     decide: &Deciding<'_>,
 ) -> Result<(String, Vec<u8>), StoreError> {
+    // A move's close and its open are the book's own acts, kept by their
+    // own keys; the open is the one act an account between the two takes
+    // (section 6.8). No caller's command is kept under a key of either
+    // shape (the reviews of #149, 2026-11-24).
+    if crate::moves::is_move_key(idempotency_key) {
+        return Err(StoreError::Malformed {
+            fields: vec!["idempotency_key".into()],
+            words: "idempotency_key begins account-move: or account-open:, which the book keeps for an account's move: choose another".into(),
+        });
+    }
     ctx.control_sequence = store
         .heads()?
         .get(crate::store::CONTROL_PARTITION)

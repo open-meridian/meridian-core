@@ -6956,6 +6956,8 @@ struct TwoDatabases {
     zero: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
     one: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
     mover: meridian_bor::partition_moves::Mover,
+    /// The members' broker: how many writes were handed on.
+    broker: Arc<GroupsBroker>,
     // Last, so the schemas are dropped after the stores over them.
     urls: Vec<Scratch>,
 }
@@ -7034,6 +7036,7 @@ fn databases(count: usize, interval: Option<u64>) -> TwoDatabases {
         zero,
         one,
         mover,
+        broker,
     }
 }
 
@@ -9208,6 +9211,7 @@ async fn m12_a_write_held_between_two_databases_is_answered_before_its_callers_d
         zero,
         one,
         mover,
+        broker: _broker,
     } = h;
     let moving = {
         let partition = partition.clone();
@@ -9663,4 +9667,682 @@ async fn a_command_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher
         "{refused}"
     );
     blocking(move || drop((one, two, three, store)));
+}
+
+// ---- A write between a cross-database move's close and its open ----------
+
+/// One write to `account` through `bus`, its caller waiting `within`.
+async fn write_within(
+    bus: &Bus,
+    account: &str,
+    reason: &str,
+    within: std::time::Duration,
+) -> Result<(), String> {
+    let request = SetAccountAttributeRequest {
+        account_id: account.to_string(),
+        attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+        reason: reason.into(),
+    };
+    let stamp = Stamp {
+        acting_for_subject: PERSON.to_string(),
+        account_scope: None,
+        ..Default::default()
+    };
+    bus.call_stamped(
+        SET_ACCOUNT_ATTRIBUTE,
+        "meridian.v1.SetAccountAttributeRequest",
+        request.encode_to_vec(),
+        None,
+        Some(within),
+        &stamp,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|failed| failed.to_string())
+}
+
+/// An account closed in group 1's database toward a partition of group 0's
+/// in another, its open not made: asked of group 0's member with nothing
+/// handed on, so the store's own answer is read. `looked` has group 0's
+/// member find the account where it was before the close, as a member
+/// that pre-routed one of its writes has.
+async fn held_between_two_databases(tag: &str, looked: bool) {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<Scratch> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    let (zero, one) = blocking(|| (spread(0), spread(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("{tag}-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    let from = blocking(|| one.place_first(&account, &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 0)
+        .unwrap();
+    let bus = |name: &str, store: Arc<meridian_bor::spread::Spread>| {
+        let bus = Arc::new(Bus::single(
+            name,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), store, bus.clock());
+        resolving_equities(&bus);
+        bus
+    };
+    let (bus_zero, bus_one) = (bus("held-0", zero.clone()), bus("held-1", one.clone()));
+    open(&bus_one, &account, &unique("INS-HELD")).await;
+    if looked {
+        assert_eq!(
+            blocking(|| zero.writer_group_of(&account)),
+            Some(1),
+            "found in {from}, group 1's, before its move"
+        );
+    }
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    // Closed by group 1; its open, group 0's, not asked yet.
+    let closed = send(
+        &bus_one,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    assert!(closed.is_err(), "the open is the new partition's group's");
+    // Never opened within its caller's wait: held that long, then answered
+    // "ask again" as a held write is -- never another group's, never
+    // "found in another partition".
+    let began = std::time::Instant::now();
+    let refused = write_within(
+        &bus_zero,
+        &account,
+        "held past its caller's wait",
+        std::time::Duration::from_millis(1_500),
+    )
+    .await
+    .expect_err("nothing is written before the open");
+    assert!(
+        refused.contains("is moving to"),
+        "held for its move's open, not refused otherwise: {refused}"
+    );
+    assert!(
+        began.elapsed() >= std::time::Duration::from_millis(700),
+        "it waited for the open inside the hold: {:?}",
+        began.elapsed()
+    );
+    // Opened meanwhile: the write waits for it and commits after it.
+    let writing = {
+        let (bus, account) = (bus_zero.clone(), account.clone());
+        tokio::spawn(async move {
+            write_within(
+                &bus,
+                &account,
+                "written after the open",
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    send(
+        &bus_zero,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .expect("opened by group 0");
+    writing
+        .await
+        .unwrap()
+        .expect("a write held by the move is written once it opens");
+    let journal = blocking(|| zero.journal(&account)).unwrap();
+    assert_eq!(
+        journal.last().map(|entry| entry.partition.as_str()),
+        Some(to.as_str()),
+        "numbered in its new partition, after the open"
+    );
+    blocking(move || drop((zero, one, bus_zero, bus_one)));
+}
+
+/// Section 6.8, across databases (PR CI 45339243058, ha: order 1005813,
+/// sent between ACC-DRIVE-01's close in database 0 and its open in
+/// database 1, was refused in 93 ms): a write to an account closed toward
+/// this member's database and not yet opened is held for the open, where
+/// this member last found the account in the partition it left. Its new
+/// database holds no row of it until the open, and the store read "the
+/// record" from the other database's store's memory of where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_between_a_cross_database_close_and_open_is_held_by_a_member_that_found_it_before()
+{
+    held_between_two_databases("ACC-HELD-LOOKED", true).await;
+}
+
+/// The same, by a member that never found the account before its move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_between_a_cross_database_close_and_open_is_held_by_a_member_that_never_found_it() {
+    held_between_two_databases("ACC-HELD-FRESH", false).await;
+}
+
+/// The same through two members that hand writes on (PR CI 45339243058):
+/// asked of either group's member between the close and the open, a write
+/// is answered once the account opens, handed on at most once each -- never
+/// passed back and forth between the groups, each by "the record", until
+/// the hand-ons' margins spent its caller's wait ("the caller's deadline
+/// left no time to hand it on").
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_between_a_cross_database_close_and_open_is_answered_and_never_handed_back_and_forth(
+) {
+    let h = blocking(two_databases);
+    let (from, to) = (partition_of(1, 2), partition_of(0, 2));
+    let account = accounts_in("ACC-HANDED", &from, 1, &h.one.0, h.one.1.as_ref())
+        .await
+        .remove(0);
+    // Group 0's member found it where it was, as one that pre-routed a
+    // write of it has.
+    assert_eq!(blocking(|| h.zero.1.writer_group_of(&account)), Some(1));
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    // Closed by group 1, and stopped before its open is handed to group 0.
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &h.one.0,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(stopped.is_err(), "stopped between its close and its open");
+    let handed = h.broker.handed.load(Ordering::SeqCst);
+    let write = |bus: &Arc<Bus>, reason: &'static str| {
+        let (bus, account) = (bus.clone(), account.clone());
+        tokio::spawn(async move {
+            write_within(&bus, &account, reason, std::time::Duration::from_secs(5)).await
+        })
+    };
+    let (by_zero, by_one) = (
+        write(&h.zero.0, "asked of its new group"),
+        write(&h.one.0, "asked of the group it left"),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    send(
+        &h.zero.0,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .expect("opened by group 0");
+    by_zero
+        .await
+        .unwrap()
+        .expect("asked of its new group's member: written once it opens");
+    by_one
+        .await
+        .unwrap()
+        .expect("asked of the member of the group it left: written once it opens");
+    let handed = h.broker.handed.load(Ordering::SeqCst) - handed;
+    assert_eq!(
+        handed, 1,
+        "the write asked of the group it left, handed on by the record once"
+    );
+    blocking(move || drop(h));
+}
+
+/// The members of `h` as (group, bus, spread), by group.
+fn member_of(h: &TwoDatabases, group: u32) -> (Arc<Bus>, Arc<meridian_bor::spread::Spread>) {
+    if group == 0 {
+        (h.zero.0.clone(), h.zero.1.clone())
+    } else {
+        (h.one.0.clone(), h.one.1.clone())
+    }
+}
+
+/// R1: a move whose target is the first partition, its source database's
+/// row unreadable from the target's member between the close and the open
+/// (any error: unreachable, pool timeout, query failure). Section 6.8: the
+/// write is held (or refused "ask again"), never committed before the open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_toward_the_first_partition_is_never_decided_before_its_open_while_its_source_database_is_unreadable(
+) {
+    let h = blocking(two_databases);
+    let to = meridian_bor::store::FIRST_PARTITION.to_string();
+    let to_group = meridian_changes::groups::owner(&to, 2);
+    let from_group = 1 - to_group;
+    let (from_bus, from_spread) = member_of(&h, from_group);
+    let (_to_bus, to_spread) = member_of(&h, to_group);
+    let from = partition_of(from_group, 0);
+    let account = accounts_in(
+        "ACC-REVIEW-FIRST",
+        &from,
+        1,
+        &from_bus,
+        from_spread.as_ref(),
+    )
+    .await
+    .remove(0);
+    // The target's member found it before its move, as one that pre-routed
+    // a write of it has.
+    assert_eq!(
+        blocking(|| to_spread.writer_group_of(&account)),
+        Some(from_group)
+    );
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "review first partition".into(),
+    };
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &from_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(stopped.is_err(), "stopped between its close and its open");
+    // The source database's row cannot be read.
+    let source = from_spread.of(&from) as usize;
+    let hide = |hidden: bool| {
+        let url = h.urls[source].to_string();
+        blocking(move || {
+            let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let sql = if hidden {
+                "ALTER TABLE book_account RENAME TO book_account_review"
+            } else {
+                "ALTER TABLE book_account_review RENAME TO book_account"
+            };
+            admin.batch_execute(sql).unwrap();
+        })
+    };
+    hide(true);
+    // Asked of the target's member's store directly (the bus would hand it
+    // to the source's member by its memory): decided means it was taken
+    // for an account in its first partition, between the close and open.
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let acted = {
+        let (spread, account, reached) = (to_spread.clone(), account.clone(), reached.clone());
+        blocking(move || {
+            spread.act(&account, "", "review-k", b"review", &mut |_, _| {
+                reached.store(true, Ordering::SeqCst);
+                Err(meridian_bor::store::StoreError::Invalid(
+                    "review: decided".into(),
+                ))
+            })
+        })
+    };
+    let direct = {
+        let (spread, account, reached) = (to_spread.clone(), account.clone(), reached.clone());
+        blocking(move || {
+            let store = spread
+                .database(spread.of(meridian_bor::store::FIRST_PARTITION))
+                .clone();
+            let acted = store.act(&account, "", "review-k2", b"review", &mut |_, _| {
+                reached.store(true, Ordering::SeqCst);
+                Err(meridian_bor::store::StoreError::Invalid(
+                    "review: decided".into(),
+                ))
+            });
+            acted.err()
+        })
+    };
+    hide(false);
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "never decided between the close and the open: {:?}, {direct:?}",
+        acted.as_ref().err()
+    );
+    // Refused to be asked again, by both: nothing is known of it until its
+    // source database answers.
+    for refused in [acted.err(), direct] {
+        let refused = refused.expect("refused").to_string();
+        assert!(refused.contains("ask again"), "{refused}");
+    }
+    blocking(move || drop(h));
+}
+
+/// R2: an account moved between databases whose source row was not let go
+/// (its settle failed after the open), then moved back: between the move
+/// back's close and its open, a write asked of the member of the group it
+/// goes back to is held for the open -- never handed back and forth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_after_a_move_back_over_a_row_not_let_go_is_held_and_never_handed_back_and_forth() {
+    let h = blocking(two_databases);
+    let (home, away) = (partition_of(0, 1), partition_of(1, 1));
+    let (zero_bus, zero_spread) = member_of(&h, 0);
+    let (one_bus, _one_spread) = member_of(&h, 1);
+    let account = accounts_in("ACC-REVIEW-BACK", &home, 1, &zero_bus, zero_spread.as_ref())
+        .await
+        .remove(0);
+    let there = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: away.clone(),
+        reason: "review there".into(),
+    };
+    send(
+        &zero_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &there,
+        Some(PERSON),
+    )
+    .await
+    .expect("moved there and opened");
+    // Its source database's row not let go: as where settle_move failed
+    // after the open (the database out of reach just then).
+    let source = zero_spread.of(&home) as usize;
+    {
+        let (url, account, away) = (h.urls[source].to_string(), account.clone(), away.clone());
+        blocking(move || {
+            let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            admin
+                .execute(
+                    "INSERT INTO book_account (account_id, partition) VALUES ($1, $2)
+                     ON CONFLICT (account_id) DO UPDATE SET partition = EXCLUDED.partition",
+                    &[&account, &away],
+                )
+                .unwrap();
+        });
+    }
+    let back = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: home.clone(),
+        reason: "review back".into(),
+    };
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &one_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &back,
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(
+        stopped.is_err(),
+        "stopped between its close and its open: {stopped:?}"
+    );
+    let handed = h.broker.handed.load(Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let refused = write_within(
+        &zero_bus,
+        &account,
+        "review held past its caller's wait",
+        std::time::Duration::from_millis(1_500),
+    )
+    .await;
+    let took = began.elapsed();
+    let handed = h.broker.handed.load(Ordering::SeqCst) - handed;
+    let refused = refused.expect_err("nothing is written before the open");
+    assert!(
+        refused.contains("is moving to"),
+        "held for its move's open, not refused otherwise (handed on {handed} times, {took:?}): {refused}"
+    );
+    assert!(handed <= 2, "handed on {handed} times");
+    blocking(move || drop(h));
+}
+
+/// The review's third finding: the other database's row is read before the
+/// batch's transaction, never under the partition's lock. With the source
+/// database's answer hung, a write to another account of the target
+/// partition is decided at once, and the moving account's is refused to
+/// be asked again within the read's bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_database_that_does_not_answer_holds_no_other_accounts_write_of_the_partition() {
+    let h = blocking(two_databases);
+    let (from, to) = (partition_of(0, 2), partition_of(1, 2));
+    let (from_bus, from_spread) = member_of(&h, 0);
+    let (to_bus, to_spread) = member_of(&h, 1);
+    let account = accounts_in("ACC-REVIEW-HUNG", &from, 1, &from_bus, from_spread.as_ref())
+        .await
+        .remove(0);
+    let bystander = accounts_in("ACC-REVIEW-BY", &to, 1, &to_bus, to_spread.as_ref())
+        .await
+        .remove(0);
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "review hung".into(),
+    };
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &from_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(stopped.is_err(), "stopped between its close and its open");
+    // The source database's rows of accounts answer no read: locked.
+    let source = from_spread.of(&from) as usize;
+    let url = h.urls[source].to_string();
+    // Held on a thread of its own, which lets it go and drops its client
+    // there when this test ends, however it ends.
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+    let locker = std::thread::spawn(move || {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute("BEGIN; LOCK TABLE book_account IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let _ = locked.send(());
+        let _ = released.recv();
+        let _ = admin.batch_execute("ROLLBACK");
+    });
+    blocking(|| is_locked.recv()).expect("the source's accounts locked");
+    let store = blocking(|| to_spread.database(to_spread.of(&to)).clone());
+    store.learn_placement(&account, &to);
+    let act = |account: String, key: &'static str| {
+        let store = store.clone();
+        let (said, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            let reached = AtomicU64::new(0);
+            let acted = store.act(&account, "", key, key.as_bytes(), &mut |_, _| {
+                reached.store(1, Ordering::SeqCst);
+                Err(meridian_bor::store::StoreError::Invalid(
+                    "review: decided".into(),
+                ))
+            });
+            let _ = said.send((
+                reached.load(Ordering::SeqCst) == 1,
+                acted.err().map(|refused| refused.to_string()),
+                began.elapsed(),
+            ));
+        });
+        heard
+    };
+    let moving = act(account.clone(), "review-hung");
+    // Its read of the source database under way.
+    blocking(|| std::thread::sleep(std::time::Duration::from_millis(300)));
+    let other = act(bystander.clone(), "review-by");
+    let within = std::time::Duration::from_secs(2);
+    let other = blocking(|| other.recv_timeout(within));
+    let moving = blocking(|| moving.recv_timeout(std::time::Duration::from_secs(4)));
+    drop(release);
+    blocking(|| locker.join()).expect("the lock let go");
+    let (reached, _, took) =
+        other.expect("another account's write of the partition waits for no other database");
+    assert!(
+        reached && took < within,
+        "decided at once: {reached}, {took:?}"
+    );
+    let (reached, refused, took) =
+        moving.expect("refused within the read's bound, never waited out");
+    let refused = refused.unwrap_or_default();
+    assert!(
+        !reached && refused.contains("ask again"),
+        "never decided, and asked again ({took:?}): {refused}"
+    );
+    blocking(move || drop(h));
+}
+
+/// The review's fourth finding: a move's open is the book's own act, kept
+/// by its own key, and the one act an account between its close and its
+/// open takes. A caller's command under a key of that shape is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_command_keyed_as_a_moves_open_is_refused() {
+    let (bus, _) = wired();
+    let account = unique("ACC");
+    let mut request = opening(&account, "INS-AAPL");
+    request.idempotency_key = format!("account-open:{account}:P0:1");
+    let refused = send(&bus, RECORD_OPENING_BALANCE, &request, Some(PERSON))
+        .await
+        .expect_err("a key the book keeps for its own");
+    assert!(refused.contains("idempotency_key"), "{refused}");
+}
+
+/// An ordinary caller's command kept under a key shaped as a move's close
+/// (account-move:...): read by the new closed_unopened as a close never
+/// opened. With a row not let go and a move back between its close and its
+/// open, a write must still be held for the open ("is moving to").
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn r149b_a_callers_key_shaped_as_a_close_does_not_steer_a_held_write() {
+    let h = blocking(two_databases);
+    let (home, away) = (partition_of(0, 1), partition_of(1, 1));
+    let (zero_bus, zero_spread) = member_of(&h, 0);
+    let (one_bus, _one_spread) = member_of(&h, 1);
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-R149B-FORGED-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == home)
+        .unwrap();
+    blocking(|| zero_spread.place_first(&account, &account)).unwrap();
+    // Refused of a caller now; were one kept, it would not be read as a
+    // close (its kind is not a move's).
+    let mut forged = opening(&account, "INS-AAPL");
+    forged.idempotency_key = format!("account-move:{account}:{home}:{away}:forged");
+    send(&zero_bus, RECORD_OPENING_BALANCE, &forged, Some(PERSON))
+        .await
+        .expect_err("a key the book keeps for its own");
+    open(&zero_bus, &account, "INS-AAPL").await;
+    let there = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: away.clone(),
+        reason: "r149b there".into(),
+    };
+    send(
+        &zero_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &there,
+        Some(PERSON),
+    )
+    .await
+    .expect("moved there and opened");
+    let source = zero_spread.of(&home) as usize;
+    {
+        let (url, account, away) = (h.urls[source].to_string(), account.clone(), away.clone());
+        blocking(move || {
+            let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            admin
+                .execute(
+                    "INSERT INTO book_account (account_id, partition) VALUES ($1, $2)
+                     ON CONFLICT (account_id) DO UPDATE SET partition = EXCLUDED.partition",
+                    &[&account, &away],
+                )
+                .unwrap();
+        });
+    }
+    let back = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: home.clone(),
+        reason: "r149b back".into(),
+    };
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &one_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &back,
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(
+        stopped.is_err(),
+        "stopped between its close and its open: {stopped:?}"
+    );
+    let handed = h.broker.handed.load(Ordering::SeqCst);
+    let began = std::time::Instant::now();
+    let refused = write_within(
+        &zero_bus,
+        &account,
+        "r149b held past its caller's wait",
+        std::time::Duration::from_millis(1_500),
+    )
+    .await;
+    let took = began.elapsed();
+    let handed = h.broker.handed.load(Ordering::SeqCst) - handed;
+    let refused = refused.expect_err("nothing is written before the open");
+    assert!(
+        refused.contains("is moving to"),
+        "held for its move's open (handed on {handed} times, {took:?}): {refused}"
+    );
+    assert!(handed <= 2, "handed on {handed} times");
+    blocking(move || drop(h));
+}
+
+/// A move's close is the book's own act too, kept by its own key: a
+/// caller's command under a key of that shape is refused, as one shaped
+/// as the open is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_command_keyed_as_a_moves_close_is_refused() {
+    let (bus, _) = wired();
+    let account = unique("ACC");
+    let mut request = opening(&account, "INS-AAPL");
+    request.idempotency_key = format!("account-move:{account}:P0:P1");
+    let refused = send(&bus, RECORD_OPENING_BALANCE, &request, Some(PERSON))
+        .await
+        .expect_err("a key the book keeps for its own");
+    assert!(refused.contains("idempotency_key"), "{refused}");
 }

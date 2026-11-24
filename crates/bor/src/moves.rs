@@ -73,6 +73,12 @@ pub fn is_open_key(key: &str) -> bool {
     key.starts_with("account-open:")
 }
 
+/// Whether `key` is shaped as a move's close or its open: the book's own
+/// keys, which no caller's command is kept under.
+pub fn is_move_key(key: &str) -> bool {
+    key.starts_with("account-move:") || is_open_key(key)
+}
+
 /// Where an account's chain stands, read from its journal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Standing {
