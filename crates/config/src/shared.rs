@@ -111,14 +111,14 @@ impl Store for Shared {
         said
     }
 
-    fn put_user_group(&self, group: &UserGroup) -> Result<()> {
-        let said = self.inner.put_user_group(group);
+    fn put_user_group(&self, group: &UserGroup, author: &Author, at_ns: i64) -> Result<()> {
+        let said = self.inner.put_user_group(group, author, at_ns);
         self.changed();
         said
     }
 
-    fn put_account_group(&self, group: &AccountGroup) -> Result<()> {
-        let said = self.inner.put_account_group(group);
+    fn put_account_group(&self, group: &AccountGroup, author: &Author, at_ns: i64) -> Result<()> {
+        let said = self.inner.put_account_group(group, author, at_ns);
         self.changed();
         said
     }
@@ -188,6 +188,14 @@ impl Store for Shared {
             .install_claimed_admin(group, permissions, author, at_ns);
         self.changed();
         said
+    }
+
+    fn group_changes(
+        &self,
+        group: crate::groups::GroupKind,
+        group_id: &str,
+    ) -> Result<Vec<crate::groups::GroupChangeRecord>> {
+        self.inner.group_changes(group, group_id)
     }
 
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {

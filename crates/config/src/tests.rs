@@ -3515,6 +3515,107 @@ async fn every_grant_change_is_its_own_record_naming_who_and_when() {
     assert!(records[3].was.contains(&people.user_group_id) && records[3].became.is_empty());
 }
 
+/// Decision 47 (roadmap v31a item 13, decisions/031): each user-group and
+/// account-group change is its own record -- defined or changed, what it was
+/// and what it became, who, through which delegation, and when -- and saving
+/// one unchanged records nothing.
+#[tokio::test]
+async fn every_user_group_and_account_group_change_is_its_own_record() {
+    use crate::groups::{GroupChangeKind::*, GroupKind};
+    let h = harness("dashboard-1");
+    let traders = user_group(&h).await;
+    let mut renamed = traders.clone();
+    renamed.name = "Desk".into();
+    renamed.logins = vec!["local|grace".into()];
+    // Through a delegation: the record names it.
+    let stamp = meridian_bus::Stamp {
+        acting_for_subject: ADA.into(),
+        acting_through_delegation: "DLG-7".into(),
+        acting_through_client: "Claude".into(),
+        ..meridian_bus::Stamp::default()
+    };
+    for _ in 0..2 {
+        // The second time, saved unchanged: nothing more to record.
+        h.bus
+            .call_stamped(
+                DEFINE_USER_GROUP,
+                "meridian.v1.DefineUserGroupRequest",
+                DefineUserGroupRequest {
+                    user_group: Some(renamed.clone()),
+                }
+                .encode_to_vec(),
+                None,
+                None,
+                &stamp,
+            )
+            .await
+            .unwrap();
+    }
+    let records = h
+        .store
+        .group_changes(GroupKind::User, &traders.user_group_id)
+        .unwrap();
+    let kinds: Vec<_> = records.iter().map(|record| record.kind).collect();
+    assert_eq!(kinds, [Defined, Changed]);
+    assert!(records.iter().all(|record| record.by == ADA));
+    assert!(records
+        .iter()
+        .all(|record| record.at_ns == 1_790_380_800_000_000_000 && !record.backfilled));
+    assert_eq!(records[0].delegation, "");
+    assert_eq!(records[1].delegation, "DLG-7");
+    assert_eq!(records[0].was, "");
+    assert_eq!(
+        records[0].became,
+        "\"Traders\": directory groups trading-desk; logins none"
+    );
+    assert_eq!(records[1].was, records[0].became);
+    assert_eq!(
+        records[1].became,
+        "\"Desk\": directory groups trading-desk; logins local|grace"
+    );
+
+    let growth = account(&h, "Growth").await;
+    let value = account(&h, "Value").await;
+    let group = account_group(&h, &[&growth]).await;
+    let mut widened = group.clone();
+    widened.account_ids.push(value.account_id.clone());
+    let _: AccountGroup = ask(
+        &h,
+        DEFINE_ACCOUNT_GROUP,
+        "meridian.v1.DefineAccountGroupRequest",
+        DefineAccountGroupRequest {
+            account_group: Some(widened),
+        },
+    )
+    .await
+    .unwrap();
+    let records = h
+        .store
+        .group_changes(GroupKind::Account, &group.account_group_id)
+        .unwrap();
+    let kinds: Vec<_> = records.iter().map(|record| record.kind).collect();
+    assert_eq!(kinds, [Defined, Changed]);
+    assert!(records.iter().all(|record| record.by == ADA));
+    assert_eq!(
+        records[0].became,
+        format!("\"Growth\": accounts {}", growth.account_id)
+    );
+    assert_eq!(
+        records[1].became,
+        format!(
+            "\"Growth\": accounts {}, {}",
+            growth.account_id, value.account_id
+        )
+    );
+    assert!(
+        h.store
+            .group_changes(GroupKind::User, &group.account_group_id)
+            .unwrap()
+            .is_empty(),
+        "an account group's records are not a user group's"
+    );
+}
+
 /// Contract v16 (W6.25, W4.7, W6.11): a hold a deployment admin sets reaches
 /// the sidecar of each instance it covers on its configuration, the records
 /// carry it, and a window setting below it is refused naming the setting.

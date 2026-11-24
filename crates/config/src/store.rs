@@ -787,8 +787,20 @@ pub trait Store: Send + Sync {
 
     /// Insert or replace, by identifier.
     fn put_account(&self, account: &AccountRecord) -> Result<()>;
-    fn put_user_group(&self, group: &UserGroup) -> Result<()>;
-    fn put_account_group(&self, group: &AccountGroup) -> Result<()>;
+    /// Insert or replace a user group, and record the change as its own
+    /// record in the same step (decision 47, decisions/031): defined or
+    /// changed, what it was and what it became, by `author` at `at_ns`.
+    /// Nothing is recorded when nothing changed.
+    fn put_user_group(&self, group: &UserGroup, author: &Author, at_ns: i64) -> Result<()>;
+    /// As [`Store::put_user_group`], for an account group.
+    fn put_account_group(&self, group: &AccountGroup, author: &Author, at_ns: i64) -> Result<()>;
+    /// Every change recorded for one user group or account group, its
+    /// backfilled record included, in the order recorded.
+    fn group_changes(
+        &self,
+        group: crate::groups::GroupKind,
+        group_id: &str,
+    ) -> Result<Vec<crate::groups::GroupChangeRecord>>;
     /// Insert or replace an access group, and record the change as its own
     /// record, in one step (W6.7, decisions/031): defined or changed, what it
     /// was and what it became, by `author` at `at_ns`. Nothing is recorded

@@ -113,6 +113,63 @@ fn a_store_settles_once_and_keeps_each_step() {
     assert!(store.get(&kept.prepared_call_id).unwrap().is_none());
 }
 
+/// Review-core-3d F5: a settle is dated when it settles, by the clock read
+/// at the settle, not by the time its caller read before the act. A slow
+/// act -- a plugin's, minutes long -- is not dated back past migration 17's
+/// skew allowance (five minutes), which the database refuses.
+#[tokio::test]
+async fn a_settle_is_dated_when_it_settles_not_when_its_act_began() {
+    let app = crate::tickets::tests::app();
+    let kept = Kept {
+        prepared_call_id: "PC-01JAC2Q4M7K000000000000001".into(),
+        tool_name: "dashboard__set_hold".into(),
+        preparer_subject: "local|ada".into(),
+        state: PreparedCallState::Prepared as i32,
+        prepared_at_ns: 1,
+        ..Kept::default()
+    };
+    let prepared = Step {
+        prepared_call_id: kept.prepared_call_id.clone(),
+        kind: StepKind::Prepared,
+        by_subject: "local|ada".into(),
+        through_delegation: String::new(),
+        client_name: String::new(),
+        at_ns: 1,
+        note: String::new(),
+    };
+    app.prepared.store().insert(&kept, &prepared, &[]).unwrap();
+    let before = app.clock.now_ns();
+    let began = before - 6 * 60 * 1_000_000_000;
+    let ada = person_caller("local|ada", "Ada", &[]);
+    assert!(app
+        .prepared
+        .settle(
+            &app,
+            &kept,
+            PreparedCallState::Made,
+            StepKind::Made,
+            &ada,
+            "",
+            began
+        )
+        .await
+        .unwrap());
+    let settled = app
+        .prepared
+        .get(&kept.prepared_call_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .settled_at_ns
+        .unwrap();
+    assert!(
+        settled >= before,
+        "settled at {settled}: the act began at {began}, the settle at or after {before}"
+    );
+    let steps = app.prepared.steps(&kept.prepared_call_id).await.unwrap();
+    assert_eq!(steps.last().map(|step| step.at_ns), Some(settled));
+}
+
 /// The prepared change's pages and the Agents tab, each against the tool
 /// that reaches it or its ruled exception (the plan's "parity check", grown
 /// at v20): nothing lands page-only.

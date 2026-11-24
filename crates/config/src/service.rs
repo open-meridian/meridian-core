@@ -2754,7 +2754,9 @@ pub fn serve_with(
             if group.user_group_id.is_empty() {
                 group.user_group_id = ids::user_group(cx.clock.now_ns());
             }
-            cx.store.put_user_group(&group).map_err(|f| f.to_string())?;
+            cx.store
+                .put_user_group(&group, &author(envelope), cx.clock.now_ns())
+                .map_err(|f| f.to_string())?;
             tracing::info!(
                 user_group = group.user_group_id,
                 by = subject(envelope),
@@ -2780,7 +2782,7 @@ pub fn serve_with(
                 group.account_group_id = ids::account_group(cx.clock.now_ns());
             }
             cx.store
-                .put_account_group(&group)
+                .put_account_group(&group, &author(envelope), cx.clock.now_ns())
                 .map_err(|f| f.to_string())?;
             tracing::info!(
                 account_group = group.account_group_id,

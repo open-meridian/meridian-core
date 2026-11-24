@@ -1285,3 +1285,1564 @@ fn a_place_this_release_moved_is_never_read_again_by_the_release_before() {
     assert_eq!(store.cursor("local|ada", "DLG-2").unwrap(), 5);
     assert!(read_before(&mut raw, "DLG-2").is_empty());
 }
+
+// ── Each delegation change, its own record (decision 47) ───────────────────
+
+/// Roadmap v31a item 13 (decisions/031): made, renewed -- the dates and the
+/// covers it replaced kept on the renewal's record, not lost --, revoked one
+/// by one and all of a person's, and removed by the sweep: each its own
+/// record, naming who and when, and the records outlive the delegation.
+#[test]
+fn every_delegation_change_is_its_own_record_and_outlives_the_sweep() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("delegation_changes");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let narrowed = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        account_groups: ["AG-1".to_string()].into(),
+        ..Covers::default()
+    };
+    let made = store
+        .grant(&granting("mdc_a", narrowed, T0 + 30 * DAY_NS), T0)
+        .unwrap();
+    let later = T0 + 20 * DAY_NS;
+    store
+        .grant(
+            &granting("mdc_a", Covers::everything(), later + 90 * DAY_NS),
+            later,
+        )
+        .unwrap();
+    assert!(store
+        .revoke(&made.id, "local|root", "left the desk", later + 1)
+        .unwrap());
+    assert!(
+        !store
+            .revoke(&made.id, "local|root", "again", later + 2)
+            .unwrap(),
+        "revoked already: nothing changed, nothing recorded"
+    );
+    let other = store
+        .grant(
+            &granting("mdc_b", Covers::everything(), later + DAY_NS),
+            later,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .revoke_person("local|ada", "local|root", "left", later + 3)
+            .unwrap(),
+        1
+    );
+
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.at_ns, r.backfilled))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", T0, false),
+            (ChangeKind::Renewed, "local|ada", later, false),
+            (ChangeKind::Revoked, "local|root", later + 1, false),
+        ]
+    );
+    assert!(records
+        .iter()
+        .all(|r| r.subject == "local|ada" && r.client_id == "mdc_a"));
+    assert_eq!(records[0].was, "");
+    assert_eq!(
+        records[0].became,
+        "covers deployment admin no; plugins oms-1 oms read; account groups AG-1; \
+         made 2026-09-26T00:00:00Z; renewed 2026-09-26T00:00:00Z; expires 2026-10-26T00:00:00Z"
+    );
+    assert_eq!(
+        records[1].was, records[0].became,
+        "the renewal keeps what it replaced, the dates among it"
+    );
+    assert_eq!(
+        records[1].became,
+        "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+         renewed 2026-10-16T00:00:00Z; expires 2027-01-14T00:00:00Z"
+    );
+    assert_eq!(records[2].was, records[1].became);
+    assert!(
+        records[2]
+            .became
+            .ends_with("; revoked 2026-10-16T00:00:00Z by local|root: left the desk"),
+        "{}",
+        records[2].became
+    );
+    let others = store.changes(&other.id).unwrap();
+    assert_eq!(
+        others.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked]
+    );
+    assert!(others[1].became.ends_with("by local|root: left"));
+
+    store.sweep(later + 2 * DAY_NS + 31 * DAY_NS).unwrap();
+    assert_eq!(count(&url, "dashboard_delegation"), 0);
+    let records = store.changes(&made.id).unwrap();
+    assert_eq!(records.len(), 4, "every record kept after the sweep");
+    assert_eq!(records[3].kind, ChangeKind::Removed);
+    assert_eq!(records[3].by, "");
+    assert_eq!(records[3].was, records[2].became);
+    assert_eq!(records[3].became, "");
+    assert_eq!(records[3].note, delegation::record::REMOVED);
+}
+
+struct At(i64);
+impl meridian_clock::Clock for At {
+    fn now_ns(&self) -> i64 {
+        self.0
+    }
+}
+
+/// Migration 16 (decision 47, decisions/031; review-core-3 2): each
+/// delegation standing before it, revoked or not, is given the records its
+/// row holds the facts of -- made by its person when the row says, renewed
+/// where it was, its tools filled in where they were, revoked by whom the row
+/// says -- each backfilled, valid when the row says and recorded at the
+/// moment the migration ran; given again, nothing more.
+#[test]
+fn delegations_standing_before_their_records_began_keep_the_facts_their_rows_hold() {
+    use delegation::record::{
+        ChangeKind, ACTING_FILLED_BACKFILLED, MADE_BACKFILLED, RENEWED_BACKFILLED,
+        REVOKED_BACKFILLED,
+    };
+    let url = scratch("delegation_backfill");
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(
+        "CREATE TABLE dashboard_schema_migration (
+             version bigint PRIMARY KEY, name text NOT NULL, applied_at_ns bigint NOT NULL)",
+    )
+    .unwrap();
+    for (version, name, sql) in meridian_dashboard::database::migrations()
+        .into_iter()
+        .filter(|(version, _, _)| *version <= 15)
+    {
+        db.batch_execute(sql).unwrap();
+        db.execute(
+            "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
+             VALUES ($1, $2, 1)",
+            &[&version, &name],
+        )
+        .unwrap();
+    }
+    let renewed = T0 + 20 * DAY_NS;
+    db.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_a', 'meridian on mdc_a', '{}', 'meridian-cli', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+         VALUES ('DLG-LIVE', 'local|ada', 'Ada Park', 'mdc_a', true, $1, $2, $3, $1)",
+        &[&T0, &renewed, &(renewed + 90 * DAY_NS)],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns,
+              revoked_at_ns, revoked_by, revoked_why)
+         VALUES ('DLG-GONE', 'local|ada', 'Ada Park', 'mdc_a', true, $1, $1, $2, $1,
+                 $1, 'local|root', 'left')",
+        &[&T0, &(T0 + DAY_NS)],
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_b', 'meridian on mdc_b', '{}', 'meridian-cli', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              covers_plugins, made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns,
+              covers_acting, acting_backfilled_at_ns)
+         VALUES ('DLG-FILLED', 'local|ada', 'Ada Park', 'mdc_b', false,
+                 '{oms-1:oms:write}', $1, $1, $2, $1, '{place_order}', $3)",
+        &[&T0, &(T0 + 30 * DAY_NS), &(T0 + DAY_NS)],
+    )
+    .unwrap();
+
+    let database = Database::connect(&url, 2).unwrap();
+    database.migrate(&At(1_000)).unwrap();
+    database
+        .migrate(&At(2_000))
+        .expect("migrating twice is a no-op");
+    // Given again, directly: each delegation has its records, so nothing.
+    for _ in 0..2 {
+        let mut tx = db.transaction().unwrap();
+        assert_eq!(delegation::backfill_from_rows(&mut tx, 3_000).unwrap(), 0);
+        tx.commit().unwrap();
+    }
+    let store = delegation::InPostgres::on(database);
+    let made = "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+                renewed 2026-09-26T00:00:00Z; expires 2026-09-27T00:00:00Z";
+    let revoked = "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+                   renewed 2026-09-26T00:00:00Z; expires 2026-09-27T00:00:00Z; \
+                   revoked 2026-09-26T00:00:00Z by local|root: left";
+    let renewed_to = "covers everything the person holds; made 2026-09-26T00:00:00Z; \
+                      renewed 2026-10-16T00:00:00Z; expires 2027-01-14T00:00:00Z";
+    let unfilled = "covers deployment admin no; plugins oms-1 oms write; account groups none; \
+                    made 2026-09-26T00:00:00Z; renewed 2026-09-26T00:00:00Z; \
+                    expires 2026-10-26T00:00:00Z";
+    let filled = "covers deployment admin no; plugins oms-1 oms write; account groups none; \
+                  acting place_order; made 2026-09-26T00:00:00Z; \
+                  renewed 2026-09-26T00:00:00Z; expires 2026-10-26T00:00:00Z";
+    for (id, owed) in [
+        (
+            "DLG-LIVE",
+            vec![
+                (ChangeKind::Made, "", "", "local|ada", T0, MADE_BACKFILLED),
+                (
+                    ChangeKind::Renewed,
+                    "",
+                    renewed_to,
+                    "local|ada",
+                    renewed,
+                    RENEWED_BACKFILLED,
+                ),
+            ],
+        ),
+        (
+            "DLG-GONE",
+            vec![
+                (ChangeKind::Made, "", made, "local|ada", T0, MADE_BACKFILLED),
+                (
+                    ChangeKind::Revoked,
+                    made,
+                    revoked,
+                    "local|root",
+                    T0,
+                    REVOKED_BACKFILLED,
+                ),
+            ],
+        ),
+        (
+            "DLG-FILLED",
+            vec![
+                (
+                    ChangeKind::Made,
+                    "",
+                    unfilled,
+                    "local|ada",
+                    T0,
+                    MADE_BACKFILLED,
+                ),
+                (
+                    ChangeKind::ActingFilled,
+                    unfilled,
+                    filled,
+                    "",
+                    T0 + DAY_NS,
+                    ACTING_FILLED_BACKFILLED,
+                ),
+            ],
+        ),
+    ] {
+        let records = store.changes(id).unwrap();
+        let seen: Vec<_> = records
+            .iter()
+            .map(|r| {
+                (
+                    r.kind,
+                    r.was.as_str(),
+                    r.became.as_str(),
+                    r.by.as_str(),
+                    r.valid_at_ns.expect("valid when the row says"),
+                    r.note.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(seen, owed, "{id}");
+        for record in &records {
+            assert!(record.backfilled, "{id}");
+            assert_eq!(record.at_ns, 1_000, "{id}: the migration's own time");
+            assert_eq!(record.subject, "local|ada");
+        }
+    }
+}
+
+/// Review-core-3 1 (decisions/031): the release before keeps serving while
+/// migration 16 runs, and its changes write no record. A delegation it
+/// changed is given a record saying so before the next change is recorded,
+/// and one it made is given the records its row holds the facts of, by the
+/// sweep or at its next change; each record's `was` is the one before's
+/// `became`.
+#[test]
+fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
+    use delegation::record::{ChangeKind, CHANGED_BY_AN_EARLIER_RELEASE};
+    let (url, database) = migrated("earlier_release");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let made = store
+        .grant(
+            &granting("mdc_a", Covers::everything(), T0 + 30 * DAY_NS),
+            T0,
+        )
+        .unwrap();
+    // The release before, as v15 writes: a renewal in place and a
+    // delegation made, neither recorded.
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let renewed = T0 + DAY_NS;
+    raw.execute(
+        "UPDATE dashboard_delegation SET renewed_at_ns = $2, expires_at_ns = $3
+          WHERE delegation_id = $1",
+        &[&made.id, &renewed, &(renewed + 30 * DAY_NS)],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+         VALUES ('DLG-OLD', 'local|ada', 'Ada Park', 'mdc_b', true, $1, $1, $2, $1)",
+        &[&renewed, &(renewed + 30 * DAY_NS)],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE dashboard_oauth_client SET consented = true WHERE client_id = 'mdc_b'",
+        &[],
+    )
+    .unwrap();
+
+    assert!(store
+        .revoke(&made.id, "local|root", "left", renewed + 1)
+        .unwrap());
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", false, Some(T0)),
+            (ChangeKind::ChangedByAnEarlierRelease, "", true, None),
+            (ChangeKind::Revoked, "local|root", false, Some(renewed + 1)),
+        ]
+    );
+    assert_eq!(records[1].note, CHANGED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(records[1].at_ns, renewed + 1, "recorded when found");
+    assert!(records[1].became.contains("renewed 2026-09-27T00:00:00Z"));
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+
+    // The sweep gives the one it made its records, once.
+    store.sweep(renewed + 2).unwrap();
+    store.sweep(renewed + 3).unwrap();
+    let records = store.changes("DLG-OLD").unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| (r.kind, r.backfilled, r.at_ns, r.valid_at_ns))
+            .collect::<Vec<_>>(),
+        [(ChangeKind::Made, true, renewed + 2, Some(renewed))]
+    );
+    assert!(store
+        .revoke("DLG-OLD", "local|ada", "done", renewed + 4)
+        .unwrap());
+    let records = store.changes("DLG-OLD").unwrap();
+    assert_eq!(
+        records.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked]
+    );
+    assert_eq!(records[1].was, records[0].became, "the chain holds");
+}
+
+/// Review-core-3 3 (ruling 1084, as config migration 30): every record the
+/// dashboard keeps of a change is kept as written. Each dashboard_*_change
+/// table refuses an update and a removal, but a settled prepared change's
+/// steps, removed with it by the sweep once kept its 90 days (W6.28;
+/// review-core-3b A: by the deployment's time named on the connection,
+/// else the database's), and when one settled is kept as written.
+#[test]
+fn every_dashboard_change_record_is_kept_as_written() {
+    let (url, database) = migrated("append_only");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let guarded: Vec<String> = raw
+        .query(
+            "SELECT c.relname::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+              WHERE t.tgname = 'dashboard_append_only'
+                AND c.relnamespace = to_regnamespace(current_schema())
+              ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let named: Vec<String> = raw
+        .query(
+            "SELECT tablename::text FROM pg_tables
+              WHERE schemaname = current_schema() AND tablename LIKE 'dashboard\\_%\\_change'
+              ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(guarded, named, "every change table is guarded");
+    assert_eq!(named.len(), 6, "{named:?}");
+
+    let refused = |raw: &mut postgres::Client, sql: &str| {
+        let failed = raw.batch_execute(sql).expect_err(sql);
+        assert_eq!(
+            failed.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{sql}: {failed}"
+        );
+    };
+    let store = delegation::InPostgres::on(database.clone());
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    refused(
+        &mut raw,
+        "UPDATE dashboard_delegation_change SET note = 'edited'",
+    );
+    refused(&mut raw, "DELETE FROM dashboard_delegation_change");
+
+    // Settled a day ago, by the database's own clock (review-core-3b A).
+    let yesterday = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64
+        - DAY_NS;
+    settled_long_ago(
+        &mut raw,
+        &format!(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, 1, NULL),
+                    ('PC-SETTLED', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 2),
+                    ('PC-AT-90-DAYS', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 3),
+                    ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday});
+             INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-PENDING', 1, 1), ('PC-SETTLED', 1, 1), ('PC-SETTLED', 4, 2),
+                    ('PC-AT-90-DAYS', 4, 3), ('PC-YESTERDAY', 4, {yesterday});"
+        ),
+    );
+    refused(
+        &mut raw,
+        "UPDATE dashboard_prepared_call_change SET note = 'edited' WHERE prepared_call_id = 'PC-SETTLED'",
+    );
+    refused(
+        &mut raw,
+        "DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-PENDING'",
+    );
+    // Settled, but not kept its 90 days: refused, whoever asks.
+    refused(
+        &mut raw,
+        "DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-YESTERDAY'",
+    );
+    // When one settled is kept as written once set, so it cannot be moved
+    // back to let its steps go early.
+    refused(
+        &mut raw,
+        "UPDATE dashboard_prepared_call SET settled_at_ns = 1 WHERE prepared_call_id = 'PC-YESTERDAY'",
+    );
+    // The boundary, by the deployment's time named on the connection: at
+    // exactly 90 days after it settled, kept; a nanosecond past, removable.
+    let kept = meridian_dashboard::prepared::KEPT_AFTER_SETTLING_NS;
+    refused(
+        &mut raw,
+        &format!(
+            "BEGIN;
+             SELECT set_config('meridian.dashboard_now_ns', '{}', true);
+             DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-AT-90-DAYS';",
+            3 + kept
+        ),
+    );
+    raw.batch_execute("ROLLBACK").unwrap();
+    use meridian_dashboard::prepared::store::PreparedStore as _;
+    let prepared = meridian_dashboard::prepared::store::InPostgres::on(database);
+    assert_eq!(prepared.sweep(3).unwrap(), 1, "the settled one swept");
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 3);
+    raw.batch_execute(&format!(
+        "BEGIN;
+         SELECT set_config('meridian.dashboard_now_ns', '{}', true);
+         DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-AT-90-DAYS';
+         ROLLBACK;",
+        3 + kept + 1
+    ))
+    .expect("kept its 90 days: removable");
+    assert_eq!(prepared.sweep(4).unwrap(), 1, "kept its 90 days, swept");
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
+}
+
+/// Review-core-3 4: the one-time rewrite is worked out from rows read
+/// unheld. A renewal between that read and the rewrite wins: the stale
+/// rewrite changes nothing and records nothing.
+#[test]
+fn a_stale_rewrite_after_a_renewal_keeps_the_renewals_rows() {
+    use delegation::record::ChangeKind;
+    let (_url, database) = migrated("stale_rewrite");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let made = store
+        .grant(&granting("mdc_a", old_rows, T0 + 30 * DAY_NS), T0)
+        .unwrap();
+    // What the rewrite read, and worked out from it.
+    let read = made.covers.clone();
+    let stale = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    // A renewal in between, to other rows.
+    let renewed_rows = Covers {
+        plugins: [("ems-1".to_string(), "ems".to_string(), "write".to_string())].into(),
+        ..Covers::default()
+    };
+    let renewed = store
+        .grant(
+            &granting("mdc_a", renewed_rows.clone(), T0 + 60 * DAY_NS),
+            T0 + 1,
+        )
+        .unwrap();
+    assert!(!store.rewrite(&made.id, &read, &stale, T0 + 2).unwrap());
+    let now = store.delegation(&made.id).unwrap().unwrap();
+    assert_eq!(
+        now.covers.plugins, renewed_rows.plugins,
+        "the renewal's rows"
+    );
+    assert_eq!(now.covers, renewed.covers);
+    assert_eq!(
+        store
+            .changes(&made.id)
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Renewed],
+        "no rewritten record"
+    );
+}
+
+/// Interpretations check, miss 1 (decisions/031 names "lapsed"): a
+/// delegation past its expiry, unrevoked, is recorded lapsed by the sweep,
+/// once, valid when it expired; renewed after, it lapses again at its new
+/// expiry; one revoked first never lapses.
+#[test]
+fn a_delegation_past_its_expiry_is_recorded_lapsed_once() {
+    use delegation::record::{ChangeKind, LAPSED};
+    let (_url, database) = migrated("lapsed");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let expires = T0 + DAY_NS;
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), expires), T0)
+        .unwrap();
+    let revoked = store
+        .grant(&granting("mdc_b", Covers::everything(), expires), T0)
+        .unwrap();
+    assert!(store
+        .revoke(&revoked.id, "local|ada", "done", T0 + 1)
+        .unwrap());
+    store.sweep(expires).unwrap();
+    assert_eq!(store.changes(&made.id).unwrap().len(), 1, "not past it yet");
+    store.sweep(expires + 1).unwrap();
+    store.sweep(expires + 2).unwrap();
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.at_ns, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", T0, Some(T0)),
+            (ChangeKind::Lapsed, "", expires + 1, Some(expires)),
+        ]
+    );
+    assert_eq!(records[1].note, LAPSED);
+    assert_eq!(records[1].was, records[0].became, "the chain holds");
+    assert_eq!(
+        records[1].became, records[1].was,
+        "the row itself unchanged"
+    );
+
+    let again = expires + 10 * DAY_NS;
+    store
+        .grant(&granting("mdc_a", Covers::everything(), again), expires + 3)
+        .unwrap();
+    store.sweep(again + 1).unwrap();
+    store.sweep(again + 2).unwrap();
+    assert_eq!(
+        store
+            .changes(&made.id)
+            .unwrap()
+            .iter()
+            .map(|r| (r.kind, r.valid_at_ns))
+            .collect::<Vec<_>>(),
+        [
+            (ChangeKind::Made, Some(T0)),
+            (ChangeKind::Lapsed, Some(expires)),
+            (ChangeKind::Renewed, Some(expires + 3)),
+            (ChangeKind::Lapsed, Some(again)),
+        ]
+    );
+    assert_eq!(
+        store
+            .changes(&revoked.id)
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked],
+        "a delegation revoked first never lapses"
+    );
+}
+
+/// Review-core-3 5: a registration making room at the cap removes only a
+/// client nobody consented to. A consent committed while its removal waited
+/// for the client's row is seen: that client, and the delegation made with
+/// it, are kept, and the registration finds no room.
+#[test]
+fn a_consent_while_a_registration_makes_room_keeps_the_client() {
+    let (url, database) = migrated("consent_race");
+    let store = std::sync::Arc::new(delegation::InPostgres::on(database));
+    store.register(&client("mdc_old", T0), 1).unwrap();
+    // A consent in flight: the client's row held, consented, not committed.
+    let mut consenting = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut tx = consenting.transaction().unwrap();
+    tx.execute(
+        "UPDATE dashboard_oauth_client SET consented = true WHERE client_id = 'mdc_old'",
+        &[],
+    )
+    .unwrap();
+    let registering = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || store.register(&client("mdc_new", T0 + 1), 1).unwrap())
+    };
+    // Wait until the registration's removal waits for the held row.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut waited = 0;
+    while watch
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE wait_event_type = 'Lock' AND query LIKE 'DELETE FROM dashboard_oauth_client%'",
+            &[],
+        )
+        .unwrap()
+        .get::<_, i64>(0)
+        == 0
+    {
+        waited += 1;
+        assert!(waited < 500, "the registration never waited for the row");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    tx.commit().unwrap();
+    assert!(
+        !registering.join().unwrap(),
+        "no room: the only client is consented now"
+    );
+    assert!(store.client("mdc_old").unwrap().is_some(), "kept");
+    assert!(store.client("mdc_new").unwrap().is_none());
+}
+
+/// Review-core-3 7: the one-time rewrite and the fill of a delegation's
+/// tools each leave their record in Postgres, once, the chain whole.
+#[test]
+fn a_rewrite_and_a_fill_each_leave_their_record_once_in_postgres() {
+    use delegation::record::{ChangeKind, ACTING_FILLED, REWRITTEN};
+    let (_url, database) = migrated("rewrite_fill");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let made = store
+        .grant(&granting("mdc_a", old_rows, T0 + 30 * DAY_NS), T0)
+        .unwrap();
+    let rewritten = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    assert!(store
+        .rewrite(&made.id, &made.covers, &rewritten, T0 + 1)
+        .unwrap());
+    assert!(
+        !store
+            .rewrite(&made.id, &made.covers, &rewritten, T0 + 2)
+            .unwrap(),
+        "rewritten already: its rows differ from what was read"
+    );
+    for at in [T0 + 3, T0 + 4] {
+        store
+            .backfill_acting(&made.id, &["place_order".to_string()], at)
+            .unwrap();
+    }
+    let records = store.changes(&made.id).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| (r.kind, r.by.as_str(), r.at_ns, r.note.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (ChangeKind::Made, "local|ada", T0, ""),
+            (ChangeKind::Rewritten, "", T0 + 1, REWRITTEN),
+            (ChangeKind::ActingFilled, "", T0 + 3, ACTING_FILLED),
+        ]
+    );
+    assert!(records[1].was.contains("oms-1 read (unmatched)"));
+    assert!(records[1].became.contains("plugins oms-1 oms read"));
+    assert!(records[2].became.contains("acting place_order"));
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+}
+
+/// Review-core-3b B (decisions/031): the release before, still serving as
+/// the upgrade ran, removes a delegation and writes no record. As the
+/// dashboard starts, a delegation whose latest record is not its removal
+/// and which has no row is given a backfilled removal: what it was, as its
+/// last record said; who and when not known; once. Not by the sweep, which
+/// would read every record each minute for it (review-core-3c N4).
+#[test]
+fn a_delegation_the_release_before_removed_is_given_its_removal_once() {
+    use delegation::record::{ChangeKind, REMOVED_BY_AN_EARLIER_RELEASE};
+    let (url, database) = migrated("removed_before");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    // The release before's sweep: the row removed, no record.
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .execute(
+            "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+            &[&made.id],
+        )
+        .unwrap();
+    store.sweep(T0 + 2).unwrap();
+    store.sweep(T0 + 3).unwrap();
+    assert_eq!(
+        store.changes(&made.id).unwrap().len(),
+        1,
+        "the sweep gives no removal"
+    );
+    assert_eq!(store.removals_owed(T0 + 4).unwrap(), 1);
+    assert_eq!(store.removals_owed(T0 + 5).unwrap(), 0, "once");
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.at_ns, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", false, T0, Some(T0)),
+            (ChangeKind::Removed, "", true, T0 + 4, None),
+        ]
+    );
+    assert_eq!(records[1].note, REMOVED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(records[1].was, records[0].became, "the chain holds");
+    assert_eq!(records[1].became, "");
+    assert_eq!(
+        (records[1].subject.as_str(), records[1].client_id.as_str()),
+        ("local|ada", "mdc_a")
+    );
+}
+
+/// Review-core-3b C (decisions/031): a delegation past its expiry is no
+/// longer live whether or not the sweep has run. A revocation or a renewal
+/// landing after its expiry, before any sweep, first records the lapse,
+/// valid when it expired, under the same lock.
+#[test]
+fn a_revocation_or_a_renewal_after_the_expiry_records_the_lapse_first() {
+    use delegation::record::ChangeKind;
+    let (_url, database) = migrated("lapse_first");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let expires = T0 + DAY_NS;
+    let revoked = store
+        .grant(&granting("mdc_a", Covers::everything(), expires), T0)
+        .unwrap();
+    let renewed = store
+        .grant(&granting("mdc_b", Covers::everything(), expires), T0)
+        .unwrap();
+    assert!(store
+        .revoke(&revoked.id, "local|ada", "done", expires + 1)
+        .unwrap());
+    let again = store
+        .grant(
+            &granting("mdc_b", Covers::everything(), expires + 30 * DAY_NS),
+            expires + 1,
+        )
+        .unwrap();
+    assert_eq!(again.id, renewed.id, "renewed in place");
+    store.sweep(expires + 2).unwrap();
+    for (id, last) in [
+        (&revoked.id, ChangeKind::Revoked),
+        (&renewed.id, ChangeKind::Renewed),
+    ] {
+        let records = store.changes(id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+                .collect::<Vec<_>>(),
+            [
+                (ChangeKind::Made, T0, Some(T0)),
+                (ChangeKind::Lapsed, expires + 1, Some(expires)),
+                (last, expires + 1, Some(expires + 1)),
+            ],
+            "{last:?}"
+        );
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+        }
+    }
+}
+
+/// Review-core-3b G: the sweep holds every delegation it lapses or removes
+/// in one pass, in order, so it never holds a later one while waiting for
+/// an earlier one another holder (revoke_person, in the same order) has.
+/// Here a holder has DLG-B, which the sweep removes, and then asks for
+/// DLG-C, which the sweep lapses: both finish, neither is deadlocked.
+#[test]
+fn the_sweep_and_another_holder_in_id_order_never_deadlock() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("sweep_order");
+    let store = std::sync::Arc::new(delegation::InPostgres::on(database));
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_a', 'a', '{}', '', $1, true), ('mdc_b', 'b', '{}', '', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    // DLG-B revoked long ago (removed by the sweep below), DLG-C past its
+    // expiry, unrevoked (lapsed by it).
+    raw.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns,
+              revoked_at_ns, revoked_by, revoked_why)
+         VALUES ('DLG-B', 'local|ada', 'Ada', 'mdc_a', true, $1, $1, $2, $1, $1, 'local|ada', 'x'),
+                ('DLG-C', 'local|bea', 'Bea', 'mdc_b', true, $1, $1, $3, $1, NULL, NULL, NULL)",
+        &[&T0, &(T0 + DAY_NS), &(T0 + 40 * DAY_NS)],
+    )
+    .unwrap();
+    // Given their records first, so the sweep below only lapses and removes.
+    store.sweep(T0 + 1).unwrap();
+
+    let mut holder = raw.transaction().unwrap();
+    holder
+        .batch_execute(
+            "SET LOCAL lock_timeout = '20s';
+             SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-B' FOR UPDATE",
+        )
+        .unwrap();
+    let mine: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let sweeping = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || store.sweep(T0 + 41 * DAY_NS))
+    };
+    // Until the sweep waits on the holder.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&mine],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sweep never waited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    holder
+        .batch_execute(
+            "SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-C' FOR UPDATE",
+        )
+        .expect("the holder is not deadlocked");
+    holder.commit().unwrap();
+    sweeping
+        .join()
+        .unwrap()
+        .expect("the sweep is not deadlocked");
+    assert_eq!(
+        store
+            .changes("DLG-C")
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Lapsed]
+    );
+    assert_eq!(
+        store
+            .changes("DLG-B")
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked, ChangeKind::Removed]
+    );
+}
+
+/// Review-core-3c N1: migration 17 runs while the release before still
+/// serves. Its settle holds a prepared change's row and then adds its step;
+/// the migration takes the prepared change's table before any change
+/// table, in the runtime's order, so the two never deadlock: here a settle
+/// holds the row as the migration starts, and both finish.
+#[test]
+fn migration_17_and_a_settle_of_the_release_before_never_deadlock() {
+    let url = scratch("settle_while_migrating");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // The store as the release before left it: at 16.
+    raw.batch_execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_schema_migration (
+             version bigint PRIMARY KEY, name text NOT NULL, applied_at_ns bigint NOT NULL)",
+    )
+    .unwrap();
+    for (version, name, sql) in meridian_dashboard::database::migrations() {
+        if version > 16 {
+            continue;
+        }
+        raw.batch_execute(sql).unwrap();
+        raw.execute(
+            "INSERT INTO dashboard_schema_migration VALUES ($1, $2, 1)",
+            &[&version, &name],
+        )
+        .unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    raw.execute(
+        "INSERT INTO dashboard_prepared_call
+             (prepared_call_id, tool_name, arguments_json, preparer_subject, state, prepared_at_ns)
+         VALUES ('PC-PENDING', 'dashboard__set_hold', '{}', 'local|ada', 1, $1)",
+        &[&now],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+         VALUES ('PC-PENDING', 1, $1)",
+        &[&now],
+    )
+    .unwrap();
+
+    // The release before settles it: the row first (transition).
+    let mut settling = raw.transaction().unwrap();
+    settling
+        .batch_execute("SET LOCAL lock_timeout = '20s'")
+        .unwrap();
+    settling
+        .execute(
+            "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = $1
+              WHERE prepared_call_id = 'PC-PENDING' AND state = 1",
+            &[&now],
+        )
+        .unwrap();
+    let mine: i32 = settling
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let migrating = {
+        let database = Database::connect(&url, 2).expect("connects");
+        std::thread::spawn(move || database.migrate(&meridian_clock::SystemClock))
+    };
+    // Until the migration waits on the settle.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&mine],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the migration never waited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Then its step, as transition writes it.
+    settling
+        .execute(
+            "INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-PENDING', 4, $1)",
+            &[&now],
+        )
+        .expect("the settle is not deadlocked");
+    settling.commit().unwrap();
+    migrating
+        .join()
+        .unwrap()
+        .expect("the migration is not deadlocked");
+    let at: i64 = raw
+        .query_one("SELECT max(version) FROM dashboard_schema_migration", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(at, 17);
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
+}
+
+/// Review-core-3c N2: the 90 days a settled prepared change's steps are
+/// kept are counted to the database's own time. A time named on the
+/// connection only tightens it, and a change said to have settled long
+/// before it was settled is refused, so neither lets a step go early.
+#[test]
+fn a_named_time_or_a_settle_dated_back_never_lets_a_step_go_early() {
+    let (url, _database) = migrated("named_time");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let refused = |raw: &mut postgres::Client, sql: &str| {
+        let failed = raw.batch_execute(sql).expect_err(sql);
+        assert_eq!(
+            failed.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{sql}: {failed}"
+        );
+        let _ = raw.batch_execute("ROLLBACK");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let yesterday = now - DAY_NS;
+    settled_long_ago(
+        &mut raw,
+        &format!(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday}),
+                    ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                    ('PC-NOW', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                    ('PC-SKEWED', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL);
+             INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-YESTERDAY', 4, {yesterday}), ('PC-PENDING', 1, {now});"
+        ),
+    );
+    // A time far ahead named on the connection: the database's own is
+    // earlier, and counts.
+    refused(
+        &mut raw,
+        "BEGIN;
+         SELECT set_config('meridian.dashboard_now_ns', '9000000000000000000', true);
+         DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-YESTERDAY';",
+    );
+    // A pending one said to have settled at the start of time: refused, and
+    // its steps stay.
+    refused(
+        &mut raw,
+        "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = 1
+          WHERE prepared_call_id = 'PC-PENDING'",
+    );
+    refused(
+        &mut raw,
+        "DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-PENDING'",
+    );
+    // Settled now, or a minute behind the database's clock: as a settle is.
+    raw.execute(
+        "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = $1
+          WHERE prepared_call_id = 'PC-NOW'",
+        &[&now],
+    )
+    .expect("a settle now");
+    raw.execute(
+        "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = $1
+          WHERE prepared_call_id = 'PC-SKEWED'",
+        &[&(now - MINUTE_NS)],
+    )
+    .expect("a settle by a clock a minute behind");
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
+}
+
+/// Review-core-3c N3: a sign-in updates every delegation of the person's;
+/// it holds them in ID order, as the sweep does, so the two never deadlock.
+/// DLG-1 (client 9, past its expiry) and DLG-3 (client 0, past its expiry)
+/// are lapsed by the sweep; DLG-2 (live) is held by another, so the sign-in
+/// waits holding what it took before it. Both finish.
+#[test]
+fn a_sign_in_and_the_sweep_hold_a_persons_delegations_in_one_order() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("sign_in_order");
+    let store = std::sync::Arc::new(delegation::InPostgres::on(database));
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_0', 'zero', '{}', '', $1, true), ('mdc_5', 'five', '{}', '', $1, true),
+                ('mdc_9', 'nine', '{}', '', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    // Added DLG-3, DLG-2, DLG-1: by client and as stored, DLG-3 comes first.
+    for (id, client, expires) in [
+        ("DLG-3", "mdc_0", T0 + DAY_NS),
+        ("DLG-2", "mdc_5", T0 + 40 * DAY_NS),
+        ("DLG-1", "mdc_9", T0 + DAY_NS),
+    ] {
+        raw.execute(
+            "INSERT INTO dashboard_delegation
+                 (delegation_id, subject, display_name, client_id, covers_everything,
+                  made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+             VALUES ($1, 'local|ada', 'Ada', $2, true, $3, $3, $4, $3)",
+            &[&id, &client, &T0, &expires],
+        )
+        .unwrap();
+    }
+    // Given their records first, so the sweep below only lapses.
+    store.sweep(T0 + 1).unwrap();
+
+    let mut holder = raw.transaction().unwrap();
+    holder
+        .batch_execute(
+            "SET LOCAL lock_timeout = '20s';
+             SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-2' FOR UPDATE",
+        )
+        .unwrap();
+    let mine: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let waiting_on = |watch: &mut postgres::Client, pid: i32| -> Option<i32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(row) = watch
+                .query_opt(
+                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+                      LIMIT 1",
+                    &[&pid],
+                )
+                .unwrap()
+            {
+                return Some(row.get(0));
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let signing_in = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || {
+            store.signed_in("local|ada", &["traders".to_string()], T0 + 2 * DAY_NS)
+        })
+    };
+    let signing = waiting_on(&mut watch, mine).expect("the sign-in waits on DLG-2");
+    let sweeping = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || store.sweep(T0 + 2 * DAY_NS))
+    };
+    waiting_on(&mut watch, signing).expect("the sweep waits on the sign-in");
+    holder.commit().unwrap();
+    signing_in
+        .join()
+        .unwrap()
+        .expect("the sign-in is not deadlocked");
+    sweeping
+        .join()
+        .unwrap()
+        .expect("the sweep is not deadlocked");
+    for (id, lapsed) in [("DLG-1", true), ("DLG-2", false), ("DLG-3", true)] {
+        let kinds: Vec<_> = store.changes(id).unwrap().iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds.contains(&ChangeKind::Lapsed),
+            lapsed,
+            "{id}: {kinds:?}"
+        );
+        let read = store.delegation(id).unwrap().unwrap();
+        assert_eq!(read.directory_groups, ["traders"], "{id}");
+    }
+}
+
+/// Review-core-3c N6: the one-time rewrite and the fill of a delegation's
+/// tools, landing after its expiry before any sweep, record the lapse
+/// first, valid when it expired, under the same lock: [Made, Lapsed(E),
+/// Rewritten], not the lapse after the rewrite.
+#[test]
+fn a_rewrite_or_a_fill_after_the_expiry_records_the_lapse_first() {
+    use delegation::record::ChangeKind;
+    let (_url, database) = migrated("rewrite_lapse_first");
+    let store = delegation::InPostgres::on(database);
+    let expires = T0 + DAY_NS;
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let mut made = Vec::new();
+    for id in ["mdc_a", "mdc_b"] {
+        store.register(&client(id, T0), 10).unwrap();
+        made.push(
+            store
+                .grant(&granting(id, old_rows.clone(), expires), T0)
+                .unwrap(),
+        );
+    }
+    let rewritten = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    assert!(store
+        .rewrite(&made[0].id, &made[0].covers, &rewritten, expires + 1)
+        .unwrap());
+    store
+        .backfill_acting(&made[1].id, &["place_order".to_string()], expires + 1)
+        .unwrap();
+    store.sweep(expires + 2).unwrap();
+    for (delegation, last) in made
+        .iter()
+        .zip([ChangeKind::Rewritten, ChangeKind::ActingFilled])
+    {
+        let records = store.changes(&delegation.id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+                .collect::<Vec<_>>(),
+            [
+                (ChangeKind::Made, T0, Some(T0)),
+                (ChangeKind::Lapsed, expires + 1, Some(expires)),
+                (last, expires + 1, Some(expires + 1)),
+            ],
+            "{last:?}"
+        );
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+        }
+    }
+}
+
+/// Review-core-3d F2: the removals owed read every delegation's records, so
+/// they are given past the serving session's 5 s statement_timeout, in a
+/// transaction of their own: here a login whose every statement is
+/// cancelled after a millisecond, over more history than a millisecond
+/// reads, still gives them.
+#[test]
+fn the_removals_owed_are_given_past_the_serving_statement_timeout() {
+    let (url, database) = migrated("removals_unbounded");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // History: removals long recorded, read with the rest.
+    raw.batch_execute(
+        "INSERT INTO dashboard_delegation_change (delegation_id, subject, client_id, kind, changed_at_ns)
+         SELECT 'DLG-OLD-' || n, 'local|old', 'mdc_old', 'removed', n
+           FROM generate_series(1, 50000) n",
+    )
+    .unwrap();
+    // The release before's sweep: the row removed, no record.
+    raw.execute(
+        "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+        &[&made.id],
+    )
+    .unwrap();
+    let bounded = format!("{url}%20-cstatement_timeout%3D1");
+    let serving = delegation::InPostgres::on(Database::connect(&bounded, 1).unwrap());
+    assert_eq!(
+        serving
+            .removals_owed(T0 + 4)
+            .expect("given past the session's statement_timeout"),
+        1
+    );
+}
+
+/// Review-core-3d F1: the release before keeps removing delegations with no
+/// record until its last replica stops, after a dashboard of this release
+/// has started. The removals owed are asked for again every
+/// REMOVALS_OWED_EVERY, so one made after the first ask is given its record
+/// by the next, once.
+#[test]
+fn a_removal_by_the_release_before_after_the_first_ask_is_given_by_the_next() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("removals_again");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), T0 + DAY_NS), T0)
+        .unwrap();
+    assert_eq!(
+        store.removals_owed(T0 + 1).unwrap(),
+        0,
+        "none owed at start"
+    );
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .execute(
+            "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+            &[&made.id],
+        )
+        .unwrap();
+    assert_eq!(store.removals_owed(T0 + 2).unwrap(), 1, "the next ask");
+    assert_eq!(store.removals_owed(T0 + 3).unwrap(), 0, "once");
+    assert_eq!(
+        store
+            .changes(&made.id)
+            .unwrap()
+            .iter()
+            .map(|r| (r.kind, r.backfilled))
+            .collect::<Vec<_>>(),
+        [(ChangeKind::Made, false), (ChangeKind::Removed, true)]
+    );
+}
+
+/// Rows a store left long ago -- prepared changes settled long since -- put
+/// in as the tables' owner may, migration 17's `dashboard_settled_once` set
+/// aside while they go in (review-core-3d F6: it refuses them otherwise).
+fn settled_long_ago(raw: &mut postgres::Client, rows: &str) {
+    raw.batch_execute(&format!(
+        "BEGIN;
+         ALTER TABLE dashboard_prepared_call DISABLE TRIGGER dashboard_settled_once;
+         {rows}
+         ALTER TABLE dashboard_prepared_call ENABLE TRIGGER dashboard_settled_once;
+         COMMIT;"
+    ))
+    .unwrap();
+}
+
+/// The database's own time, as migration 17's guard reads it.
+fn database_now_ns(raw: &mut postgres::Client) -> i64 {
+    raw.query_one(
+        "SELECT (extract(epoch FROM statement_timestamp()) * 1000000000)::bigint",
+        &[],
+    )
+    .unwrap()
+    .get(0)
+}
+
+/// Review-core-3d F3: the prepared sweep picks only what migration 17's
+/// guard lets go -- settled 90 days before the deployment's time and the
+/// database's both -- so a deployment clock ahead of the database's never
+/// has a step refused and the whole sweep rolled back. One settled 90 days
+/// before the deployment's time but not the database's is left for a later
+/// sweep; the older is swept.
+#[test]
+fn the_prepared_sweep_takes_only_what_the_database_lets_go() {
+    use meridian_dashboard::prepared::store::PreparedStore as _;
+    let (url, database) = migrated("sweep_clock_ahead");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let kept = meridian_dashboard::prepared::KEPT_AFTER_SETTLING_NS;
+    let now = database_now_ns(&mut raw);
+    let old = now - kept - DAY_NS;
+    let edge = now - kept + 30_000_000_000;
+    settled_long_ago(
+        &mut raw,
+        &format!(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-OLD', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {old}),
+                    ('PC-EDGE', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {edge});
+             INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-OLD', 4, {old}), ('PC-EDGE', 4, {edge});"
+        ),
+    );
+    let prepared = meridian_dashboard::prepared::store::InPostgres::on(database);
+    // The deployment's clock a minute ahead of the database's.
+    assert_eq!(
+        prepared
+            .sweep(now - kept + 60_000_000_000)
+            .expect("swept, not refused"),
+        1
+    );
+    let left: Vec<String> = raw
+        .query(
+            "SELECT prepared_call_id FROM dashboard_prepared_call ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(left, ["PC-EDGE"]);
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 1);
+}
+
+/// Review-core-3d F4: the records a migration owes the past (16's, given
+/// each delegation standing as it runs) are written in the try its SQL is,
+/// under the same lock wait: one that meets the release before's writers --
+/// here a deadlock over two delegations' rows, the migration's to lose -- is
+/// rolled back and tried again, not failed.
+#[test]
+fn migration_16s_records_meeting_the_release_before_are_tried_again() {
+    let url = scratch("then_tried_again");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // The store as the release before left it: at 15, two delegations.
+    raw.batch_execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_schema_migration (
+             version bigint PRIMARY KEY, name text NOT NULL, applied_at_ns bigint NOT NULL)",
+    )
+    .unwrap();
+    for (version, name, sql) in meridian_dashboard::database::migrations() {
+        if version > 15 {
+            continue;
+        }
+        raw.batch_execute(sql).unwrap();
+        raw.execute(
+            "INSERT INTO dashboard_schema_migration VALUES ($1, $2, 1)",
+            &[&version, &name],
+        )
+        .unwrap();
+    }
+    for (id, client) in [("DLG-1", "mdc_a"), ("DLG-2", "mdc_b")] {
+        raw.execute(
+            "INSERT INTO dashboard_oauth_client
+                 (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+             VALUES ($1, 'meridian', '{}', 'meridian-cli', $2, true)",
+            &[&client, &T0],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO dashboard_delegation
+                 (delegation_id, subject, display_name, client_id, covers_everything,
+                  made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+             VALUES ($1, 'local|ada', 'Ada Park', $2, true, $3, $3, $4, $3)",
+            &[&id, &client, &T0, &(T0 + 30 * DAY_NS)],
+        )
+        .unwrap();
+    }
+
+    // The release before holds DLG-2.
+    let mut holding = raw.transaction().unwrap();
+    holding
+        .query(
+            "SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-2' FOR UPDATE",
+            &[],
+        )
+        .unwrap();
+    let mine: i32 = holding
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let migrating = {
+        let database = Database::connect(&url, 2).expect("connects");
+        std::thread::spawn(move || database.migrate(&meridian_clock::SystemClock))
+    };
+    // Until the migration, holding DLG-1 for its records, waits on DLG-2.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&mine],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the migration never waited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Then the release before takes DLG-1: a deadlock, which the migration,
+    // waiting first, finds and loses.
+    holding
+        .query(
+            "SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-1' FOR UPDATE",
+            &[],
+        )
+        .expect("the release before goes on");
+    holding.commit().unwrap();
+    migrating
+        .join()
+        .unwrap()
+        .expect("the migration is tried again, not failed");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let versions: Vec<i64> = raw
+        .query(
+            "SELECT version FROM dashboard_schema_migration WHERE version > 15 ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(versions, [16, 17]);
+    let made: i64 = raw
+        .query_one(
+            "SELECT count(*) FROM dashboard_delegation_change WHERE kind = 'made' AND backfilled",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(made, 2, "each delegation given its records once");
+}
+
+/// Review-core-3d F6: a prepared change added already settled long ago is
+/// refused as one moved there is: its steps would otherwise go at once.
+/// Added pending, or settled now, it is as the dashboard adds and settles
+/// one.
+#[test]
+fn a_prepared_change_added_settled_long_ago_is_refused() {
+    let (url, _database) = migrated("settled_on_insert");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let now = database_now_ns(&mut raw);
+    let failed = raw
+        .batch_execute(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-OLD', 'dashboard__set_hold', '{}', 'local|ada', 4, 1, 1)",
+        )
+        .expect_err("added settled at the start of time");
+    assert_eq!(
+        failed.code(),
+        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "{failed}"
+    );
+    raw.batch_execute(&format!(
+        "INSERT INTO dashboard_prepared_call
+             (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+              prepared_at_ns, settled_at_ns)
+         VALUES ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                ('PC-NOW', 'dashboard__set_hold', '{{}}', 'local|ada', 4, {now}, {now})"
+    ))
+    .expect("added pending, or settled now");
+    assert_eq!(count(&url, "dashboard_prepared_call"), 2);
+}

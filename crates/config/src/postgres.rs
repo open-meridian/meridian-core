@@ -23,6 +23,10 @@ use meridian_domain::v1::{
 use meridian_pb::v1::{PluginDeclaration, RecordMoveRequest, SettingDeclaration, StoredSpan};
 use prost::Message;
 
+use crate::groups::{
+    account_group_change, described_account_group, described_user_group, owed_before_change,
+    user_group_change, GroupChangeKind, GroupChangeRecord, GroupKind,
+};
 use crate::migrations;
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redeclared, AccessChangeKind,
@@ -73,6 +77,7 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
         "config_dataset_licence_change",
         "config_external_account_link",
         "config_fx_pivot_change",
+        "config_group_change",
         "config_hold_change",
         "config_known_plugin",
         "config_licensed_schemes_change",
@@ -157,6 +162,68 @@ impl PostgresStore {
         let mut conn = self.conn()?;
         let epoch = CHANGES.adopt(&mut *conn).map_err(unavailable)?;
         Ok(self.fence.adopt_once(epoch))
+    }
+
+    /// Every user group and account group compared with its latest record
+    /// at `at_ns` (decision 47, decisions/031; review-core-3b B and D): one
+    /// the release before defined while the upgrade ran, with no record, or
+    /// changed and nobody changed since, standing otherwise than its latest
+    /// record became, is given its gap record (kind 4). Run by a conductor
+    /// as it starts to write; a group as its records say is left as it is.
+    /// Each group is held, in order, and compared under its lock, so two
+    /// conductors starting at once write each record once.
+    pub fn backfill_group_records(&self, at_ns: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let users: Vec<UserGroup> = tx
+            .query(
+                "SELECT user_group_id, name, directory_groups, logins FROM config_user_group
+                  ORDER BY user_group_id FOR UPDATE",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| UserGroup {
+                user_group_id: row.get(0),
+                name: row.get(1),
+                directory_groups: row.get(2),
+                logins: row.get(3),
+            })
+            .collect();
+        for group in &users {
+            caught_up(
+                &mut tx,
+                GroupKind::User,
+                &group.user_group_id,
+                &described_user_group(group),
+                at_ns,
+            )?;
+        }
+        let accounts: Vec<AccountGroup> = tx
+            .query(
+                "SELECT account_group_id, name, account_ids, built_in FROM config_account_group
+                  ORDER BY account_group_id FOR UPDATE",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| AccountGroup {
+                account_group_id: row.get(0),
+                name: row.get(1),
+                account_ids: row.get(2),
+                built_in: row.get(3),
+            })
+            .collect();
+        for group in &accounts {
+            caught_up(
+                &mut tx,
+                GroupKind::Account,
+                &group.account_group_id,
+                &described_account_group(group),
+                at_ns,
+            )?;
+        }
+        tx.commit().map_err(unavailable)
     }
 
     /// Take the store over: raise its epoch, record who took it over and
@@ -327,6 +394,9 @@ impl PostgresStore {
             ],
         )
         .map_err(unavailable)?;
+        if let Some(record) = user_group_change(None, group, author, at_ns) {
+            insert_group_change(&mut tx, &record)?;
+        }
         for permission in permissions {
             insert_permission(&mut tx, permission)?;
             insert_access_change(&mut tx, &permission_change(permission, true, author, at_ns))?;
@@ -869,14 +939,17 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn put_user_group(&self, group: &UserGroup) -> Result<()> {
-        self.conn()?
+    fn put_user_group(&self, group: &UserGroup, author: &Author, at_ns: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // A new group inserted, or nothing where one stands: of two puts of
+        // one new ID at once, the second waits for the first and finds it,
+        // so one records it defined and the other changed (review-core-3 6).
+        let defined = tx
             .execute(
                 "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
                  VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (user_group_id) DO UPDATE
-                    SET name = excluded.name, directory_groups = excluded.directory_groups,
-                        logins = excluded.logins",
+                 ON CONFLICT (user_group_id) DO NOTHING",
                 &[
                     &group.user_group_id,
                     &group.name,
@@ -884,21 +957,102 @@ impl Store for PostgresStore {
                     &group.logins,
                 ],
             )
-            .map_err(unavailable)?;
-        Ok(())
+            .map_err(unavailable)?
+            == 1;
+        if defined {
+            if let Some(record) = user_group_change(None, group, author, at_ns) {
+                insert_group_change(&mut tx, &record)?;
+            }
+            return tx.commit().map_err(unavailable);
+        }
+        // The group as it stood, read and held in the transaction that
+        // replaces it, so its record says what it was.
+        let before = tx
+            .query_one(
+                "SELECT name, directory_groups, logins FROM config_user_group
+                  WHERE user_group_id = $1 FOR UPDATE",
+                &[&group.user_group_id],
+            )
+            .map_err(unavailable)
+            .map(|row| UserGroup {
+                user_group_id: group.user_group_id.clone(),
+                name: row.get(0),
+                directory_groups: row.get(1),
+                logins: row.get(2),
+            })?;
+        caught_up(
+            &mut tx,
+            GroupKind::User,
+            &before.user_group_id,
+            &described_user_group(&before),
+            at_ns,
+        )?;
+        tx.execute(
+            "UPDATE config_user_group SET name = $2, directory_groups = $3, logins = $4
+              WHERE user_group_id = $1",
+            &[
+                &group.user_group_id,
+                &group.name,
+                &group.directory_groups,
+                &group.logins,
+            ],
+        )
+        .map_err(unavailable)?;
+        if let Some(record) = user_group_change(Some(&before), group, author, at_ns) {
+            insert_group_change(&mut tx, &record)?;
+        }
+        tx.commit().map_err(unavailable)
     }
 
-    fn put_account_group(&self, group: &AccountGroup) -> Result<()> {
-        self.conn()?
+    fn put_account_group(&self, group: &AccountGroup, author: &Author, at_ns: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // As a user group: inserted new, or held and replaced.
+        let defined = tx
             .execute(
                 "INSERT INTO config_account_group (account_group_id, name, account_ids)
                  VALUES ($1, $2, $3)
-                 ON CONFLICT (account_group_id) DO UPDATE
-                    SET name = excluded.name, account_ids = excluded.account_ids",
+                 ON CONFLICT (account_group_id) DO NOTHING",
                 &[&group.account_group_id, &group.name, &group.account_ids],
             )
-            .map_err(unavailable)?;
-        Ok(())
+            .map_err(unavailable)?
+            == 1;
+        if defined {
+            if let Some(record) = account_group_change(None, group, author, at_ns) {
+                insert_group_change(&mut tx, &record)?;
+            }
+            return tx.commit().map_err(unavailable);
+        }
+        let before = tx
+            .query_one(
+                "SELECT name, account_ids, built_in FROM config_account_group
+                  WHERE account_group_id = $1 FOR UPDATE",
+                &[&group.account_group_id],
+            )
+            .map_err(unavailable)
+            .map(|row| AccountGroup {
+                account_group_id: group.account_group_id.clone(),
+                name: row.get(0),
+                account_ids: row.get(1),
+                built_in: row.get(2),
+            })?;
+        caught_up(
+            &mut tx,
+            GroupKind::Account,
+            &before.account_group_id,
+            &described_account_group(&before),
+            at_ns,
+        )?;
+        tx.execute(
+            "UPDATE config_account_group SET name = $2, account_ids = $3
+              WHERE account_group_id = $1",
+            &[&group.account_group_id, &group.name, &group.account_ids],
+        )
+        .map_err(unavailable)?;
+        if let Some(record) = account_group_change(Some(&before), group, author, at_ns) {
+            insert_group_change(&mut tx, &record)?;
+        }
+        tx.commit().map_err(unavailable)
     }
 
     fn put_access_group(&self, group: &AccessGroup, author: &Author, at_ns: i64) -> Result<()> {
@@ -1108,6 +1262,40 @@ impl Store for PostgresStore {
                                  WHERE s.directory_groups && g.directory_groups))
               LIMIT 1",
         )
+    }
+
+    fn group_changes(&self, group: GroupKind, group_id: &str) -> Result<Vec<GroupChangeRecord>> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT kind, was, became, changed_by, through_delegation, changed_at_ns,
+                        valid_at_ns, backfilled, note
+                   FROM config_group_change
+                  WHERE group_kind = $1 AND group_id = $2
+                  ORDER BY change_id",
+                &[&group.code(), &group_id],
+            )
+            .map_err(unavailable)?;
+        rows.iter()
+            .map(|row| {
+                let kind: i16 = row.get(0);
+                Ok(GroupChangeRecord {
+                    group,
+                    group_id: group_id.to_string(),
+                    kind: GroupChangeKind::from_code(kind).ok_or_else(|| {
+                        StoreError::Unavailable(format!("a group change of kind {kind}"))
+                    })?,
+                    was: row.get(1),
+                    became: row.get(2),
+                    by: row.get(3),
+                    delegation: row.get(4),
+                    at_ns: row.get(5),
+                    valid_at_ns: row.get(6),
+                    backfilled: row.get(7),
+                    note: row.get(8),
+                })
+            })
+            .collect()
     }
 
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {
@@ -3332,6 +3520,64 @@ pub(crate) fn read_access_group(
     }))
 }
 
+/// Before a group's change is recorded, or as the conductor starts, the
+/// record it is owed for what changed it unrecorded (decisions/031;
+/// review-core-3 1): the release before, still serving as the upgrade ran,
+/// writes no record. Compared with the group's latest record, the group as
+/// it stands, held in `tx`, is given one -- defined or changed by an
+/// earlier release -- where they differ, so each record's `was` is the one
+/// before's `became`.
+fn caught_up(
+    tx: &mut postgres::Transaction<'_>,
+    group: GroupKind,
+    group_id: &str,
+    standing: &str,
+    at_ns: i64,
+) -> Result<()> {
+    let latest: Option<String> = tx
+        .query_opt(
+            "SELECT became FROM config_group_change
+              WHERE group_kind = $1 AND group_id = $2
+              ORDER BY change_id DESC LIMIT 1",
+            &[&group.code(), &group_id],
+        )
+        .map_err(unavailable)?
+        .map(|row| row.get(0));
+    if let Some(owed) = owed_before_change(group, group_id, standing, latest.as_deref(), at_ns) {
+        insert_group_change(tx, &owed)?;
+    }
+    Ok(())
+}
+
+/// One user-group or account-group change's record (decision 47).
+fn insert_group_change(
+    client: &mut impl postgres::GenericClient,
+    record: &GroupChangeRecord,
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO config_group_change
+                    (group_kind, group_id, kind, was, became, changed_by, through_delegation,
+                     changed_at_ns, valid_at_ns, backfilled, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &[
+                &record.group.code(),
+                &record.group_id,
+                &record.kind.code(),
+                &record.was,
+                &record.became,
+                &record.by,
+                &record.delegation,
+                &record.at_ns,
+                &record.valid_at_ns,
+                &record.backfilled,
+                &record.note,
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(())
+}
+
 /// One access change's own record (decisions/031).
 pub(crate) fn insert_access_change(
     client: &mut impl postgres::GenericClient,
@@ -3419,6 +3665,12 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
         // The migration and the row recording it commit together.
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute(migration.sql).map_err(unavailable)?;
+        // A table it made captured before it writes rows of its own, so a
+        // backfill is in the change log (review-core-3 8). Not rows its SQL
+        // writes into a table that SQL also makes: those escape the log, so
+        // a migration that makes a captured table and fills it fills it in
+        // its `then`, or in a migration after it (review-core-3c N5).
+        CHANGES.capture_new_tables(&mut tx).map_err(unavailable)?;
         let at_ns = clock.now_ns();
         if let Some(then) = migration.then {
             then(&mut tx, at_ns)?;

@@ -14,6 +14,7 @@ use meridian_domain::v1::{
 use meridian_domain::v1::VenueCatalogue;
 use meridian_pb::v1::{ConnectivityLink, SettingDeclaration, StoredSpan, VenueAccountMapping};
 
+use crate::groups::{account_group_change, user_group_change, GroupChangeRecord, GroupKind};
 use crate::store::{
     archived_spans, group_change, known_plugins, permission_change, redaction_note, redeclared,
     AccessChangeRecord, Author, ChangeKind, ConnectivityLinkChange, Ending, Held, HeldMapping,
@@ -34,6 +35,9 @@ pub struct MemoryStore {
     changes: Mutex<Vec<SettingChangeRecord>>,
     /// Each grant change's own record (W6.7, W6.8), likewise.
     access_changes: Mutex<Vec<AccessChangeRecord>>,
+    /// Each user-group and account-group change's own record (decision
+    /// 47), likewise.
+    group_changes: Mutex<Vec<GroupChangeRecord>>,
     /// Each hold's and each archive's change, its own record, in order, with
     /// its note (W6.25, W8.7; the note from contract v17).
     holds: Mutex<Vec<(Hold, String)>>,
@@ -106,6 +110,10 @@ impl MemoryStore {
             return Ok(false);
         }
         state.records.user_groups.push(group.clone());
+        self.group_changes
+            .lock()
+            .expect("store lock poisoned")
+            .extend(user_group_change(None, group, author, at_ns));
         state
             .records
             .permissions
@@ -137,6 +145,7 @@ impl MemoryStore {
             state: Mutex::new(snapshot),
             changes: Mutex::new(Vec::new()),
             access_changes: Mutex::new(Vec::new()),
+            group_changes: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
             reports_usage: Mutex::new(Vec::new()),
             settings: Mutex::new(Vec::new()),
@@ -383,19 +392,39 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn put_user_group(&self, group: &UserGroup) -> Result<()> {
+    fn put_user_group(&self, group: &UserGroup, author: &Author, at_ns: i64) -> Result<()> {
         let mut state = self.state.lock().expect("store lock poisoned");
+        let before = state
+            .records
+            .user_groups
+            .iter()
+            .find(|g| g.user_group_id == group.user_group_id)
+            .cloned();
         upsert(&mut state.records.user_groups, group, |g| {
             g.user_group_id == group.user_group_id
         });
+        self.group_changes
+            .lock()
+            .expect("store lock poisoned")
+            .extend(user_group_change(before.as_ref(), group, author, at_ns));
         Ok(())
     }
 
-    fn put_account_group(&self, group: &AccountGroup) -> Result<()> {
+    fn put_account_group(&self, group: &AccountGroup, author: &Author, at_ns: i64) -> Result<()> {
         let mut state = self.state.lock().expect("store lock poisoned");
+        let before = state
+            .records
+            .account_groups
+            .iter()
+            .find(|g| g.account_group_id == group.account_group_id)
+            .cloned();
         upsert(&mut state.records.account_groups, group, |g| {
             g.account_group_id == group.account_group_id
         });
+        self.group_changes
+            .lock()
+            .expect("store lock poisoned")
+            .extend(account_group_change(before.as_ref(), group, author, at_ns));
         Ok(())
     }
 
@@ -517,6 +546,17 @@ impl Store for MemoryStore {
             at_ns,
             meridian_access::deployment_admin_held,
         )
+    }
+
+    fn group_changes(&self, group: GroupKind, group_id: &str) -> Result<Vec<GroupChangeRecord>> {
+        Ok(self
+            .group_changes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|change| change.group == group && change.group_id == group_id)
+            .cloned()
+            .collect())
     }
 
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {

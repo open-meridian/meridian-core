@@ -694,6 +694,14 @@ pub trait Store: Send + Sync {
         true
     }
 
+    /// How many times this member's view of the writer groups has named a
+    /// partition another owner (step 3d): what a book held in memory is
+    /// kept by, since a partition moved away and back was written by
+    /// another group meanwhile. 0 where no view is kept.
+    fn owner_changes(&self) -> u64 {
+        0
+    }
+
     /// The writer group `account_id`'s commands are its owner's by, decided
     /// from its placement as this store last found it, never read from the
     /// record (step 3d; the ownership pre-check decided 2026-11-13): none

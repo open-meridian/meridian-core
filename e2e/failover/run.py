@@ -2422,6 +2422,37 @@ def acks_again(began_ms, seconds=90):
                                for kind in ("price", "order")), seconds, every=2)
 
 
+BOOK_SAID = ".e2e-failover-book.log"
+
+
+def book_said():
+    """The book's members' logs -- its writers, standbys and readers, each
+    container's and its previous one's, timestamped -- kept beside the
+    driver's history (.e2e-failover-book.log, which CI keeps with
+    .e2e-cluster.log when any step fails). Elle checks the history after
+    the run has passed and its cluster is gone, and a read it refuses was
+    answered by a member whose log went with the cluster (merge-queue run
+    45104369464: which member answered was inferred, never shown). Never
+    decides the run: a log that cannot be read is said so in its place."""
+    parts = [f"== the book's members at the run's end, {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+    listed = json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json",
+                            check=False) or "{}").get("items", [])
+    for pod in listed:
+        if not pod["metadata"].get("labels", {}).get("meridian.dev/component", "").startswith("bor"):
+            continue
+        pod_name = pod["metadata"]["name"]
+        spec = pod.get("spec", {})
+        for container in [c["name"] for c in spec.get("initContainers", []) + spec.get("containers", [])]:
+            for previous in ((), ("--previous",)):
+                said = kubectl("logs", pod_name, "-c", container, "--timestamps", f"--tail={SAID_LINES}",
+                               *previous, check=False, quiet=True)
+                parts.append(f"== {pod_name}, {container}{', before, if it restarted' if previous else ''}")
+                parts.append((said.stdout or said.stderr).decode(errors="replace"))
+    with open(BOOK_SAID, "w", encoding="utf-8") as kept:
+        kept.write("\n".join(parts))
+    print(f"R: the book's members' logs, kept in {BOOK_SAID}", flush=True)
+
+
 def driver_history(s):
     """The driver stopped, within its calls' bound, and the oms instance's
     history kept for Elle (the ha failover CI job checks it)."""
@@ -2440,6 +2471,7 @@ def driver_history(s):
     history = driver_file("drive-oms", "/tmp/history.edn")
     with open(HISTORY, "w", encoding="utf-8") as kept:
         kept.write(history)
+    book_said()
     counts = {}
     for line in history.splitlines():
         kind = line.split(":type :", 1)[-1].split(",", 1)[0]
@@ -4158,9 +4190,24 @@ def not_answered(began_ms, ended_ms):
     T's review, finding 7)."""
     found = []
     for p in driver_lines("/tmp/refused"):
-        if len(p) >= 5 and p[3].isdigit() and began_ms <= int(p[3]) <= ended_ms:
-            found.append((int(p[3]), p[1], " ".join(p[4:])))
+        said = refusal(p)
+        if said and began_ms <= said[1] <= ended_ms:
+            found.append((said[1], said[2], said[3]))
     return sorted(found)
+
+
+def refusal(p):
+    """A driver's refusal line (`REFUSED <kind> <id> <unix ms refused> <ms
+    taken> <words>`, driver.py) as (when its write began, when it was
+    refused, its kind, its words), or None for a line that is not one. A
+    line with no time taken (a driver from before PR CI 45225932982) began
+    when it was refused."""
+    if len(p) < 4 or not p[3].isdigit():
+        return None
+    at = int(p[3])
+    if len(p) >= 5 and p[4].isdigit():
+        return at - int(p[4]), at, p[1], " ".join(p[5:])
+    return at, at, p[1], " ".join(p[4:])
 
 
 # Two writes not answered this far apart or nearer are one stretch: the
@@ -6100,14 +6147,71 @@ def driver_lines(path):
             for line in driver_file(instance, path).splitlines()]
 
 
+# Each move's window as window_held read it, (began ms, until ms), in turn:
+# what refused_between reads the stretches between moves from.
+WINDOWS = []
+
+# The lake's and the book's members, whose logs say why a write was refused:
+# kept before each of the rebalance class's upgrades rolls them, and at a
+# class's first refused write, in one file the job keeps when it fails
+# (.e2e-*.log; never from a stalled runner, whose check run is its channel)
+# and the next run clears (.e2e-said-*.log). PR CI 45225932982: the class
+# rolled every member for two databases before any log was taken, and the
+# book's logs of a refused order were lost with them.
+STORE_MEMBERS = GROUP_COMPONENTS + ("lake-reader", "bor-reader")
+STORE_LOGS = ".e2e-said-stores.log"
+# Each kubectl call's own bound: an API server that does not answer costs
+# the run this per call, never the job's limit.
+STORE_LOGS_TIMEOUT = "20s"
+# The classes whose first refused write's logs are kept.
+STORE_LOGS_KEPT = set()
+
+
+def keep_store_logs(when):
+    """Every lake and book member's logs (`STORE_MEMBERS`, all containers,
+    timestamped, the last SAID_LINES of each), appended to STORE_LOGS under
+    `when`. Each call bounded by STORE_LOGS_TIMEOUT; what is not answered is
+    said in the file."""
+    bound = f"--request-timeout={STORE_LOGS_TIMEOUT}"
+    selector = f"app.kubernetes.io/instance={RELEASE},meridian.dev/component in ({','.join(STORE_MEMBERS)})"
+    listed = kubectl("get", "pods", "-l", selector, "-o", "name", bound, check=False)
+    parts = [f"== {when}, at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+    if listed.returncode != 0:
+        parts.append(f"(the members were not listed: {listed.stderr.decode(errors='replace').strip()})")
+    for name in listed.stdout.decode(errors="replace").split():
+        said = kubectl("logs", name, "--all-containers", "--prefix", "--timestamps", f"--tail={SAID_LINES}",
+                       bound, check=False)
+        parts.append(f"== {name}")
+        parts.append((said.stdout + said.stderr).decode(errors="replace"))
+    with open(STORE_LOGS, "a", encoding="utf-8") as kept:
+        kept.write("\n".join(parts) + "\n")
+    print(f"R: {when}: the lake's and the book's members' logs, kept in {STORE_LOGS}", flush=True)
+
+
+def store_logs_at_first_refusal(failure, what):
+    """The members' logs kept at `failure`'s first refused write, once."""
+    if failure not in STORE_LOGS_KEPT:
+        STORE_LOGS_KEPT.add(failure)
+        keep_store_logs(f"{failure}: the first refused write, {what}")
+
+
+def upgrade_kept(*sets):
+    """An upgrade (`upgrade`), the members' logs kept before it rolls them."""
+    keep_store_logs(f"before the upgrade to {' '.join(sets)}")
+    return upgrade(*sets)
+
+
 def window_held(s, what, began_ms, ended_ms):
     """The driver's writes while a move ran, and through the hold after it
     began: their p99 time within the hold, and none refused. A move shorter
     than the driver's pace began no write of its own (CI 43626539705, ha:
     "None ms of 0 writes"), so the window is at least the hold."""
     until_ms = max(ended_ms, began_ms + HOLD_SECONDS * 1000) + 1000
+    WINDOWS.append((began_ms, until_ms))
     # Each write by when it began (its answer's time less its own), never
-    # by its answer alone: a write begun in the window and answered after it
+    # by its answer alone, refused or answered alike (PR CI 45225932982: an
+    # order begun before a move's window, timed out 5 s later inside it,
+    # was charged to it): a write begun in the window and answered after it
     # is counted with its whole time (CI 43636763392, ha: "None ms of 0
     # writes" through a range's move -- writes answered past the window's
     # end were not counted at all). Read once the window's writes had the
@@ -6119,7 +6223,7 @@ def window_held(s, what, began_ms, ended_ms):
                   if len(p) == 4 and p[2].isdigit() and p[3].isdigit()
                   and began_ms <= int(p[2]) - int(p[3]) <= until_ms)
     refused = [p for p in driver_lines("/tmp/refused")
-               if len(p) >= 4 and p[3].isdigit() and began_ms <= int(p[3]) <= until_ms]
+               if refusal(p) and began_ms <= refusal(p)[0] <= until_ms]
     p99 = took[min(len(took) - 1, int(len(took) * 0.99))] if took else None
     s.check(bool(took) and p99 <= HOLD_SECONDS * 1000,
             f"rebalance: {what}: the driver's p99 write time while it moved within moves.holdSeconds "
@@ -6127,6 +6231,7 @@ def window_held(s, what, began_ms, ended_ms):
     # Each refusal's whole words, in the job's log and the run's artifact
     # (.e2e-refused.log): the next red names its cause (CI 43626539705).
     if refused:
+        store_logs_at_first_refusal("rebalance", what)
         with open(".e2e-refused.log", "a") as kept:
             kept.write(f"== {what}\n")
             for p in refused:
@@ -6139,6 +6244,32 @@ def window_held(s, what, began_ms, ended_ms):
     if p99 is not None:
         claim(s, "rebalance", what, p99 / 1000, HOLD_SECONDS,
               {"move_s": round((ended_ms - began_ms) / 1000, 2), "writes": len(took)})
+
+
+def refused_between(s, what, windows):
+    """The driver's writes refused between moves: begun after one of a
+    phase's move windows ended and before the next began (`windows`, the
+    phase's in turn), with nothing moved, upgraded or aborted meanwhile. A
+    write refused there is refused in steady state, which no write may be,
+    as none may within a move's window: the class fails, each named, and
+    kept with the window's in .e2e-refused.log."""
+    found = []
+    if windows:
+        first, last = windows[0][0], max(until for _, until in windows)
+        for p in driver_lines("/tmp/refused"):
+            said = refusal(p)
+            if said and first <= said[0] <= last and not any(b <= said[0] <= u for b, u in windows):
+                found.append(p)
+    if found:
+        store_logs_at_first_refusal("rebalance", f"refused between moves, {what}")
+        with open(".e2e-refused.log", "a") as kept:
+            kept.write(f"== refused between moves, {what}\n")
+            for p in found:
+                kept.write(" ".join(p) + "\n")
+        for p in found:
+            print(f"      refused between moves: {' '.join(p)}", flush=True)
+    s.check(not found, f"rebalance: {what}: no write refused between moves ({len(found)}: "
+                       f"{[' '.join(p[:3]) for p in found[:3]]}; each in full above and in .e2e-refused.log)")
 
 
 def committed_cut(store, d, kind, name):
@@ -6422,7 +6553,7 @@ def rebalance(s):
     """The rebalance class (step 3d; section 15), after writer_groups."""
     print("R: rebalance: a range, a partition and an account moved under load", flush=True)
     began = time.time()
-    upgraded = upgrade(f"bor.partitions={BOOK_PARTITIONS}")
+    upgraded = upgrade_kept(f"bor.partitions={BOOK_PARTITIONS}")
     s.check(upgraded.returncode == 0, "rebalance: the book at four partitions")
     # Every workload rolled out before her forward is made: the dashboard's
     # among them, handed the chart's values, which replaces its two copies
@@ -6470,16 +6601,18 @@ def moves(s, dash):
             f"rebalance: the driver's half and P0 each held by a group ({half_from} and {p0_from})")
     if half_from not in (0, 1) or p0_from not in (0, 1) or len(accounts) < 2:
         return
+    phase = len(WINDOWS)
     a_move(s, dash, "lake", "range", loaded, 1 - half_from, (0, 0))
     a_move(s, dash, "book", "partition", "P0", 1 - p0_from, (0, 0), by_dialog=True)
     others = sorted(p for p, g in owners.items() if p != "P0" and int(g) == p0_from) or \
         sorted(p for p in owners if p != "P0")
     a_move(s, dash, "book", "account", accounts[0], others[0], (0, 0))
+    refused_between(s, "within one database", WINDOWS[phase:])
     # Across two databases: each store's second database brought by an
     # upgrade, group 1 writing to it; its partitions moved there by the
     # count's change; then the driver's half, P0 and an account moved from
     # group 0's database to group 1's.
-    upgraded = upgrade("lake.databases=2", "bor.databases=2")
+    upgraded = upgrade_kept("lake.databases=2", "bor.databases=2")
     s.check(upgraded.returncode == 0, "rebalance: the lake and the book at two databases")
     if upgraded.returncode != 0:
         return
@@ -6523,6 +6656,7 @@ def moves(s, dash):
     # pod was ready (CI 43636763392, 20:36:43-45, the lake's and the book's
     # at once, before any move began) -- the restart's, not a move's.
     since_ms = int(time.time() * 1000)
+    phase = len(WINDOWS)
     in_one = happens(lambda: int(psql("select count(*) from book_entry where account_id <> '~control'",
                                       pod=database_pod("bor", 1)) or 0) > 0, 300, every=5)
     s.check(in_one, "rebalance: group 1's book partitions moved to database 1 by the count's change")
@@ -6555,6 +6689,7 @@ def moves(s, dash):
     moved_p0 = "P0" in zeros and a_move(s, dash, "book", "partition", "P0", 1, (0, 1))
     if "P0" not in zeros:
         s.check(False, f"rebalance: P0 in group 0's database to move ({owners})")
+    refused_between(s, "across two databases", WINDOWS[phase:])
     # The aborts, from group 1's database back towards group 0's: the
     # lake's range by an injected digest mismatch, the book's P0 by an
     # injected lag (the gate held shut for moves.switchSeconds).

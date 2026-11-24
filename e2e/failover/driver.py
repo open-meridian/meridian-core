@@ -149,11 +149,17 @@ def took(kind, began):
     kept("/tmp/took", f"TOOK {kind} {int(now * 1000)} {int((now - began) * 1000)}")
 
 
-def refused(kind, ident, failed):
+def refused(kind, ident, began, said):
     """A write refused, or answered by nothing, kept in /tmp/refused as
-    `REFUSED <kind> <id> <unix ms> <its words>`: what the rebalance class
-    holds to none inside a move's hold."""
-    kept("/tmp/refused", f"REFUSED {kind} {ident} {int(time.time() * 1000)} {refusal_words(failed)}")
+    `REFUSED <kind> <id> <unix ms refused> <ms taken> <its words>`: what the
+    rebalance class holds to none inside a move's hold. Its time taken, as
+    a TOOK line's, so a write is placed by when it began: a call timed out
+    at its deadline is refused that long after it began (PR CI 45225932982:
+    an order begun before a move's window, refused 5 s later inside it).
+    `said` is the refusal (its words are made here) or its words."""
+    now = time.time()
+    text = said if isinstance(said, str) else refusal_words(said)
+    kept("/tmp/refused", f"REFUSED {kind} {ident} {int(now * 1000)} {int((now - began) * 1000)} {text}")
 
 
 def refusal_words(failed):
@@ -404,10 +410,10 @@ async def drive_data(plugin, gen):
                 uncounted = (f"UNCOUNTED: answered recorded {done.recorded}, restated {done.restated}, "
                              f"unchanged {done.unchanged} for one row")
                 say(f"REFUSED price {key}: {uncounted}")
-                kept("/tmp/refused", f"REFUSED price {key} {int(time.time() * 1000)} {uncounted}")
+                refused("price", key, began, uncounted)
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
             say(f"REFUSED price {key}: {words(failed)}")
-            refused("price", key, failed)
+            refused("price", key, began, failed)
             await asyncio.sleep(0.5)
         await asyncio.sleep(0.5)
 
@@ -529,7 +535,7 @@ class Book:
                 venue_order_id=str(number), origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED,
                 idempotency_key=f"drive-{number}", acting_for=self.person.assertion())))
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
-            refused("order", number, failed)
+            refused("order", number, began, failed)
             if definitely_not(failed):
                 self.history.write("fail", process, value)
                 say(f"REFUSED order {number}: {words(failed)}")

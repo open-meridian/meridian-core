@@ -783,11 +783,26 @@ impl PreparedStore for InPostgres {
     fn sweep(&self, before_ns: i64) -> Result<usize, String> {
         let mut conn = self.database.conn()?;
         let mut tx = conn.transaction().map_err(said)?;
+        // The deployment's time, named for migration 17's guard: a step is
+        // removed only once its change was kept its 90 days by it.
+        tx.execute(
+            "SELECT set_config('meridian.dashboard_now_ns', $1, true)",
+            &[&(before_ns + super::KEPT_AFTER_SETTLING_NS).to_string()],
+        )
+        .map_err(said)?;
+        // And only what that guard lets go: settled before `before_ns` and
+        // kept its 90 days by the database's own time too, as the guard
+        // counts them, so a deployment clock ahead of the database's never
+        // has a step refused and the whole sweep rolled back; the rest is
+        // the next sweep's (review-core-3d F3). The guard reads its time at
+        // each statement after this one, never earlier.
         let gone: Vec<String> = tx
             .query(
                 "SELECT prepared_call_id FROM dashboard_prepared_call
-                  WHERE settled_at_ns IS NOT NULL AND settled_at_ns < $1",
-                &[&before_ns],
+                  WHERE settled_at_ns IS NOT NULL
+                    AND settled_at_ns < least($1,
+                            (extract(epoch FROM statement_timestamp()) * 1000000000)::bigint - $2)",
+                &[&before_ns, &super::KEPT_AFTER_SETTLING_NS],
             )
             .map_err(said)?
             .iter()

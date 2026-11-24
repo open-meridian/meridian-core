@@ -1020,12 +1020,23 @@ E2E_K3D_SHARED_PATH = /var/lib/meridian-e2e-shared
 E2E_K3D_LOG_LINES ?= 5000
 
 # `ready <what> <command...>`: the command, every two seconds until it
-# succeeds or E2E_K3D_READY_SECONDS have passed.
+# succeeds or E2E_K3D_READY_SECONDS have passed. Sooner where a kube-system
+# pod's sandbox is stuck: in ContainerCreating with its sandbox not made for
+# more than 60 s by this machine's clock (e2e/cluster/stuck-sandbox.sh, which
+# says the pod, its node and how long, then `kubectl describe pod`,
+# kube-system's events and every pod). A sandbox starts in seconds; about 1%
+# of cluster jobs from 2026-11-17 had one stuck until the wait gave up at
+# 300 s, and their runner then hung. $$seen, made by the recipe, keeps the
+# pods each turn found so.
 K3D_READY = ready() { \
 	  what="$$1"; shift; start=$$(date +%s); \
 	  echo "e2e-cluster-k3d: waiting for $$what, at most $(E2E_K3D_READY_SECONDS)s"; \
 	  until "$$@" >/dev/null 2>&1; do \
-	    if [ $$(( $$(date +%s) - start )) -ge $(E2E_K3D_READY_SECONDS) ]; then \
+	    if ! e2e/cluster/stuck-sandbox.sh "$$seen" "$$what" "$$start" >&2; then \
+	      echo "e2e-cluster-k3d: the cluster is left; remove it with: $(K3D) cluster delete $(E2E_K3D_CLUSTER)" >&2; \
+	      return 1; \
+	    fi; \
+	    if [ $$(($$(date +%s) - start )) -ge $(E2E_K3D_READY_SECONDS) ]; then \
 	      echo "e2e-cluster-k3d: gave up on $$what after $(E2E_K3D_READY_SECONDS)s. It said:" >&2; \
 	      "$$@" >&2 || true; \
 	      echo "e2e-cluster-k3d: and the cluster's pods:" >&2; \
@@ -1065,6 +1076,7 @@ e2e-cluster-k3d:
 	[ -n "$$made" ] || { echo "e2e-cluster-k3d: the cluster could not be made, twice" >&2; exit 1; }
 	@$(K3D) kubeconfig get $(E2E_K3D_CLUSTER) > $(E2E_K3D_KUBECONFIG)
 	@$(K3D_READY); export KUBECONFIG=$(E2E_K3D_KUBECONFIG); began=$$(date +%s); \
+	seen=$$(mktemp); trap 'rm -f "$$seen"' EXIT; \
 	ready "the API server (/readyz)" kubectl get --raw /readyz \
 	&& ready "the default service account" kubectl -n default get serviceaccount default \
 	&& ready "kube-system's deployments to exist: $(E2E_K3D_SYSTEM)" kubectl -n kube-system get deployment $(E2E_K3D_SYSTEM) \
@@ -1263,7 +1275,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)) $(if $(E2E_FAILOVER_DRIVEN),$(INTEROP_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-failover-claims.jsonl .e2e-failover-figures.jsonl .e2e-failover-history.edn .e2e-said-*.log .e2e-shards-*.log
+	@rm -f .e2e-failover-claims.jsonl .e2e-failover-figures.jsonl .e2e-failover-history.edn .e2e-failover-book.log .e2e-elle-*.log .e2e-said-*.log .e2e-shards-*.log
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 	 E2E_K3D_LOG_LINES=$(E2E_K3D_LOG_LINES) \

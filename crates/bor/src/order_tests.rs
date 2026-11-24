@@ -187,6 +187,10 @@ struct As {
     delegation: Option<&'static str>,
     /// The sidecar's demo verdict on the connection (contract v26).
     demo: bool,
+    /// The subject's kind as stamped (contract v21): unset unless named.
+    kind: i32,
+    /// The owner stamped beside a service account (contract v21).
+    owner: Option<&'static str>,
 }
 
 fn person(subject: &'static str) -> As {
@@ -223,6 +227,8 @@ async fn send_from<M: Message>(
         connectivity_allowed: from.allowed,
         acting_through_delegation: from.delegation.unwrap_or_default().to_string(),
         connectivity_demo: from.demo,
+        acting_for_kind: from.kind,
+        owner_subject: from.owner.unwrap_or_default().to_string(),
         ..Default::default()
     };
     bus.call_stamped(

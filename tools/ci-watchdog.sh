@@ -37,9 +37,13 @@
 #                                 steps' results did arrive, so what is known
 #                                 leaves by the API and never by an upload.
 #                                 The check run is made first, from file
-#                                 reads alone (the make's FAILED and last
-#                                 lines, the sampler's last load, memory
-#                                 and disk lines), before any network or
+#                                 reads alone (at its top the runner's
+#                                 image, kernel and host, the proofs'
+#                                 results from proof.log and a stuck
+#                                 sandbox's report from the make; then the
+#                                 make's FAILED and last lines, the
+#                                 sampler's last load, memory and disk
+#                                 lines), before any network or
 #                                 Docker probe: on runs 45130110944 and
 #                                 45139152927 every probe ran to its limit
 #                                 and nothing reached GitHub. The probes'
@@ -53,7 +57,10 @@
 #                                 as the step's result. gave-up: which of
 #                                 the make's `ready` waits gave up; kernel:
 #                                 the kernel's blocked-task, hung-task,
-#                                 netlink and unregister_netdevice lines;
+#                                 RCU-stall, unregister_netdevice and
+#                                 netlink-fault lines, said as matched,
+#                                 clean or unreadable (a ::warning::, and
+#                                 the step passes: only matched is red);
 #                                 answers: whether `ip -o link` and `docker
 #                                 ps` each answer within 3 s, said to the
 #                                 step's outputs as stalled=true|false.
@@ -247,10 +254,24 @@ loop() {
 
 # What a failed make left on disk, from file reads alone: no network and no
 # Docker, so it is ready to send before anything is probed. $1 is the make's
-# log, $2 the sampler's file.
+# log, $2 the sampler's file. Evidence first: the runner, the proofs'
+# results (proof.log beside the make's log: which wait gave up, the kernel's
+# matched, clean or unreadable, whether ip and docker answered) and a stuck
+# sandbox's report from the make (e2e/cluster/stuck-sandbox.sh), each
+# indented so none of their lines reads as a section here. On the runs that
+# hung, the check run's text ended at the first probe below these reads.
 known() {
-  local make=$1 watch=$2
+  local make=$1 watch=$2 proof stuck
+  proof="$(dirname "$make")/proof.log"
   echo "== $(date -u +%Y-%m-%dT%H:%M:%SZ) ${CHECK_NAME:-a cluster job} on $(hostname 2>/dev/null || echo '?'), runner ${RUNNER_NAME:-?}"
+  echo "== the runner: image ${ImageOS:-?} ${ImageVersion:-?}, kernel $(uname -r 2>/dev/null || echo '?'), host $(hostname 2>/dev/null || echo '?')"
+  echo "== the proofs, from local reads before any network call"
+  if [ -s "$proof" ]; then awk 'NR <= 80 { print "  " $0 }' "$proof" || true; else echo "  (no proof.log at $proof: the proof steps did not run or wrote nothing)"; fi
+  echo "== a stuck sandbox, as the make's ready wait found it"
+  stuck=$(awk '/^e2e-cluster-k3d: gave up on .* in ContainerCreating for /{on=1}
+    on && n++ < 200 { print "  " $0 }
+    on && /^e2e-cluster-k3d: the cluster is left/ { exit }' "$make" 2>/dev/null || true)
+  if [ -n "$stuck" ]; then printf '%s\n' "$stuck"; else echo "  (none: no ready wait gave up on a stuck sandbox)"; fi
   echo "== FAILED and gave-up lines: the make's, then the e2e's own logs'"
   grep -h -E 'FAILED|gave up|could not be made' "$make" .e2e-*.log 2>/dev/null | tail -n 40 || true
   echo "== the make's last 60 lines"
@@ -463,8 +484,15 @@ case $cmd in
         ;;
       kernel)
         # As root where it can be, since dmesg is root's on GitHub's runners;
-        # the journal's kernel lines where dmesg says nothing.
-        pattern='blocked for more than|hung_task|INFO: task |netlink|unregister_netdevice'
+        # the journal's kernel lines where dmesg says nothing. Three
+        # outcomes, each said in words and as kernel=<it> in the step's
+        # outputs: matched, the step's only red, so a red means a stall
+        # line; clean; and unreadable, a warning on a passing step, since
+        # nothing was found either way. The lines a stall writes, and
+        # netlink only beside an error, a timeout or "stuck": a bare
+        # `netlink` matched every boot's "NET: Registered PF_NETLINK" and
+        # "audit: initializing netlink subsys" lines.
+        pattern='blocked for more than|hung_task|unregister_netdevice: waiting|rcu_sched self-detected stall|INFO: task .* blocked|netlink.*(error|timeout|stuck)|(error|timeout|stuck).*netlink'
         read_by=""
         # Each try's seconds first, 8 in all, inside the step's 10: sudo can
         # itself wait on a name lookup.
@@ -473,15 +501,19 @@ case $cmd in
           if within $how && [ "$within_rc" = 0 ] && [ -n "$within_out" ]; then read_by=${how#* }; break; fi
         done
         if [ -z "$read_by" ]; then
-          echo "sudo -n dmesg (4 s), dmesg (2 s) and journalctl -k (2 s) gave nothing" | say error "the kernel's log could not be read"
-          exit 1
+          [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=unreadable" >>"$GITHUB_OUTPUT"
+          echo "sudo -n dmesg (4 s), dmesg (2 s) and journalctl -k (2 s) gave nothing: whether the kernel logged a stall is not known" \
+            | say warning "kernel: unreadable, its log could not be read"
+          exit 0
         fi
         found=$(printf '%s\n' "$within_out" | grep -i -E "$pattern" | tail -n 30 || true)
         if [ -n "$found" ]; then
-          printf '%s\n' "$found" | say error "the kernel logged $(printf '%s\n' "$found" | grep -c .) blocked-task, hung-task, netlink or unregister_netdevice lines"
+          [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=matched" >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$found" | say error "kernel: matched, $(printf '%s\n' "$found" | grep -c .) blocked-task, hung-task, RCU-stall, unregister_netdevice or netlink-fault lines"
           exit 1
         fi
-        echo "$(printf '%s\n' "$within_out" | grep -c .) lines read by $read_by" | say notice "the kernel logged no blocked task, hung task, netlink or unregister_netdevice line"
+        [ -z "${GITHUB_OUTPUT:-}" ] || echo "kernel=clean" >>"$GITHUB_OUTPUT"
+        echo "$(printf '%s\n' "$within_out" | grep -c .) lines read by $read_by" | say notice "kernel: clean, no blocked task, hung task, RCU stall, unregister_netdevice wait or netlink fault"
         ;;
       answers)
         stalled=false

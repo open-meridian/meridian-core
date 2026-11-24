@@ -44,7 +44,11 @@ use crate::in_flight::{kind, InFlightStore, Marked};
 use crate::session::token;
 use crate::terminal::{hashed, same, unreserved, url_safe, verifies, Person, Unavailable};
 
+pub mod record;
 mod store;
+pub use record::DelegationChange;
+pub use store::backfill_from_rows;
+pub(crate) use store::held_when_records_began;
 pub use store::{CallsOf, DelegationStore, InMemory, InPostgres};
 
 pub const DAY_NS: i64 = 24 * HOUR_NS;
@@ -351,7 +355,7 @@ pub async fn rewrite_once_records_are_read(
 ) {
     loop {
         if let Ok(read) = records.current(clock.now_ns()) {
-            match rewrite_recorded_rows(&delegations, &read).await {
+            match rewrite_recorded_rows(&delegations, &read, clock.now_ns()).await {
                 Ok(0) => {}
                 Ok(rewritten) => tracing::info!(
                     rewritten,
@@ -369,19 +373,56 @@ pub async fn rewrite_once_records_are_read(
     }
 }
 
+/// How often the removals the release before made with no record are asked
+/// for (review-core-3d F1): it removes them until its last replica stops,
+/// after this release's dashboards have started, so asked only at start
+/// they would stay unrecorded until the next. Each ask reads every record,
+/// so not each minute (review-core-3c N4).
+pub const REMOVALS_OWED_EVERY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The removals the release before made, still serving as the upgrade ran,
+/// given their records (review-core-3b B): one ask, said where it gave any.
+/// The dashboard asks at start and every [`REMOVALS_OWED_EVERY`] after, each
+/// failed ask tried again with a growing pause
+/// (`meridian_runtime::again_every`).
+pub async fn removals_owed(
+    delegations: &Delegations,
+    clock: &dyn crate::clock::Clock,
+) -> Result<(), String> {
+    let given = delegations
+        .removals_owed(clock.now_ns())
+        .await
+        .map_err(|unavailable| unavailable.to_string())?;
+    if given > 0 {
+        tracing::info!(
+            given,
+            "delegations the release before removed given their removal records"
+        );
+    }
+    Ok(())
+}
+
 /// The rows rewrite: every delegation recorded with rows from before v15,
 /// once the records are first read at v15 (W6.17), each rewrite logged.
 /// Returns how many delegations it rewrote.
 pub async fn rewrite_recorded_rows(
     delegations: &Delegations,
     records: &AccessRecords,
+    now_ns: i64,
 ) -> Result<usize, Unavailable> {
     let mut rewritten = 0;
     for delegation in delegations.narrowed().await? {
         let Some(covers) = rewrite_rows(&delegation.covers, records) else {
             continue;
         };
-        delegations.rewrite(&delegation.id, &covers).await?;
+        // Worked out from what was read, unheld: a renewal since wins, and
+        // nothing is rewritten (review-core-3 4).
+        if !delegations
+            .rewrite(&delegation.id, &delegation.covers, &covers, now_ns)
+            .await?
+        {
+            continue;
+        }
         tracing::info!(
             delegation = delegation.id,
             subject = delegation.subject,
@@ -1372,10 +1413,26 @@ impl Delegations {
         self.stored(|store| store.narrowed()).await
     }
 
-    /// A delegation's rows as rewritten once to name each plugin's role.
-    pub async fn rewrite(&self, id: &str, covers: &Covers) -> Result<(), Unavailable> {
-        let (id, covers) = (id.to_string(), covers.clone());
-        self.stored(move |store| store.rewrite(&id, &covers)).await
+    /// A delegation's rows as rewritten once to name each plugin's role, at
+    /// `now_ns`, from the rows `read`: nothing where they changed since.
+    /// True when it rewrote them.
+    pub async fn rewrite(
+        &self,
+        id: &str,
+        read: &Covers,
+        covers: &Covers,
+        now_ns: i64,
+    ) -> Result<bool, Unavailable> {
+        let (id, read, covers) = (id.to_string(), read.clone(), covers.clone());
+        self.stored(move |store| store.rewrite(&id, &read, &covers, now_ns))
+            .await
+    }
+
+    /// Every change recorded for one delegation, in the order recorded
+    /// (decision 47).
+    pub async fn changes(&self, id: &str) -> Result<Vec<DelegationChange>, Unavailable> {
+        let id = id.to_string();
+        self.stored(move |store| store.changes(&id)).await
     }
 
     /// A delegation narrowed before v18, its consented tools filled in once
@@ -1519,6 +1576,12 @@ impl Delegations {
     /// The latest calls on a delegation, or of a person, newest first.
     pub async fn calls(&self, of: CallsOf, limit: usize) -> Result<Vec<ToolCall>, Unavailable> {
         self.stored(move |store| store.calls(&of, limit)).await
+    }
+
+    /// Each delegation the release before removed with no record, given
+    /// its backfilled removal once (review-core-3c N4). Answers how many.
+    pub async fn removals_owed(&self, now_ns: i64) -> Result<usize, Unavailable> {
+        self.stored(move |store| store.removals_owed(now_ns)).await
     }
 
     pub async fn sweep(&self, now_ns: i64) -> Result<(), Unavailable> {
