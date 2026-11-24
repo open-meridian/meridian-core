@@ -93,7 +93,10 @@ pub struct Opened {
     /// among them, the hour it opened in, so two copies asking seconds apart
     /// file one notice, and one condition opening again within the hour
     /// files none again (decision 40). Two copies judging
-    /// either side of an hour's boundary still file two, until v32.
+    /// either side of an hour's boundary still file two, until v32. A
+    /// write-ahead stream's stuck spell, and its draining, are windowed by
+    /// the time it went stuck, as its writer says it: one event to every
+    /// copy, on either side of an hour.
     pub event: String,
     pub window_ns: i64,
 }
@@ -104,8 +107,10 @@ pub struct Judge {
     members: BTreeMap<String, Kept>,
     unheard: Unheard,
     /// The core components whose write-ahead stream stands stuck full, as
-    /// one of their members said last (v31a item 5).
-    stuck_full: BTreeSet<String>,
+    /// one of their members said (v31a item 5), each with its spell: the
+    /// time its stream went stuck. One is here once its stuck notice is
+    /// kept, and until its drained notice is ([`Judge::kept`]).
+    stuck_full: BTreeMap<String, i64>,
 }
 
 fn mib(bytes: u64) -> u64 {
@@ -261,43 +266,60 @@ impl Judge {
     /// The lake's write-ahead stream stuck full, as a core member's report
     /// says first in its words (v31a item 5, 0-J): a standing notice, opened
     /// once while any member of the component says so, and its drained
-    /// notice once none of those reporting does. Its window is the hour, as
-    /// every kind's but a restart's (decision 40).
-    fn stuck_full(&mut self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
+    /// notice once none of those reporting does.
+    ///
+    /// One stuck spell is one event, whoever judges it and when (the review
+    /// of 4c, fix B item 1): its window is the time the stream went stuck,
+    /// as the lake's guard says it in those words
+    /// ([`meridian_bus::write_ahead::stuck_since`]), the earliest said, so
+    /// every copy of the dashboard, and one started again, names the same
+    /// event and the notices' store keeps it once; a second spell within
+    /// the hour is another event. Its drained notice carries the same
+    /// window. Words saying no time are a spell of the hour judged, as
+    /// every other kind's window is (decision 40).
+    ///
+    /// Each is offered at every judging until [`Judge::kept`] says it was
+    /// kept: an opening dropped -- the records stale, or the keeping failed
+    /// -- is not lost, and its keyed ID makes a repeat harmless. A writer
+    /// moved while its stream stands stuck says a later time: the same
+    /// spell to a copy that kept its notice, another to one started since.
+    fn stuck_full(&self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
         let stuck = meridian_bus::write_ahead::STUCK_FULL;
-        let window_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
-        let mut said: BTreeMap<&str, Option<&ComponentReport>> = BTreeMap::new();
+        let hour_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
+        // Each core component reporting, and of its members saying so the
+        // one whose stream went stuck first.
+        let mut said: BTreeMap<&str, Option<(i64, &ComponentReport)>> = BTreeMap::new();
         for report in members
             .iter()
             .filter(|r| !r.component.starts_with("sidecar-"))
         {
             let saying = said.entry(report.component.as_str()).or_default();
-            if saying.is_none() && report.detail.starts_with(stuck) {
-                *saying = Some(report);
+            if report.detail.starts_with(stuck) {
+                let since =
+                    meridian_bus::write_ahead::stuck_since(&report.detail).unwrap_or(hour_ns);
+                if saying.is_none_or(|(first, _)| since < first) {
+                    *saying = Some((since, report));
+                }
             }
         }
         let mut opened = Vec::new();
         for (component, saying) in said {
-            let open = self.stuck_full.contains(component);
-            let (name, about) = match (saying, open) {
-                (Some(report), false) => (
+            let (name, window_ns, about) = match (saying, self.stuck_full.get(component)) {
+                (Some((since, report)), None) => (
                     "write-ahead-stuck-full",
+                    since,
                     format!(
                         "{component}/{}: {}. Standing until it drains; its cause goes to a diagnosis",
                         report.member, report.detail
                     ),
                 ),
-                (None, true) => (
+                (None, Some(since)) => (
                     "write-ahead-drained",
+                    *since,
                     format!("{component}: the lake's write-ahead stream drained, no longer at a bound"),
                 ),
                 _ => continue,
             };
-            if open {
-                self.stuck_full.remove(component);
-            } else {
-                self.stuck_full.insert(component.to_string());
-            }
             let kind = format!("component-{name}");
             opened.push(Opened {
                 of: component.to_string(),
@@ -353,10 +375,22 @@ impl Judge {
     }
 
     /// What one judging opened is kept, or there was nobody to tell: the
-    /// conductor's silence, among them, is not offered again while it lasts.
+    /// conductor's silence, among them, is not offered again while it lasts,
+    /// nor a stream's stuck spell while it stands, nor its draining.
     pub fn kept(&mut self, opened: &[Opened]) {
-        if opened.iter().any(|one| one.kind == "component-unheard") {
-            self.unheard.open = true;
+        for one in opened {
+            match one.kind.as_str() {
+                "component-unheard" => self.unheard.open = true,
+                // A stuck spell stands from its notice kept to its drained
+                // notice kept.
+                "component-write-ahead-stuck-full" => {
+                    self.stuck_full.insert(one.of.clone(), one.window_ns);
+                }
+                "component-write-ahead-drained" => {
+                    self.stuck_full.remove(&one.of);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -577,6 +611,7 @@ mod tests {
         let mut judge = Judge::default();
         assert!(judge.judge(&[lake(MIB, 0, 0, 0)], T0).is_empty());
         let opened = judge.judge(&[stuck("meridian-lake-0")], T0 + MINUTE);
+        judge.kept(&opened);
         assert_eq!(kinds(&opened), vec!["component-write-ahead-stuck-full"]);
         assert!(!opened[0].plugin && opened[0].of == "lake");
         assert!(
@@ -598,11 +633,115 @@ mod tests {
         );
         let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
         assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
+        judge.kept(&opened);
         assert!(judge
             .judge(&[lake(MIB, 0, 0, 0)], T0 + 5 * MINUTE)
             .is_empty());
         let opened = judge.judge(&[stuck("meridian-lake-1")], T0 + 120 * MINUTE);
         assert_eq!(kinds(&opened), vec!["component-write-ahead-stuck-full"]);
+    }
+
+    /// The lake's writer's words for a stream stuck full since `since`, as
+    /// its guard says them.
+    fn stuck_since(member: &str, since: &str) -> ComponentReport {
+        ComponentReport {
+            member: member.into(),
+            detail: format!(
+                "{} for 30s, since {since}: holds 256.0 MiB of its 256.0 MiB bound",
+                meridian_bus::write_ahead::STUCK_FULL
+            ),
+            ..lake(MIB, 0, 0, 0)
+        }
+    }
+
+    /// The review of 4c, fix B item 1: a stuck spell is one episode, keyed
+    /// by the time its stream went stuck, which the lake's guard says. A
+    /// second spell within the hour of the first is another episode, with
+    /// its own stuck and drained notices.
+    #[test]
+    fn a_second_stuck_spell_within_the_hour_opens_its_own_notices() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let (records, store) = (records(), InMemory::default());
+        let mut judge = Judge::default();
+        let mut events = Vec::new();
+        let spells = [
+            (Some("2026-10-26T07:33:50Z"), MINUTE),
+            (None, 3 * MINUTE),
+            (Some("2026-10-26T07:37:40Z"), 5 * MINUTE),
+            (None, 7 * MINUTE),
+        ];
+        for (since, after) in spells {
+            let report = match since {
+                Some(since) => stuck_since("meridian-lake-0", since),
+                None => lake(MIB, 0, 0, 0),
+            };
+            let opened = judge.judge(&[report], T0 + after);
+            assert_eq!(opened.len(), 1, "{since:?}: {opened:#?}");
+            store
+                .notify(&notices_of(&records, &opened, T0 + after))
+                .unwrap();
+            judge.kept(&opened);
+            events.push(opened[0].event.clone());
+        }
+        assert_ne!(events[0], events[2], "each spell its own event");
+        assert_ne!(events[1], events[3]);
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 4, "{filed:#?}");
+    }
+
+    /// Fix B item 1: two copies of the dashboard, judging the same episode
+    /// either side of an hour's boundary -- or one started again within it
+    /// -- file its stuck notice once, and its drained notice once.
+    #[test]
+    fn two_judges_seeing_one_stuck_episode_file_one_notice_and_one_drained() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let (records, store) = (records(), InMemory::default());
+        // The hour after T0 starts 1,600 s after it.
+        let hour = T0 + 1_600_000_000_000;
+        let (mut a, mut b) = (Judge::default(), Judge::default());
+        let stuck = stuck_since("meridian-lake-0", "2026-10-26T07:59:00Z");
+        for (stage, kind) in [
+            (stuck, "component-write-ahead-stuck-full"),
+            (lake(MIB, 0, 0, 0), "component-write-ahead-drained"),
+        ] {
+            for (judge, at) in [
+                (&mut a, hour - 20_000_000_000),
+                (&mut b, hour + 20_000_000_000),
+            ] {
+                let opened = judge.judge(std::slice::from_ref(&stage), at);
+                assert_eq!(kinds(&opened), vec![kind]);
+                store.notify(&notices_of(&records, &opened, at)).unwrap();
+                judge.kept(&opened);
+            }
+        }
+        // A copy started again while it stands stuck files none again.
+        let mut again = Judge::default();
+        let stuck = stuck_since("meridian-lake-0", "2026-10-26T07:59:00Z");
+        let opened = again.judge(&[stuck], hour + MINUTE);
+        store
+            .notify(&notices_of(&records, &opened, hour + MINUTE))
+            .unwrap();
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 2, "{filed:#?}");
+    }
+
+    /// Fix B item 1: the judge takes a stream for stuck, or drained, only
+    /// once its notice is kept: one whose keeping failed is offered again
+    /// at the next judging, as the same event.
+    #[test]
+    fn a_stuck_notice_that_was_not_kept_is_offered_again() {
+        let mut judge = Judge::default();
+        let stuck = stuck_since("meridian-lake-0", "2026-10-26T07:33:50Z");
+        let dropped = judge.judge(std::slice::from_ref(&stuck), T0 + MINUTE);
+        let opened = judge.judge(std::slice::from_ref(&stuck), T0 + 2 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-stuck-full"]);
+        assert_eq!(opened[0].event, dropped[0].event);
+        judge.kept(&opened);
+        assert!(judge.judge(&[stuck], T0 + 3 * MINUTE).is_empty());
+        let dropped = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
+        let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 5 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
+        assert_eq!(opened[0].event, dropped[0].event);
     }
 
     #[test]

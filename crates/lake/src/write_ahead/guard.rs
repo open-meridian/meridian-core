@@ -134,9 +134,18 @@ impl Standing {
         by_bytes || by_age
     }
 
-    /// The words it is said with while stuck full: [`STUCK_FULL`], then
-    /// the figures that tell its causes apart.
-    pub fn words(&self, bounds: &Bounds, next: u64, now_ns: i64, stuck_for: Duration) -> String {
+    /// The words it is said with while stuck full: [`STUCK_FULL`], for how
+    /// long and since when -- `since_ns`, the wall clock at the first look
+    /// that found it at a bound, which names the spell for the dashboard's
+    /// judge -- then the figures that tell its causes apart.
+    pub fn words(
+        &self,
+        bounds: &Bounds,
+        next: u64,
+        now_ns: i64,
+        stuck_for: Duration,
+        since_ns: i64,
+    ) -> String {
         let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
         let age = match self.unrecorded_age(next, now_ns) {
             Some(age) => format!(
@@ -150,10 +159,10 @@ impl Standing {
             ),
         };
         format!(
-            "{STUCK_FULL} for {}s: holds {:.1} MiB of its {:.1} MiB bound, {age}, {} write(s) \
+            "{}: holds {:.1} MiB of its {:.1} MiB bound, {age}, {} write(s) \
              past the lake's place (the lake at {}, the stream at {}); a write it has no room \
              for is refused for load, none it holds is dropped",
-            stuck_for.as_secs(),
+            meridian_bus::write_ahead::stuck_full_since(stuck_for.as_secs(), since_ns),
             mib(self.bytes),
             mib(u64::try_from(bounds.max_bytes).unwrap_or(0)),
             self.past(next),
@@ -169,8 +178,9 @@ pub struct Full {
     after: Duration,
     /// The broker's largest message, bytes.
     largest_write: u64,
-    /// Since when every look found the stream at a bound.
-    since: Option<tokio::time::Instant>,
+    /// Since when every look found the stream at a bound, and the wall
+    /// clock then.
+    since: Option<(tokio::time::Instant, i64)>,
 }
 
 impl Full {
@@ -197,9 +207,9 @@ impl Full {
             self.since = None;
             return None;
         }
-        let since = *self.since.get_or_insert(at);
+        let (since, since_ns) = *self.since.get_or_insert((at, now_ns));
         let stuck_for = at.duration_since(since);
-        (stuck_for >= self.after).then(|| standing.words(bounds, next, now_ns, stuck_for))
+        (stuck_for >= self.after).then(|| standing.words(bounds, next, now_ns, stuck_for, since_ns))
     }
 }
 

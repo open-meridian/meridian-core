@@ -43,8 +43,8 @@ async fn a_stream_at_its_byte_bound_for_the_stuck_bound_is_said_stuck_full_until
         .expect("stuck full after 30 s at its bound");
     assert!(said.starts_with(STUCK_FULL), "{said}");
     for figure in [
-        "for 30s",
-        "holds 256.0 MiB of its 256.0 MiB bound",
+        // Since the first look that found it at a bound, 1,700,000,000 s.
+        "for 30s, since 2023-11-14T22:13:20Z: holds 256.0 MiB of its 256.0 MiB bound",
         "the oldest write the lake has not recorded 120s old of its 600s bound",
         "3100 write(s) past the lake's place",
         "the lake at 900, the stream at 4000",
@@ -54,9 +54,19 @@ async fn a_stream_at_its_byte_bound_for_the_stuck_bound_is_said_stuck_full_until
     // Drained below its bound by more than the largest write: no longer.
     let drained = standing(3_000, 4_000, 200 * MIB, now, 60);
     assert_eq!(full.looked(at(35), &drained, 3_500, &bounds(), now), None);
-    assert_eq!(full.looked(at(40), &stuck, 3_500, &bounds(), now), None);
+    assert_eq!(
+        full.looked(at(40), &stuck, 3_500, &bounds(), now + 40 * S),
+        None
+    );
     assert_eq!(full.looked(at(65), &stuck, 3_500, &bounds(), now), None);
-    assert!(full.looked(at(70), &stuck, 3_500, &bounds(), now).is_some());
+    // Another spell, said since its own first look at a bound.
+    let said = full.looked(at(70), &stuck, 3_500, &bounds(), now + 70 * S);
+    assert_eq!(
+        said.as_deref()
+            .and_then(meridian_bus::write_ahead::stuck_since),
+        Some(now + 40 * S),
+        "{said:?}"
+    );
 }
 
 /// Full of writes the lake recorded -- its place at the stream's last --

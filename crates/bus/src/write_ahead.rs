@@ -49,6 +49,73 @@ pub const STREAM: &str = "LAKE_WRITE_AHEAD";
 /// status` shows. The lake's guard says it (`meridian_lake::write_ahead::guard`).
 pub const STUCK_FULL: &str = "the lake's write-ahead stream is stuck full";
 
+/// How the stuck-full words say since when, after [`STUCK_FULL`] and for
+/// how long: `, since 2026-11-24T10:00:00Z`.
+const STUCK_SINCE: &str = ", since ";
+
+/// The words a stuck-full stream is said with open so: [`STUCK_FULL`], for
+/// how long, and the time it went stuck, to the second, UTC. That time
+/// names the stuck spell: every copy of the dashboard reads the same one
+/// from the same member, and files the spell's notices once
+/// ([`stuck_since`]).
+pub fn stuck_full_since(stuck_for_s: u64, since_ns: i64) -> String {
+    let seconds = since_ns.div_euclid(1_000_000_000);
+    let (days, of_day) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    // Days since 1970 to a civil date (Howard Hinnant's civil-from-days).
+    let shifted = days + 719_468;
+    let (era, day_of_era) = (shifted.div_euclid(146_097), shifted.rem_euclid(146_097));
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{STUCK_FULL} for {stuck_for_s}s{STUCK_SINCE}{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        of_day / 3_600,
+        of_day % 3_600 / 60,
+        of_day % 60
+    )
+}
+
+/// The time a member's words say its stream went stuck, ns since the
+/// epoch ([`stuck_full_since`]): none where they do not say it stuck full,
+/// or say no time that reads.
+pub fn stuck_since(detail: &str) -> Option<i64> {
+    let said = detail.strip_prefix(STUCK_FULL)?;
+    let at = said.split_once(STUCK_SINCE)?.1.get(..20)?;
+    let digits = |from: usize, to: usize| at.get(from..to)?.parse::<i64>().ok();
+    let marks = at.as_bytes();
+    if [
+        marks[4], marks[7], marks[10], marks[13], marks[16], marks[19],
+    ] != *b"--T::Z"
+    {
+        return None;
+    }
+    let (year, month, day) = (digits(0, 4)?, digits(5, 7)?, digits(8, 10)?);
+    let (hour, minute, second) = (digits(11, 13)?, digits(14, 16)?, digits(17, 19)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // A civil date to days since 1970 (Howard Hinnant's days-from-civil).
+    let year = year - i64::from(month <= 2);
+    let (era, year_of_era) = (year.div_euclid(400), year.rem_euclid(400));
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000_000_000)
+}
+
 /// Where a dataset's writes go: its instance and its key, one subject a
 /// dataset; a plugin's credential publishes on its own instance's alone.
 /// Spelled as the topic registry names it.
@@ -972,6 +1039,29 @@ mod tests {
         ] {
             assert_eq!(subject_of(bad), None, "{bad}");
         }
+    }
+
+    /// The time a stream went stuck is said to the second and read back
+    /// as it was said; words saying none, or not stuck full, give none.
+    #[test]
+    fn the_time_a_stream_went_stuck_is_read_back_as_it_was_said() {
+        for (seconds, said) in [
+            (1_793_000_000, "2026-10-26T07:33:20Z"),
+            (1_709_251_199, "2024-02-29T23:59:59Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (0, "1970-01-01T00:00:00Z"),
+        ] {
+            let words = stuck_full_since(30, seconds * 1_000_000_000 + 999);
+            assert_eq!(words, format!("{STUCK_FULL} for 30s, since {said}"));
+            let detail = format!("{words}: holds 256.0 MiB of its 256.0 MiB bound");
+            assert_eq!(stuck_since(&detail), Some(seconds * 1_000_000_000));
+        }
+        assert_eq!(stuck_since(&format!("{STUCK_FULL} for 30s: holds")), None);
+        assert_eq!(
+            stuck_since(&format!("{STUCK_FULL} for 30s, since soon")),
+            None
+        );
+        assert_eq!(stuck_since("ready, since 2026-10-26T07:33:20Z"), None);
     }
 
     #[test]
