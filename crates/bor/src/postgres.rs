@@ -1924,7 +1924,7 @@ impl PostgresStore {
     /// the account-moved kind, read by what it carries -- never told by
     /// its key's shape, which a caller's command kept before such keys
     /// were refused may have (the second review of #149, 2026-11-24).
-    fn closed_unopened(&self, account_id: &str, partition: &str) -> Result<bool> {
+    pub(crate) fn closed_unopened(&self, account_id: &str, partition: &str) -> Result<bool> {
         let rows = self.asked(account_id, |tx| {
             tx.query(
                 &format!(

@@ -183,10 +183,21 @@ impl Spread {
         &self.stores[0]
     }
 
-    /// The account copied into database `here`, where its act goes, from
-    /// any other whose row names a partition written there: its move closed
-    /// there, toward this database (step 3d; section 6.4). Nothing where it
-    /// is here already, or closed toward nowhere here.
+    /// The account copied into database `here`, where its move's open goes,
+    /// from the database that closed it toward a partition written there
+    /// and holds no open of that close (step 3d; section 6.4). Nothing
+    /// where it is here already, or closed toward nowhere here.
+    ///
+    /// A row naming a partition written here is not a close toward it by
+    /// that alone: a database the account left before, and never let go
+    /// of -- its let-go failed after the open -- keeps such a row. Copied
+    /// from, it wrote that placement over the row the account's own
+    /// database had just closed with, and the move back never opened (the
+    /// second review of #149, F1). So it is copied only from the database
+    /// whose close no database holds the open of, and what this database
+    /// kept of the account from before it left is let go first: the copy
+    /// adds rows by their own keys, and would leave what was projected
+    /// here then in place of what its own database projected since.
     fn bring_in(&self, account_id: &str, here: u32) -> Result<()> {
         let into = self.database(here);
         for (d, store) in self.stores.iter().enumerate() {
@@ -196,15 +207,28 @@ impl Spread {
             let Some(partition) = store.account_row(account_id)? else {
                 continue;
             };
-            if self.of(&partition) == here {
-                let added = into.copy_account_from(store, account_id)?;
+            if self.of(&partition) != here || !store.closed_unopened(account_id, &partition)? {
+                continue;
+            }
+            if into
+                .account_row(account_id)?
+                .is_some_and(|kept| self.of(&kept) != here)
+            {
+                let gone = into.forget_moved_out(account_id)?;
                 tracing::info!(
                     account_id,
-                    from = d,
-                    added,
-                    "an account's move copied it into this database"
+                    database = here,
+                    gone,
+                    "an account moved back to a database that had not let it go: what it kept is let go"
                 );
             }
+            let added = into.copy_account_from(store, account_id)?;
+            tracing::info!(
+                account_id,
+                from = d,
+                added,
+                "an account's move copied it into this database"
+            );
         }
         Ok(())
     }

@@ -10346,3 +10346,112 @@ async fn a_callers_command_keyed_as_a_moves_close_is_refused() {
         .expect_err("a key the book keeps for its own");
     assert!(refused.contains("idempotency_key"), "{refused}");
 }
+
+/// The second review of #149, F1 (it existed before #149): a move there
+/// whose source database never let the account go -- `settle_move` failed
+/// after the open -- leaves that database its row, naming the partition it
+/// went to, and what it projected of the account at the close. A move back,
+/// asked of the group the account is in now, closes there and must open
+/// (section 6.8: the open itself passes): the stale row is no close toward
+/// the database it names, so nothing is copied from it over the row the
+/// close just moved. And what the account's own database projected of it
+/// while it was away is what is read once it is back, never what the stale
+/// copy held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_move_back_over_a_row_not_let_go_opens() {
+    let h = blocking(two_databases);
+    let (home, away) = (partition_of(0, 1), partition_of(1, 1));
+    let (zero_bus, zero_spread) = member_of(&h, 0);
+    let (one_bus, _one_spread) = member_of(&h, 1);
+    let account = accounts_in("ACC-MOVE-BACK", &home, 1, &zero_bus, zero_spread.as_ref())
+        .await
+        .remove(0);
+    let there = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: away.clone(),
+        reason: "there".into(),
+    };
+    send(
+        &zero_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &there,
+        Some(PERSON),
+    )
+    .await
+    .expect("moved there and opened");
+    // Its source database's copy not let go: its row, naming where it
+    // went, and its projections as they were then.
+    let (source, target) = (zero_spread.of(&home), zero_spread.of(&away));
+    assert_ne!(source, target, "a move between databases");
+    blocking(|| {
+        zero_spread
+            .database(source)
+            .copy_account_from(zero_spread.database(target), &account)
+    })
+    .expect("the copy not let go");
+    assert_eq!(
+        blocking(|| zero_spread.database(source).account_row(&account)).unwrap(),
+        Some(away.clone())
+    );
+    // Written while it is away: the stale copy holds nothing of this.
+    write_within(
+        &one_bus,
+        &account,
+        "while away",
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("written while away");
+    let back = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: home.clone(),
+        reason: "back".into(),
+    };
+    let moved = send(
+        &one_bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &back,
+        Some(PERSON),
+    )
+    .await;
+    let rows: Vec<Option<String>> = blocking(|| {
+        (0..zero_spread.count())
+            .map(|d| zero_spread.database(d).account_row(&account).unwrap())
+            .collect()
+    });
+    moved.unwrap_or_else(|refused| {
+        panic!(
+            "the move back opens (rows by database: {rows:?}, home {home}, away {away}): {refused}"
+        )
+    });
+    assert_eq!(
+        rows[source as usize].as_deref(),
+        Some(home.as_str()),
+        "{rows:?}"
+    );
+    let attributes = blocking(|| {
+        zero_spread.attributes(&meridian_bor::store::AttributesRead {
+            scope: meridian_bor::store::Scope::Everything,
+            account_id: account.clone(),
+            since: None,
+            limit: 1,
+            cursor: String::new(),
+        })
+    })
+    .unwrap()
+    .records;
+    assert_eq!(
+        attributes.first().map(|held| held.waits_for_compliance),
+        Some(false),
+        "what was written while it was away is read once it is back"
+    );
+    write_once(&zero_bus, &account, 2)
+        .await
+        .expect("written after the move back");
+    let journal = blocking(|| zero_spread.journal(&account)).unwrap();
+    assert_eq!(
+        journal.last().map(|entry| entry.partition.as_str()),
+        Some(home.as_str())
+    );
+    blocking(move || drop(h));
+}
