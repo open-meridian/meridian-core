@@ -12,6 +12,19 @@ of `make e2e-harness-check`.
   three-agent jobs).
 - tools/ci-watchdog.sh verdict: a failed job's last line names the failed
   check, or the step that died where no check ran (v31a item 11).
+- e2e/cluster/nodes-steady.sh: the cluster is ready only when every node is
+  Ready and no node container is restarting, its restart count steady
+  (v31a item 11; queue run 45395079443's agent-2 restart-looped while every
+  ready wait passed).
+- e2e/cluster/image-load.sh: an image that never reached a node says that
+  node's container state (restarts, exit code, OOMKilled) and its log's last
+  200 lines (e2e/cluster/node-state.sh), as the watchdog's evidence does for
+  every node (v31a item 11).
+- tools/ci-watchdog.sh kernel-again: the kernel's log read again at the end
+  for stall lines, which a hung task writes about two minutes after it
+  blocks, after the proof's read; said, and never failing (v31a item 11).
+- tools/ci-sdk.sh: interop reads the SDK release tools/ci-sdk.txt pins, and
+  another ref only where a run names it, said as a warning (v31a item 11).
 """
 
 import hashlib
@@ -246,6 +259,278 @@ class Watchdog(unittest.TestCase):
         line = self.last_line(log=self.READY.format(system="none", host="x:1"),
                               steps={"make": {"outcome": "success"}, "pulls": {"outcome": "failure"}})
         self.assertEqual(line, "FAILED: the step pulls (failure), after the make")
+
+
+class KernelAgain(unittest.TestCase):
+    """ci-watchdog.sh kernel-again, with sudo, dmesg and journalctl stood
+    in for: the kernel's log is a file the test writes."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="c4b2-kernel-")
+        self.bin = os.path.join(self.dir, "bin")
+        os.makedirs(self.bin)
+        self.make = os.path.join(self.dir, "make.log")
+        self.dmesg = os.path.join(self.dir, "dmesg")
+        stub(self.bin, "sudo", "exit 1\n")
+        stub(self.bin, "dmesg", f"cat {self.dmesg}\n")
+        stub(self.bin, "journalctl", "exit 1\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir)
+
+    def again(self, kernel):
+        with open(self.dmesg, "w") as f:
+            f.write(kernel)
+        env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT")}
+        env["PATH"] = f"{self.bin}:{env['PATH']}"
+        return subprocess.run(["bash", os.path.join(TOOLS, "ci-watchdog.sh"), "kernel-again", self.make],
+                              capture_output=True, text=True, cwd=self.dir, env=env)
+
+    HUNG = ("[  1.0] NET: Registered PF_NETLINK/PF_ROUTE protocol family\n"
+            "[ 245.1] INFO: task containerd:4242 blocked for more than 120 seconds.\n"
+            "[ 245.2] hung_task: blocked tasks\n")
+
+    def test_a_hung_task_logged_after_the_proof_is_said_and_fails_nothing(self):
+        done = self.again(self.HUNG)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("kernel, read again: matched, 2 blocked-task", done.stdout)
+        self.assertIn("::warning title=kernel, read again: matched", done.stdout)
+        with open(os.path.join(self.dir, "proof.log")) as f:
+            self.assertIn("INFO: task containerd:4242 blocked", f.read())
+
+    def test_a_clean_kernel_is_said_clean(self):
+        done = self.again("[  1.0] NET: Registered PF_NETLINK/PF_ROUTE protocol family\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("kernel, read again: clean, 1 lines read by dmesg", done.stdout)
+        self.assertNotIn("::warning", done.stdout)
+
+    def test_an_unreadable_kernel_is_said_unreadable(self):
+        done = self.again("")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("kernel, read again: unreadable", done.stdout)
+
+    def test_the_evidence_and_its_beacon_read_it_again(self):
+        with open(os.path.join(TOOLS, "ci-watchdog.sh")) as f:
+            watchdog = f.read()
+        evidence = watchdog[watchdog.index("\n  evidence)"):watchdog.index("\n  beacon)")]
+        beacon = watchdog[watchdog.index("\n  beacon)"):watchdog.index("\n  kernel-again)")]
+        self.assertIn('kernel-again "$file"', evidence)
+        self.assertIn("kernel_scan", beacon)
+
+
+E2E = os.path.join(TOOLS, "..", "e2e", "cluster")
+
+
+class NodesSteady(unittest.TestCase):
+    """nodes-steady.sh with docker, kubectl and date stood in for, each
+    answering from a file the test writes."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="c4b2-steady-")
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        self.state = os.path.join(self.root, "state")
+        # docker: `ps` lists the node files' names; `inspect` answers a node's
+        # file: running restarting restarts exit-code oomkilled.
+        stub(self.bin, "docker", f"""
+case "$1" in
+  ps) ls {self.root}/node | sed 's/^/x/;s/^x//'; echo k3d-c-serverlb ;;
+  inspect) eval last=\\${{$#}}; cat {self.root}/node/$last ;;
+  logs) echo "the log of $3" ;;
+esac
+""")
+        stub(self.bin, "kubectl", f"cat {self.root}/ready\n")
+        stub(self.bin, "date", f"cat {self.root}/now\n")
+        os.makedirs(os.path.join(self.root, "node"))
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def nodes(self, now, ready=True, **nodes):
+        """Each node keyword: (running, restarting, restarts)."""
+        for name in os.listdir(os.path.join(self.root, "node")):
+            os.remove(os.path.join(self.root, "node", name))
+        lines = []
+        for name, (running, restarting, restarts) in nodes.items():
+            node = "k3d-c-" + name.replace("_", "-")
+            with open(os.path.join(self.root, "node", node), "w") as f:
+                f.write(f"{str(running).lower()} {str(restarting).lower()} {restarts} 0 false\n")
+            lines.append(f"{node} {'True' if ready is True or (ready and name not in ready) else 'False'}")
+        with open(os.path.join(self.root, "ready"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+        with open(os.path.join(self.root, "now"), "w") as f:
+            f.write(f"{now}\n")
+
+    def ask(self):
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", E2E_K3D_STEADY_SECONDS="30")
+        return subprocess.run(["sh", os.path.join(E2E, "nodes-steady.sh"), "c", self.state],
+                              capture_output=True, text=True, env=env)
+
+    def test_nodes_ready_and_never_restarted_pass_once_steady_for_long_enough(self):
+        self.nodes(1000, server_0=(True, False, 0), agent_0=(True, False, 0))
+        self.assertEqual(self.ask().returncode, 1)
+        self.nodes(1020, server_0=(True, False, 0), agent_0=(True, False, 0))
+        early = self.ask()
+        self.assertEqual(early.returncode, 1)
+        self.assertIn("have held for 20s of 30s", early.stdout)
+        self.nodes(1031, server_0=(True, False, 0), agent_0=(True, False, 0))
+        done = self.ask()
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("has not restarted for 31s", done.stdout)
+
+    def test_a_node_restart_looping_never_passes(self):
+        # Agent-2's loop of queue run 45395079443: running at every look,
+        # its count higher at each.
+        for turn in range(12):
+            self.nodes(1000 + 18 * turn, server_0=(True, False, 0), agent_2=(True, False, turn))
+            done = self.ask()
+            self.assertEqual(done.returncode, 1, f"turn {turn}: {done.stdout}")
+        self.assertIn("a node container restarted", done.stdout)
+        self.assertIn("were k3d-c-agent-2=10 k3d-c-server-0=0, now k3d-c-agent-2=11 k3d-c-server-0=0", done.stdout)
+
+    def test_a_node_container_restarting_or_stopped_fails_and_starts_the_clock_again(self):
+        self.nodes(1000, server_0=(True, False, 0), agent_0=(True, False, 1))
+        self.ask()
+        self.nodes(1040, server_0=(True, False, 0), agent_0=(False, True, 1))
+        down = self.ask()
+        self.assertEqual(down.returncode, 1)
+        self.assertIn("k3d-c-agent-0 (running false, restarting true, restarts 1, last exit 0, OOMKilled false)", down.stdout)
+        # Up again with its count unchanged: the clock started again.
+        self.nodes(1050, server_0=(True, False, 0), agent_0=(True, False, 1))
+        self.assertEqual(self.ask().returncode, 1)
+        self.nodes(1081, server_0=(True, False, 0), agent_0=(True, False, 1))
+        self.assertEqual(self.ask().returncode, 0)
+
+    def test_a_node_not_ready_fails_though_its_container_is_steady(self):
+        self.nodes(1000, ready={"agent_1"}, server_0=(True, False, 0), agent_1=(True, False, 0))
+        self.ask()
+        self.nodes(1100, ready={"agent_1"}, server_0=(True, False, 0), agent_1=(True, False, 0))
+        done = self.ask()
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("a node is not Ready: k3d-c-agent-1 (Ready False)", done.stdout)
+        # Ready later: steady since the first look, so it passes at once.
+        self.nodes(1101, server_0=(True, False, 0), agent_1=(True, False, 0))
+        self.assertEqual(self.ask().returncode, 0)
+
+    def test_no_node_container_fails(self):
+        self.nodes(1000)
+        done = self.ask()
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no node container", done.stdout)
+
+    def test_the_bring_up_asks_it_as_the_cluster_is_made_and_in_its_last_wait(self):
+        with open(os.path.join(TOOLS, "..", "Makefile")) as f:
+            make = f.read()
+        recipe = make[make.index("\ne2e-cluster-k3d:"):]
+        recipe = recipe[:recipe.index("the cluster is ready, ")]
+        first = recipe.index("e2e/cluster/nodes-steady.sh")
+        self.assertLess(first, recipe.index('ready "the API server'))
+        self.assertIn('ready "every node Ready, its container running and not restarting', recipe)
+
+
+class ImageLoad(unittest.TestCase):
+    """image-load.sh with k3d and docker stood in for: the import exits 0
+    and agent-1's containerd never holds the image."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="c4b2-load-")
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        stub(self.bin, "k3d", "echo imported\n")
+        stub(self.bin, "sleep", "")
+        stub(self.bin, "docker", """
+case "$1" in
+  ps) printf 'k3d-c-server-0\nk3d-c-agent-1\nk3d-c-serverlb\n' ;;
+  image) exit 0 ;;
+  exec) echo "IMAGE TAG ID SIZE"; [ "$2" = k3d-c-agent-1 ] || echo "docker.io/library/app 1 x 1MB" ;;
+  inspect) echo "running true, restarting false, restarts 3, last exit 137, OOMKilled true, started a, finished b" ;;
+  logs) for n in $(seq 1 250); do echo "line $n of $5"; done | tail -n "$4" ;;
+esac
+""")
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def test_an_image_that_never_reached_a_node_says_what_docker_says_of_that_node(self):
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
+        done = subprocess.run(["sh", os.path.join(E2E, "image-load.sh"), "k3d", "c", "app:1"],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("image-load: app:1 never arrived in k3d-c-agent-1", done.stderr)
+        self.assertIn("node-state: k3d-c-agent-1: running true, restarting false, restarts 3, last exit 137, "
+                      "OOMKilled true", done.stderr)
+        self.assertIn("node-state: k3d-c-agent-1, its log's last 200 lines:", done.stderr)
+        said = [line for line in done.stderr.splitlines() if line.startswith("    line ")]
+        self.assertEqual((len(said), said[-1].strip()), (200, "line 250 of k3d-c-agent-1"))
+        self.assertNotIn("node-state: k3d-c-server-0", done.stderr)
+
+    def test_the_watchdog_s_evidence_says_every_node_container(self):
+        with open(os.path.join(TOOLS, "ci-watchdog.sh")) as f:
+            watchdog = f.read()
+        evidence = watchdog[watchdog.index("\n  evidence)"):watchdog.index("\n  beacon)")]
+        self.assertIn("nodes_said", evidence)
+        self.assertIn("e2e/cluster/node-state.sh\" 200 $bad", watchdog)
+
+
+class SdkRef(unittest.TestCase):
+    """ci-sdk.sh: which meridian-python ref interop reads."""
+
+    def choose(self, *args, pin=None):
+        root = tempfile.mkdtemp(prefix="c4b2-sdk-")
+        self.addCleanup(shutil.rmtree, root)
+        shutil.copy(os.path.join(TOOLS, "ci-sdk.sh"), root)
+        if pin is None:
+            shutil.copy(os.path.join(TOOLS, "ci-sdk.txt"), root)
+        else:
+            with open(os.path.join(root, "ci-sdk.txt"), "w") as f:
+                f.write("# a comment naming main\n\n" + pin + "\n")
+        out = os.path.join(root, "out")
+        env = dict(os.environ, GITHUB_OUTPUT=out)
+        done = subprocess.run(["sh", os.path.join(root, "ci-sdk.sh"), *args], capture_output=True, text=True, env=env)
+        ref = None
+        if os.path.exists(out):
+            with open(out) as f:
+                ref = f.read().strip()
+        return done, ref
+
+    def test_the_pin_is_a_release_and_is_read_by_default(self):
+        done, ref = self.choose()
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertRegex(ref, r"^ref=v[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertNotIn("::warning", done.stdout)
+        self.assertIn("the release tools/ci-sdk.txt names", done.stdout)
+
+    def test_an_empty_input_reads_the_pin(self):
+        done, ref = self.choose("", pin="v1.2.3")
+        self.assertEqual((done.returncode, ref), (0, "ref=v1.2.3"), done.stdout)
+
+    def test_a_run_s_input_is_read_and_said_where_it_is_no_release(self):
+        done, ref = self.choose("main", pin="v1.2.3")
+        self.assertEqual((done.returncode, ref), (0, "ref=main"), done.stdout)
+        self.assertIn("::warning title=interop reads no release::", done.stdout)
+        self.assertIn("sdk_ref input", done.stdout)
+
+    def test_a_branch_pinned_is_said_on_every_run(self):
+        done, ref = self.choose(pin="contract-31")
+        self.assertEqual((done.returncode, ref), (0, "ref=contract-31"), done.stdout)
+        self.assertIn("::warning", done.stdout)
+        self.assertIn("tools/ci-sdk.txt", done.stdout)
+
+    def test_a_ref_with_other_characters_fails(self):
+        done, ref = self.choose("main;id")
+        self.assertEqual((done.returncode, ref), (1, None), done.stdout)
+        self.assertIn("::error::", done.stdout)
+
+    def test_a_pin_file_naming_nothing_fails(self):
+        done, ref = self.choose(pin="")
+        self.assertEqual((done.returncode, ref), (1, None), done.stdout)
+
+    def test_ci_reads_no_sdk_branch_by_the_pull_request_s_name(self):
+        for workflow in ("ci.yaml", "failover-repeat.yaml"):
+            with open(os.path.join(TOOLS, "..", ".github", "workflows", workflow)) as f:
+                text = f.read()
+            self.assertIn("tools/ci-sdk.sh", text, workflow)
+            self.assertNotIn("git ls-remote --exit-code --heads \"$SDK\"", text, workflow)
 
 
 if __name__ == "__main__":

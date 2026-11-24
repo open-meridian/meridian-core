@@ -11,7 +11,8 @@
 # pulled meridian-runtime:local, which the import had left on the server
 # alone) -- the import tried once more where it is not on every one, and the
 # run stopped with the reason and what the import said where one still
-# lacks it.
+# lacks it, with that node's container state and its log's last 200 lines
+# (node-state.sh).
 set -u
 k3d="$1"
 cluster="$2"
@@ -85,6 +86,10 @@ for image in "$@"; do
 		for node in $missing; do
 			echo "image-load: and $node holds:" >&2
 			docker exec "$node" crictl images >&2 2>&1 || echo "image-load: $node could not be asked" >&2
+			# Whether the node itself was there to import into: its
+			# container's restarts, exit and OOM kill, and its last words
+			# (v31a item 11).
+			"$(dirname "$0")/node-state.sh" 200 "$node" >&2
 		done
 		exit 1
 	fi

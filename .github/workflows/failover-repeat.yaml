@@ -30,9 +30,9 @@ on:
         type: string
         default: "5"
       sdk_ref:
-        description: The SDK's branch or tag the write driver's interop image is built from (main; a contract's branch while its SDK is held unmerged until core's lands, as step 3c's c30)
+        description: The SDK's branch or tag the write driver's interop image is built from; empty reads the release tools/ci-sdk.txt pins (main, or a contract's branch while its SDK is held unmerged until core's lands, as step 3c's c30, by name)
         type: string
-        default: main
+        default: ""
 
 permissions:
   contents: read
@@ -79,7 +79,7 @@ jobs:
             *[!a-z0-9,-]*) echo "::error::failure is class names, comma-separated, not '$FAILURE'"; exit 1 ;;
           esac
           case "$SDK_REF" in
-            "" | *[!A-Za-z0-9._/-]*) echo "::error::sdk_ref is a branch or tag of meridian-python, not '$SDK_REF'"; exit 1 ;;
+            *[!A-Za-z0-9._/-]*) echo "::error::sdk_ref is a branch or tag of meridian-python, not '$SDK_REF'"; exit 1 ;;
           esac
           echo "profiles=[$profiles]" >> "$GITHUB_OUTPUT"
           echo "runs=[$(seq -s, 1 "$REPEAT")]" >> "$GITHUB_OUTPUT"
@@ -88,14 +88,21 @@ jobs:
         with:
           path: workspace/meridian-core
 
-      # The SDK at its main, for the write driver's interop image
-      # (e2e/failover/driver.py), as ci's images job builds it.
+      # The SDK's pinned release, or the ref `sdk_ref` names (step 3c: the
+      # SDK held unmerged until core's lands), for the write driver's
+      # interop image (e2e/failover/driver.py), as ci's images job chooses
+      # it (tools/ci-sdk.sh).
+      - name: Choose the SDK's ref
+        id: sdk
+        working-directory: workspace/meridian-core
+        env:
+          SDK_REF: ${{ inputs.sdk_ref }}
+        run: tools/ci-sdk.sh "$SDK_REF"
+
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/meridian-python
-          # main, or the branch `sdk_ref` names (step 3c: the SDK held
-          # unmerged until core's lands).
-          ref: ${{ inputs.sdk_ref }}
+          ref: ${{ steps.sdk.outputs.ref }}
           path: workspace/meridian-python
 
       - name: Free the runner's disk

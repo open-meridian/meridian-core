@@ -985,6 +985,12 @@ E2E_CLUSTER_TARGET ?= e2e-cluster
 # Set to anything to keep the cluster afterwards, for reading.
 E2E_K3D_KEEP ?=
 E2E_K3D_READY_SECONDS ?= 300
+# How long every node container must have run without a restart, Ready at the
+# end, before the cluster counts as ready (e2e/cluster/nodes-steady.sh, v31a
+# item 11): longer than the 15-20 s restart loop of queue run 45395079443's
+# agent-2. Timed from the cluster's making, so a cluster that never restarted
+# has it by the last wait; asked within the ready wait's own bound.
+E2E_K3D_STEADY_SECONDS ?= 30
 E2E_K3D_SYSTEM ?= coredns local-path-provisioner metrics-server traefik
 # This machine's port the cluster's port 80 is published on, and the one
 # e2e/cluster/run.py reaches the dashboard's Ingress at: 80 by default, as CI
@@ -1104,7 +1110,8 @@ e2e-cluster-k3d:
 	[ -n "$$made" ] || { $(E2E_K3D_PULLS_END); echo "e2e-cluster-k3d: the cluster could not be made, twice" >&2; exit 1; }
 	@$(K3D) kubeconfig get $(E2E_K3D_CLUSTER) > $(E2E_K3D_KUBECONFIG)
 	@$(K3D_READY); export KUBECONFIG=$(E2E_K3D_KUBECONFIG); began=$$(date +%s); \
-	seen=$$(mktemp); trap 'rm -f "$$seen"; $(E2E_K3D_PULLS_END)' EXIT; \
+	seen=$$(mktemp); steady=$$(mktemp); trap 'rm -f "$$seen" "$$steady"; $(E2E_K3D_PULLS_END)' EXIT; \
+	e2e/cluster/nodes-steady.sh $(E2E_K3D_CLUSTER) "$$steady" >/dev/null 2>&1; \
 	ready "the API server (/readyz)" kubectl get --raw /readyz \
 	&& ready "the default service account" kubectl -n default get serviceaccount default \
 	&& ready "kube-system's deployments to exist: $(E2E_K3D_SYSTEM)" kubectl -n kube-system get deployment $(E2E_K3D_SYSTEM) \
@@ -1112,6 +1119,8 @@ e2e-cluster-k3d:
 	&& ready "every API group to be discoverable" kubectl api-resources \
 	&& kubectl -n kube-system rollout restart deploy/coredns >/dev/null \
 	&& ready "CoreDNS to come back from its restart" kubectl -n kube-system rollout status deploy/coredns --timeout=10s \
+	&& ready "every node Ready, its container running and not restarting for $(E2E_K3D_STEADY_SECONDS)s" \
+		env E2E_K3D_STEADY_SECONDS=$(E2E_K3D_STEADY_SECONDS) e2e/cluster/nodes-steady.sh $(E2E_K3D_CLUSTER) "$$steady" \
 	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made" \
 	&& pulled=$$(kubectl get events -A --field-selector reason=Pulling \
 		-o jsonpath='{range .items[*]}{.message}{"; "}{end}' 2>/dev/null | sed 's/Pulling image //g'; true) \
