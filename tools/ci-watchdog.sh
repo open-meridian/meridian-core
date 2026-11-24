@@ -63,7 +63,13 @@
 #                                 the step passes: only matched is red);
 #                                 answers: whether `ip -o link` and `docker
 #                                 ps` each answer within 3 s, said to the
-#                                 step's outputs as stalled=true|false.
+#                                 step's outputs as stalled=true|false;
+#                                 pulls (on every run, not only a failed
+#                                 one): the make's lines saying what
+#                                 kube-system and the host pulled while the
+#                                 cluster was made: red unless the host's
+#                                 is none, and a ::warning:: naming the
+#                                 image where kube-system's is not.
 #                                 Each is also appended to proof.log beside
 #                                 the make's log, the annotations' source,
 #                                 and to the step summary. A command is
@@ -72,6 +78,15 @@
 #                                 ignores every signal, and `timeout` waits
 #                                 for its child, so on the runs that died
 #                                 `timeout 3 ip ...` would hang itself
+#   ci-watchdog.sh verdict <make-log>
+#                                 a failed job's last line, "FAILED: ...",
+#                                 naming the failed check (the first, and
+#                                 how many), else the ready wait that gave
+#                                 up, else the step that failed (STEPS, the
+#                                 steps context as JSON): one before the
+#                                 make, the make's own innermost target, a
+#                                 make cancelled by the job's limit, or one
+#                                 after it. File reads alone
 #   ci-watchdog.sh probe <which> <make-log>
 #                                 one fact as a step's result, which arrives
 #                                 when nothing else does: names, hub, blob,
@@ -97,9 +112,9 @@
 
 set -euo pipefail
 
-usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | proof|probe <which> <make-log>" >&2; exit 2; }
+usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | proof|probe <which> <make-log> | verdict <make-log>" >&2; exit 2; }
 case ${1:-}:$# in
-  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|proof:3|probe:3|probe-one:3) ;;
+  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|proof:3|probe:3|probe-one:3|verdict:2) ;;
   *) usage ;;
 esac
 cmd=$1 file=$2
@@ -536,8 +551,82 @@ case $cmd in
         fi
         printf '%s' "$report" | say notice "ip and docker each answered within 3 s"
         ;;
+      pulls)
+        # The Makefile's two lines once the cluster is ready: what kube-system
+        # pulled (k3s's own images, which CI hands every node as the airgap
+        # tarball) and what the host's Docker pulled (k3d's and the node
+        # image, which CI loads first). The host's not none fails the job: run
+        # 45300919431 died making the cluster on k3d's pull. Kube-system's
+        # not none is a warning naming the image and the step passes, as on
+        # main, where the make said it and nothing failed on it: a known gap,
+        # CoreDNS pulled in 4 of 52 three-agent jobs with the tarball on
+        # every node (runs 45265929792, 45273067565, 45300919431,
+        # 45333826556), and the make now says which node and pod. A make that
+        # never got the cluster ready has nothing to judge, and has failed
+        # already.
+        system=$(sed -n 's/^e2e-cluster-k3d: images pulled while it was made: //p' "$make" 2>/dev/null | tail -n 1)
+        host=$(sed -n 's/^e2e-cluster-k3d: images the host pulled while it was made: //p' "$make" 2>/dev/null | tail -n 1)
+        if [ -z "$system" ] && [ -z "$host" ]; then
+          echo "the make never said what was pulled: the cluster was not made ready" | say notice "pulls: nothing to judge"
+          exit 0
+        fi
+        if [ "${host:-unknown}" != none ]; then
+          printf 'the host pulled: %s\nkube-system pulled: %s\n' "${host:-unknown}" "${system:-unknown}" \
+            | say error "pulls: the host pulled from a registry while the cluster was made"
+          exit 1
+        fi
+        if [ "${system:-unknown}" != none ]; then
+          printf 'kube-system pulled: %s\nthe host pulled: none\n' "${system:-unknown}" \
+            | say warning "pulls: kube-system pulled ${system:-unknown} (a known gap; the make says which node and pod)"
+          exit 0
+        fi
+        echo "kube-system pulled none, and the host none" | say notice "pulls: making the cluster pulled nothing"
+        ;;
       *) usage ;;
     esac
+    ;;
+  verdict)
+    # The job's last line, after any failure (v31a item 11: every cluster
+    # job that fails ends with a line naming the failed assertion). From
+    # file reads and the steps' outcomes alone. $file is the make's log;
+    # STEPS is the job's steps context as JSON (toJSON(steps)), for a step
+    # other than the make that failed or a make that never ran.
+    make=$file
+    failed_step=$(printf '%s' "${STEPS:-}" | jq -r 'to_entries[] | select(.value.outcome == "failure" or .value.outcome == "cancelled") | "\(.key) (\(.value.outcome))"' 2>/dev/null | head -n 1 || true)
+    make_outcome=$(printf '%s' "${STEPS:-}" | jq -r '.make.outcome // empty' 2>/dev/null || true)
+    # An e2e check's own line: "    FAILED: <check>" from the runs, "FAILED:
+    # <check>" from the browser, plugin and terminal checks. A suite's
+    # "<suite> FAILED: <count>" is a count, not a check.
+    checks=$(grep -h -E '^[[:space:]]*FAILED: ' "$make" 2>/dev/null || true)
+    [ -n "$checks" ] || checks=$(grep -h -E '^[[:space:]]*FAILED: ' .e2e-*.log 2>/dev/null || true)
+    n=$(printf '%s\n' "$checks" | grep -c . || true)
+    gave=$(grep -h -E '^e2e-cluster-k3d: (gave up on |the cluster could not be made)' "$make" 2>/dev/null | head -n 1 || true)
+    # The innermost make's error: the first "*** [file:line: target] Error n".
+    died=$(grep -h -E '^make(\[[0-9]+\])?: \*\*\* ' "$make" 2>/dev/null | head -n 1 || true)
+    last=$(grep -v -E '^make(\[[0-9]+\])?: \*\*\* |^[[:space:]]*$' "$make" 2>/dev/null | tail -n 1 | cut -c1-200 || true)
+    if [ "$n" -gt 0 ]; then
+      first=$(printf '%s\n' "$checks" | head -n 1 | sed -e 's/^[[:space:]]*FAILED: //' | cut -c1-300)
+      line="FAILED: $first"
+      [ "$n" -le 1 ] || line="$line (the first of $n failed checks)"
+    elif [ -n "$gave" ]; then
+      line="FAILED: making the cluster: $(printf '%s' "$gave" | sed -e 's/^e2e-cluster-k3d: //' -e 's/\. It said:$//' | cut -c1-300)"
+    elif [ ! -s "$make" ] || [ "$make_outcome" = skipped ]; then
+      line="FAILED: the step ${failed_step:-before the make (unnamed)}, before the make ran"
+    elif [ -n "$died" ]; then
+      target=$(printf '%s' "$died" | sed -n 's/.*\*\*\* \[\([^]]*\)\].*/\1/p')
+      line="FAILED: the make's step ${target:-?} died before any check failed ($(printf '%s' "$died" | sed 's/.*\] //')); its last line: ${last:-none}"
+    elif [ "$make_outcome" = cancelled ]; then
+      line="FAILED: the make was cancelled (the job's time limit) before any check failed; its last line: ${last:-none}"
+    elif [ -n "$failed_step" ]; then
+      line="FAILED: the step $failed_step, after the make"
+    else
+      line="FAILED: no check and no step named the failure; the make's last line: ${last:-none}"
+    fi
+    echo "::error title=The failed assertion::$(printf '%s' "$line" | sed -e 's/%/%25/g')"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      printf -- '### The failed assertion\n\n%s\n' "$line" >>"$GITHUB_STEP_SUMMARY" || true
+    fi
+    echo "$line"
     ;;
   probe)
     # $file names the fact, $3 is the make's log. A step that fails says the

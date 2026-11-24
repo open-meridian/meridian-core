@@ -2050,6 +2050,39 @@ def write_ahead_made():
     return seen
 
 
+def broker_set_ready():
+    """Whether the broker's StatefulSet has finished rolling: every copy on
+    its current revision and ready."""
+    said = json.loads(out("get", f"statefulset/{broker_set()}", "-o", "json", check=False) or "{}")
+    status, want = said.get("status", {}), said.get("spec", {}).get("replicas")
+    return (want is not None and status.get("readyReplicas") == want and status.get("updatedReplicas") == want
+            and status.get("currentRevision") == status.get("updateRevision"))
+
+
+def broker_rolled_late(s):
+    """The broker's roll outlived its 300 s, and its check has failed
+    (PR #147's scaled run: a JetStream server sat "not current with the
+    meta leader" until its startup probe restarted it, so a three-server
+    roll took over six minutes). Before anything else: each server's
+    previous container's last lines and its health, which a run that moved
+    on had lost; then the run waits, once more and bounded as the roll was,
+    for the set to finish rolling and be ready, so the shard section after
+    begins on a whole broker rather than failing for the roll's sake."""
+    for server in broker_servers():
+        previous = kubectl("logs", server, "--previous", "--all-containers", "--tail=40", check=False)
+        status, health = monitored(server, ("/healthz",))["/healthz"]
+        print(f"    broker {server}: healthz {status} {health.strip()[:200]}; its previous container's last "
+              f"lines{':' if previous.returncode == 0 else ': none (no previous container)'}", flush=True)
+        for line in previous.stdout.decode(errors="replace").splitlines()[-40:] if previous.returncode == 0 else []:
+            print(f"      {line}", flush=True)
+    finished = kubectl("rollout", "status", f"statefulset/{broker_set()}", "--timeout=300s",
+                       check=False).returncode == 0
+    ready = finished and happens(broker_set_ready, 120)
+    print(f"    broker: after its check failed, the roll {'finished, every server ready' if ready else 'had still not finished'}"
+          f"; the shard section goes on", flush=True)
+    return ready
+
+
 def jetstream_rolled(s):
     """The broker's servers restarted one at a time, as an upgrade rolls
     them, and JetStream still there after: each analytics copy restarted
@@ -2067,6 +2100,8 @@ def jetstream_rolled(s):
     rolled = kubectl("rollout", "status", f"statefulset/{broker_set()}", "--timeout=300s",
                      check=False).returncode == 0
     s.check(rolled, "broker: its servers restarted one at a time")
+    if not rolled:
+        broker_rolled_late(s)
     if PROFILE == "ha":
         servers = len(broker_servers())
         happens(lambda: len(write_ahead_made()) == servers, 120)

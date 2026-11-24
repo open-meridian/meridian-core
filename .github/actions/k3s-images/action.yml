@@ -1,9 +1,10 @@
 # k3s's own images for a cluster job (tools/ci-k3s-images.sh): the node
 # image and the release's airgap tarball of its system images, from GitHub's
 # cache for the Makefile's k3s, or fetched and checked where the cache has
-# none (every other k3s, each run). The node image is loaded into Docker, and E2E_K3S_AIRGAP
-# names the tarball after this step, which the Makefile hands to every node:
-# making the cluster then pulls nothing from Docker Hub.
+# none (every other k3s, each run), and k3d's own loadbalancer and tools
+# images beside them. The node and k3d's images are loaded into Docker, and
+# E2E_K3S_AIRGAP names the tarball after this step, which the Makefile hands
+# to every node: making the cluster then pulls from no registry.
 #
 # Only main's cargo-cache workflow keeps an entry (save: true), for the
 # Makefile's k3s alone, one per architecture, where every run reads it: an
@@ -12,7 +13,7 @@
 # (176-263 MB each) would push out the Rust build caches. A miss costs a fetch
 # from the k3s release, never a Docker Hub pull at bring-up.
 name: k3s-images
-description: k3s's node and system images, from GitHub's cache or fetched and checked.
+description: k3s's node and system images and k3d's own, from GitHub's cache or fetched and checked.
 inputs:
   k3s:
     description: The k3s tag (rancher/k3s's); the Makefile's pin when empty.

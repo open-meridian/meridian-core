@@ -13,6 +13,10 @@ harness groups, the cluster runs -- and decides, for a run, which of them run:
       a pull request into a branch other than main (R, the branch it merges
       into: a stage branch has no merge queue, ruling 205 of 2026-11-19), and
       a pull request whose changes cannot be read, run everything.
+  ci_tier.py left --event E [--base B --head H] [--base-ref R]
+      the jobs this run leaves to the merge queue, by name, as Markdown for
+      the run's summary: each still shows as a passed check (a required
+      check must), so a green pull request does not mean they ran.
   ci_tier.py table
       every job, today / pull request (fast tier) / merge queue, as Markdown.
   ci_tier.py suites
@@ -195,6 +199,24 @@ def plan(event: str, paths: list[str] | None, base_ref: str = "") -> dict[str, s
     return out
 
 
+def left(out: dict[str, str]) -> str:
+    """A plan's jobs left to the merge queue, by their checks' names: the
+    stage legs, harness groups and cluster runs it does not run, and the
+    queue-only jobs. The harness and cluster ones still report a passed
+    check (e2e-harness-left, e2e-cluster-left: a required check must pass),
+    so the run's summary says plainly that they did not run."""
+    if out["full"] == "true":
+        return "### Left to the merge queue\n\nNone: every job runs in this run."
+    ran = set(json.loads(out["stage_names"]))
+    names = [f"ci-local ({leg['stage']})" for leg in STAGE_LEGS if leg["stage"] not in ran]
+    names += [f"e2e-harness ({g['group']}) -- shows as passed, not run" for g in json.loads(out["harness_left"])["include"]]
+    names += [f"{cluster_name(r)} -- shows as passed, not run" for r in json.loads(out["clusters_left"])["include"]]
+    names += ["e2e-cluster-k3d (e2e-cluster, arm64)", "release-candidate", "claims-check"]
+    return (f"### Left to the merge queue: {len(names)} jobs not run here\n\n"
+            "A green pull request does not mean these ran; the merge queue runs every one.\n\n"
+            + "\n".join(f"- {name}" for name in names))
+
+
 # ── The table and the check ────────────────────────────────────────────────
 
 JOBS_UNTIERED = ["ci-local (checks)", "ci-local (lint)", "ci-local (images)", "ci-local (compile)", "ci-local"]
@@ -272,6 +294,12 @@ def self_test() -> int:
     assert [cluster_name(r) for r in json.loads(docs["clusters"])["include"]] == ["e2e-cluster-k3d (e2e-cluster)"]
     assert docs["harness_any"] == "false" and docs["clusters_left_any"] == "true"
     assert len(json.loads(docs["clusters_left"])["include"]) == len(CLUSTERS) - 1
+    # The run's summary names what it leaves to the queue, each left cluster
+    # run said not to have run though its check passes.
+    said = left(docs)
+    assert "e2e-cluster-k3d (e2e-cluster-oidc) -- shows as passed, not run" in said
+    assert "e2e-cluster-k3d (e2e-cluster) " not in said and "e2e-cluster-k3d (e2e-cluster, arm64)" in said
+    assert "None: every job runs" in left(queue)
     # Failover's paths select its runs; CI's own, everything; unreadable, everything.
     fo = plan("pull_request", ["e2e/failover/run.py"])
     names = {cluster_name(r) for r in json.loads(fo["clusters"])["include"]}
@@ -302,6 +330,11 @@ def main() -> int:
     p.add_argument("--base", default="")
     p.add_argument("--head", default="HEAD")
     p.add_argument("--base-ref", default="", help="the branch a pull request merges into")
+    lp = sub.add_parser("left")
+    lp.add_argument("--event", required=True)
+    lp.add_argument("--base", default="")
+    lp.add_argument("--head", default="HEAD")
+    lp.add_argument("--base-ref", default="")
     sub.add_parser("table")
     sub.add_parser("suites")
     c = sub.add_parser("check")
@@ -314,6 +347,10 @@ def main() -> int:
         paths = changed_files(asked.base, asked.head) if asked.event == "pull_request" and asked.base else None
         for key, value in plan(asked.event, paths, asked.base_ref).items():
             print(f"{key}={value}")
+        return 0
+    if asked.command == "left":
+        paths = changed_files(asked.base, asked.head) if asked.event == "pull_request" and asked.base else None
+        print(left(plan(asked.event, paths, asked.base_ref)))
         return 0
     if asked.command == "suites":
         for group in HARNESS_GROUPS:
