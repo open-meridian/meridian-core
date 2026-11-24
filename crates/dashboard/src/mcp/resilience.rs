@@ -322,6 +322,10 @@ fn member_json(m: &ComponentReport) -> Value {
         "partitions": m.partitions,
         "restarts": m.restarts,
         "last_restart_reason": m.last_restart_reason,
+        // Its health and the words it said it with (v31a item 5): the
+        // lake's writer, its write-ahead stream stuck full, with its figures.
+        "health": page::health_word(m.health),
+        "detail": m.detail,
     })
 }
 
@@ -664,6 +668,43 @@ mod tests {
             read.get("not_listed").is_none(),
             "the book's records are in it"
         );
+    }
+
+    /// v31a item 5 (0-J): a member's health and the words it says it with
+    /// -- the lake's writer saying its write-ahead stream is stuck full, with
+    /// its figures -- are in the read `meridian status` and an agent show,
+    /// as the Members tab draws them.
+    #[test]
+    fn a_members_health_and_its_words_are_read_as_the_page_draws_them() {
+        let words = format!(
+            "{} for 30s: holds 256.0 MiB of its 256.0 MiB bound",
+            meridian_bus::write_ahead::STUCK_FULL
+        );
+        let member = ComponentReport {
+            component: "lake".into(),
+            member: "om-lake-0".into(),
+            mode: "writer".into(),
+            health: meridian_domain::v1::ComponentHealth::Degraded as i32,
+            detail: words.clone(),
+            ..Default::default()
+        };
+        let read = resilience_json(&ReadResilienceReply {
+            members: vec![member.clone()],
+            ..Default::default()
+        });
+        assert_eq!(read["members"][0]["health"], "degraded");
+        assert_eq!(read["members"][0]["detail"], words.as_str());
+        let serving = resilience_json(&ReadResilienceReply {
+            members: vec![ComponentReport {
+                health: meridian_domain::v1::ComponentHealth::Serving as i32,
+                ..member.clone()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(serving["members"][0]["health"], "serving");
+        let row = page::member_row(&member);
+        assert!(row.contains("writer, degraded"), "{row}");
+        assert!(row.contains(&crate::html::escape(&words)), "{row}");
     }
 
     /// A book partition's move goes to the book, a lake range's to the lake.
