@@ -1057,6 +1057,22 @@ K3D_READY = ready() { \
 # (tools/ci-watchdog.sh proof pulls). Run 45300919431 died making the
 # cluster when its runner could not pull k3d's images. The listener ends
 # with the cluster ready, or when making it fails.
+# Where kube-system did pull, who: each Pulling event's time, node and pod,
+# kube-system's pods, and what each node's k3s said of importing the airgap
+# tarball and holds of the image now. The line above only names the image,
+# and the cluster is gone by the time the job is read: runs 45265929792,
+# 45273067565, 45300919431 and 45333826556 each pulled CoreDNS in a
+# three-agent cluster that had the tarball, and kept nothing saying which
+# node or why. Said to stderr; it never fails the make.
+E2E_K3D_WHO_PULLED = echo "e2e-cluster-k3d: who pulled (time, node, pod, message):"; \
+	kubectl get events -A --field-selector reason=Pulling -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{" "}{.source.host}{" "}{.involvedObject.namespace}{"/"}{.involvedObject.name}{" "}{.message}{"\n"}{end}'; \
+	kubectl -n kube-system get pods -o wide; \
+	for node in $$(docker ps --filter label=k3d.cluster=$(E2E_K3D_CLUSTER) --format '{{.Names}}' | grep -e '-server-' -e '-agent-' | sort); do \
+	  echo "e2e-cluster-k3d: $$node, its k3s on importing images (the last 20 lines), and the images it holds now:"; \
+	  docker logs "$$node" 2>&1 | grep -i -e import -e 'agent/images' | tail -n 20; \
+	  docker exec "$$node" crictl images 2>&1 | sed 's/^/    /'; \
+	done
+
 E2E_K3D_PULLS_END = kill $$(cat .e2e-k3d-pulls.pid 2>/dev/null) 2>/dev/null; rm -f .e2e-k3d-pulls.pid
 
 e2e-cluster-k3d:
@@ -1100,6 +1116,7 @@ e2e-cluster-k3d:
 	&& pulled=$$(kubectl get events -A --field-selector reason=Pulling \
 		-o jsonpath='{range .items[*]}{.message}{"; "}{end}' 2>/dev/null | sed 's/Pulling image //g'; true) \
 	&& echo "e2e-cluster-k3d: images pulled while it was made: $${pulled:-none}" \
+	&& { [ -z "$$pulled" ] || { $(E2E_K3D_WHO_PULLED); } >&2 || true; } \
 	&& host=$$($(E2E_K3D_PULLS_END); sort -u .e2e-k3d-pulls.log 2>/dev/null | paste -sd ' ' -) \
 	&& echo "e2e-cluster-k3d: images the host pulled while it was made: $${host:-none}"
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
