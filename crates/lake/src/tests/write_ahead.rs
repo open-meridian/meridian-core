@@ -1359,3 +1359,175 @@ async fn a_byte_bound_under_what_the_stream_holds_is_not_applied_and_the_stream_
         assert!(why.contains(part), "{part} in {why}");
     }
 }
+
+/// The review of 4c, fix B item 2: the place the stream's age bound is
+/// held to is the lowest among the writer groups'. A group with no place
+/// takes the stream from its first; one group alone, its own place.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lowest_place_among_the_writer_groups_is_the_one_the_age_bound_is_held_to() {
+    use crate::write_ahead::lowest_place;
+    use meridian_changes::groups::{owner, Groups};
+    let h = harness();
+    let dataset = "coinbase-1:daily";
+    let (b, a) = (owner(dataset, 2), 1 - owner(dataset, 2));
+    let lake_of = |group: u32| {
+        service::Lake::grouped(
+            h.bus.clone(),
+            h.store.clone(),
+            h.clock.clone(),
+            Groups::new(group, 2).unwrap(),
+        )
+    };
+    let pass = |group: u32, through: u64| {
+        let batch: Vec<Taken> = (1..=through)
+            .map(|sequence| {
+                let mut taken = written(sequence, "coinbase-1", Vec::new());
+                taken.dataset = dataset.to_string();
+                taken
+            })
+            .collect();
+        tokio::task::block_in_place(|| {
+            let mut writer = Writer::start(lake_of(group), STREAM, 0).unwrap();
+            writer.take(batch).unwrap();
+            writer.next()
+        })
+    };
+    // A at the stream's last + 1, B with no place: the stream's first.
+    assert_eq!(pass(a, 40), 41);
+    assert_eq!(lowest_place(&lake_of(a), STREAM, 41).unwrap(), 1);
+    assert_eq!(lowest_place(&h.lake, STREAM, 41).unwrap(), 41, "one group");
+    // B at 10: its next, from either group.
+    assert_eq!(pass(b, 10), 11);
+    assert_eq!(lowest_place(&lake_of(a), STREAM, 41).unwrap(), 11);
+    assert_eq!(lowest_place(&lake_of(b), STREAM, 11).unwrap(), 11);
+    // A lower age bound than the oldest write B has not recorded is old
+    // is refused at B's place, and would not be at A's own.
+    let now = h.clock.now_ns();
+    let standing = crate::write_ahead::guard::Standing {
+        messages: 40,
+        bytes: 4_000,
+        first: 11,
+        last: 40,
+        oldest_ns: now - 300_000_000_000,
+    };
+    let lower = crate::write_ahead::Bounds {
+        max_age: std::time::Duration::from_secs(120),
+        max_bytes: 256 << 20,
+        replicas: 1,
+    };
+    let drop = |next| crate::write_ahead::guard::bounds_drop(STREAM, &standing, next, &lower, now);
+    assert_eq!(drop(41), None);
+    assert!(drop(11).is_some_and(|why| why.contains("30 write(s)")));
+}
+
+/// The review of 4c, fix B item 2: with several writer groups, a lower
+/// age bound is held to the lowest place among them, never this group's
+/// alone. Group A, at the stream's last write, starts with a lower age
+/// bound than the stream's oldest write's age, while group B has recorded
+/// none of the stream: the bound would drop writes B has not recorded,
+/// so the stream is kept as it is, and A's member says why.
+///
+/// By hand, as the tests above; this test empties the broker of the
+/// lake's stream.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_lower_age_bound_is_refused_while_another_writer_group_has_not_recorded_the_streams_oldest(
+) {
+    use crate::write_ahead::{group_key, place, stream_config, stream_key, write_forever, Bounds};
+    use async_nats::jetstream;
+    use meridian_bus::write_ahead::{subject, STREAM};
+    use meridian_changes::groups::{owner, Groups};
+    use std::time::Duration;
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = meridian_bus::NatsBackend::client(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let made = Bounds {
+        max_age: Duration::from_secs(600),
+        max_bytes: 256 << 20,
+        replicas: 1,
+    };
+    let mut stream = context.create_stream(stream_config(&made)).await.unwrap();
+    for _ in 0..3 {
+        context
+            .publish(subject("coinbase-1", "daily"), vec![7u8; 100].into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    // The stream's writes older than the lower bound.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let h = harness();
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    h.clock.set(i64::try_from(wall.as_nanos()).unwrap());
+    let identity = place(&client).await.unwrap().stream;
+    // Group A passes the stream's three writes, their dataset group B's.
+    let dataset = "coinbase-1:daily";
+    let (b, a) = (owner(dataset, 2), 1 - owner(dataset, 2));
+    let lake = service::Lake::grouped(
+        h.bus.clone(),
+        h.store.clone(),
+        h.clock.clone(),
+        Groups::new(a, 2).unwrap(),
+    );
+    lake.configured(&configuration(true, &[]));
+    let batch: Vec<Taken> = (1..=3)
+        .map(|sequence| {
+            let mut taken = written(sequence, "coinbase-1", Vec::new());
+            taken.dataset = dataset.to_string();
+            taken
+        })
+        .collect();
+    let base = stream_key(STREAM, identity);
+    tokio::task::block_in_place(|| {
+        let mut writer = Writer::start(lake.clone(), STREAM, identity).unwrap();
+        assert!(writer.take(batch).unwrap().is_empty());
+    });
+    let at = |group: u32| {
+        h.store
+            .write_ahead_position(&group_key(&base, group))
+            .unwrap()
+            .map(|at| at.sequence)
+    };
+    assert_eq!(
+        (at(a), at(b)),
+        (Some(3), None),
+        "A at the last, B at the first"
+    );
+    let said = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let writer = {
+        let (client, said) = (client.clone(), Arc::clone(&said));
+        let chart = Bounds {
+            max_age: Duration::from_secs(2),
+            ..made
+        };
+        tokio::spawn(async move {
+            write_forever(lake, client, chart, move |why| {
+                said.lock().unwrap().push(why)
+            })
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    writer.abort();
+    let _ = writer.await;
+    let info = stream.info().await.unwrap().clone();
+    context.delete_stream(STREAM).await.unwrap();
+    let said = said.lock().unwrap().clone();
+    assert_eq!(
+        (info.config.max_age, info.state.messages),
+        (Duration::from_secs(600), 3),
+        "the stream keeps its age bound and group B's writes: {said:?}"
+    );
+    let why = said
+        .iter()
+        .flatten()
+        .find(|why| why.contains("not yet recorded"))
+        .unwrap_or_else(|| panic!("the member says why its stream is kept: {said:?}"));
+    for part in [STREAM, "past the 2s bound", "3 write(s)"] {
+        assert!(why.contains(part), "{part} in {why}");
+    }
+}

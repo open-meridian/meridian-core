@@ -183,6 +183,35 @@ pub fn group_key(stream: &str, group: u32) -> String {
     }
 }
 
+/// The lowest place any writer group takes the stream kept as `base` from
+/// next, this group's being `mine` (the review of 4c, fix B item 2): what
+/// the stream's age bound is held to, since a write is dropped unrecorded
+/// where any group whose rows it carries has not passed it. Each group's
+/// position as its database keeps it -- a group with none takes the stream
+/// from its first -- and any place kept under a group's key beside a
+/// move's pointer in another's: where a switch between databases takes its
+/// target back to, at its open. One group, `mine`. Read through
+/// [`Lake::group_position`], as an answer spanning groups reads them.
+pub fn lowest_place(lake: &Lake, base: &str, mine: u64) -> Result<u64, StoreError> {
+    let groups = lake.groups();
+    let mut lowest = mine;
+    for group in 0..groups.count() {
+        let key = group_key(base, group);
+        for kept_by in 0..groups.count() {
+            if (group, kept_by) == (groups.mine(), groups.mine()) {
+                continue;
+            }
+            let place = match lake.group_position(&key, kept_by)? {
+                Some(at) => at.sequence + 1,
+                None if kept_by == group => 1,
+                None => continue,
+            };
+            lowest = lowest.min(place);
+        }
+    }
+    Ok(lowest)
+}
+
 /// An answer this group gives once other groups have committed their own
 /// parts of its write (step 3d; spec 6.7): the answer's place in its batch,
 /// the write's stream sequence, and the groups whose positions must reach
@@ -1306,6 +1335,7 @@ pub async fn write_forever(
         largest_write,
         Arc::clone(&lake),
         Arc::clone(&place),
+        writer.stream_name().to_string(),
         kept,
         waiting,
     ));
@@ -1536,8 +1566,21 @@ async fn bring_to_bounds(
         }
     }
     // The oldest write past the place is the one whose age a lower age
-    // bound is held to, where the stream's oldest is one the lake recorded.
-    let next = writer.next();
+    // bound is held to, where the stream's oldest is one the lake recorded:
+    // the lowest place among the writer groups, never this one's alone.
+    let lowest =
+        tokio::task::block_in_place(|| lowest_place(lake, writer.stream_name(), writer.next()));
+    let next = match lowest {
+        Ok(next) => next,
+        Err(failed) => {
+            tracing::warn!(
+                %failed,
+                "the write-ahead stream kept at its bounds: the writer groups' places could \
+                 not be read"
+            );
+            return bytes_kept;
+        }
+    };
     let standing = match from_place(&stream, standing, next).await {
         Ok(standing) => standing,
         Err(failed) => {
@@ -1587,7 +1630,8 @@ impl Drop for AbortOnDrop {
 
 /// The stream looked at every [`guard::LOOK_EVERY`] against the writer's
 /// place (v31a item 5): stuck full, its member says so, degraded, with its
-/// figures; drained, it says so no longer. Judged at each look by the
+/// figures; drained, it says so no longer. The place is the lowest among
+/// the writer groups' ([`lowest_place`]). Judged at each look by the
 /// stream's own bounds, as its leader says them then, its age bound held
 /// to the oldest write the lake has not recorded ([`from_place`]) -- never
 /// the chart's,
@@ -1600,6 +1644,7 @@ async fn guard_forever(
     largest_write: u64,
     lake: Arc<Lake>,
     place: Arc<AtomicU64>,
+    base: String,
     kept: Option<String>,
     waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) {
@@ -1610,7 +1655,23 @@ async fn guard_forever(
     }
     loop {
         tokio::time::sleep(guard::LOOK_EVERY).await;
-        let next = place.load(Ordering::Relaxed);
+        // The lowest place among the writer groups: the age bound drops a
+        // write another group has not recorded as it does this one's.
+        let mine = place.load(Ordering::Relaxed);
+        let next = if lake.groups().several() {
+            let (lake, base) = (Arc::clone(&lake), base.clone());
+            let lowest =
+                tokio::task::spawn_blocking(move || lowest_place(&lake, &base, mine)).await;
+            match lowest {
+                Ok(Ok(next)) => next,
+                _ => {
+                    tracing::debug!("the writer groups' places were not read at this look");
+                    continue;
+                }
+            }
+        } else {
+            mine
+        };
         // The stream, and from the lake's place: once the stream has
         // dropped or the lake recorded its oldest, the age held to its
         // bound is the write's at the place.
