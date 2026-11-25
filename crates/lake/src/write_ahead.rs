@@ -24,6 +24,7 @@
 //! stream and nothing here runs.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +37,8 @@ use prost::Message as _;
 
 use crate::service::Lake;
 use crate::store::{Dropped, StoreError, WriteAheadBatch, WriteAheadPosition};
+
+pub mod guard;
 
 /// The database connections the writer adds to the lake's pool in `ha`:
 /// its batch's transaction and its position's read (ruled 2026-11-08: the
@@ -178,6 +181,35 @@ pub fn group_key(stream: &str, group: u32) -> String {
         0 => stream.to_string(),
         group => format!("{stream}.group-{group}"),
     }
+}
+
+/// The lowest place any writer group takes the stream kept as `base` from
+/// next, this group's being `mine` (the review of 4c, fix B item 2): what
+/// the stream's age bound is held to, since a write is dropped unrecorded
+/// where any group whose rows it carries has not passed it. Each group's
+/// position as its database keeps it -- a group with none takes the stream
+/// from its first -- and any place kept under a group's key beside a
+/// move's pointer in another's: where a switch between databases takes its
+/// target back to, at its open. One group, `mine`. Read through
+/// [`Lake::group_position`], as an answer spanning groups reads them.
+pub fn lowest_place(lake: &Lake, base: &str, mine: u64) -> Result<u64, StoreError> {
+    let groups = lake.groups();
+    let mut lowest = mine;
+    for group in 0..groups.count() {
+        let key = group_key(base, group);
+        for kept_by in 0..groups.count() {
+            if (group, kept_by) == (groups.mine(), groups.mine()) {
+                continue;
+            }
+            let place = match lake.group_position(&key, kept_by)? {
+                Some(at) => at.sequence + 1,
+                None if kept_by == group => 1,
+                None => continue,
+            };
+            lowest = lowest.min(place);
+        }
+    }
+    Ok(lowest)
 }
 
 /// An answer this group gives once other groups have committed their own
@@ -1034,14 +1066,24 @@ pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
 /// refused for load. The bound a write is held within at a high rate.
 pub const MAX_BYTES: i64 = 256 << 20;
 
+/// The least the stream's byte bound holds: this many of the broker's
+/// largest message (`broker.limits.maxPayload`). The chart refuses less
+/// too (`meridian-runtime.writeAheadMiB`).
+pub const LEAST_WRITES: u64 = 16;
+
 impl Bounds {
     /// The chart's bounds, `lake.writeAhead.maxAge` as `30s`, `10m` or `1h`
     /// and `lake.writeAhead.maxBytes` as `256MB` or `1GB`, each above 0;
-    /// this module's where it says nothing. Refused naming the value.
+    /// this module's where it says nothing. Refused naming the value. A
+    /// byte bound under [`LEAST_WRITES`] of the broker's largest message
+    /// (`max_payload` bytes, as the broker says it) is refused too: a
+    /// stream with less room than one write is at its bound for that
+    /// write, and one of a few writes is full at once.
     pub fn from_said(
         max_age: Option<&str>,
         max_bytes: Option<&str>,
         replicas: usize,
+        max_payload: u64,
     ) -> Result<Bounds, String> {
         let max_age = match max_age.map(str::trim).filter(|said| !said.is_empty()) {
             None => MAX_AGE,
@@ -1061,6 +1103,14 @@ impl Bounds {
                 )
             })?,
         };
+        let least = LEAST_WRITES.saturating_mul(max_payload);
+        if u64::try_from(max_bytes).unwrap_or(0) < least {
+            return Err(format!(
+                "lake.writeAhead.maxBytes is {max_bytes} bytes; at least {least}, {LEAST_WRITES} \
+                 times the broker's largest message (broker.limits.maxPayload, {max_payload} \
+                 bytes)"
+            ));
+        }
         Ok(Bounds {
             max_age,
             max_bytes,
@@ -1225,25 +1275,28 @@ pub async fn write_forever(
     lake: Arc<Lake>,
     client: async_nats::Client,
     bounds: Bounds,
-    waiting: impl Fn(Option<String>),
+    waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) -> Result<(), String> {
     let context = jetstream::new(client.clone());
     let config = stream_config(&bounds);
-    // Made, or brought to the bounds this release sets: never with fewer
-    // replicas than set, to get past a broker not yet ready (step 3d). Until
-    // then the lake takes no write, and says why in its report.
+    // Made where the broker says there is none: never with fewer replicas
+    // than set, to get past a broker not yet ready (step 3d), and never
+    // over one it could not say of (v31a item 5): a stream made again is
+    // another stream, and the writes the one before held would be passed
+    // by. Brought to this release's bounds once the writer knows its place
+    // (below). Until then the lake takes no write, and says why in its
+    // report.
     loop {
         let made = match context.get_stream(STREAM).await {
-            Ok(_) => context
-                .update_stream(config.clone())
-                .await
-                .map(|_| ())
-                .map_err(|f| f.to_string()),
-            Err(_) => context
+            Ok(_) => Ok(()),
+            Err(failed) if not_found(&failed) => context
                 .create_stream(config.clone())
                 .await
                 .map(|_| ())
                 .map_err(|f| f.to_string()),
+            Err(failed) => Err(format!(
+                "the broker did not say whether it holds it ({failed})"
+            )),
         };
         match made {
             Ok(()) => {
@@ -1273,6 +1326,20 @@ pub async fn write_forever(
         }
     };
     let mut writer = started(&lake, identity).await;
+    // The room a write needs: the broker's largest message, as it says it.
+    let largest_write = u64::try_from(client.server_info().max_payload).unwrap_or(u64::MAX);
+    let kept = bring_to_bounds(&lake, &context, &config, &bounds, largest_write, &writer).await;
+    let place = Arc::new(AtomicU64::new(writer.next()));
+    let guarding = tokio::spawn(guard_forever(
+        context.clone(),
+        largest_write,
+        Arc::clone(&lake),
+        Arc::clone(&place),
+        writer.stream_name().to_string(),
+        kept,
+        waiting,
+    ));
+    let _guarding = AbortOnDrop(guarding);
     // The gaps the last writer was asking for again, asked again by this
     // one (W10.14): their wants were in its memory.
     // Group 0's, which holds the lake's wants (step 3d).
@@ -1331,6 +1398,7 @@ pub async fn write_forever(
         let mut stall = Stall::new(STALL_AFTER);
         loop {
             let next = writer.next();
+            place.store(next, Ordering::Relaxed);
             let batch = match read(&mut messages, &mut stall, next, &mut stream, &writer).await {
                 Read::Batch(batch) => batch,
                 Read::TakenBack => {
@@ -1416,6 +1484,258 @@ pub async fn write_forever(
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Whether the broker said it holds no stream of that name: only then is
+/// one made (v31a item 5).
+fn not_found(failed: &jetstream::context::GetStreamError) -> bool {
+    matches!(
+        failed.kind(),
+        jetstream::context::GetStreamErrorKind::JetStream(said)
+            if said.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+    )
+}
+
+/// The stream as it stands from the lake's place `next`
+/// ([`guard::Standing::from_place`]): where its oldest write is one the
+/// lake recorded and it holds writes the lake has not, the write at the
+/// place is read from it for its time -- the oldest write the lake has not
+/// recorded, whose age the age bound is held to.
+async fn from_place(
+    stream: &stream::Stream,
+    standing: guard::Standing,
+    next: u64,
+) -> Result<guard::Standing, String> {
+    if !standing.oldest_is_recorded(next) {
+        return Ok(standing);
+    }
+    let at = stream
+        .direct_get(next)
+        .await
+        .map_err(|failed| failed.to_string())?;
+    let at_ns = i64::try_from(at.time.unix_timestamp_nanos()).unwrap_or(0);
+    Ok(standing.from_place(next, at_ns))
+}
+
+/// The stream brought to this release's bounds where they differ from its
+/// own, unless that would drop a write past the writer's place
+/// ([`guard::bounds_drop`], v31a item 5), or the broker refuses them: then
+/// it is kept as it is, and the refusal said naming it -- here, and in the
+/// member's report (the words returned) -- until the writer starts again.
+/// A byte bound the stream would have no room for a write under is not
+/// applied either ([`guard::bytes_kept`]): the stream keeps its own byte bound, said the
+/// same way, and the next writer's start applies it once it fits.
+async fn bring_to_bounds(
+    lake: &Arc<Lake>,
+    context: &jetstream::Context,
+    config: &stream::Config,
+    bounds: &Bounds,
+    largest_write: u64,
+    writer: &Writer,
+) -> Option<String> {
+    let Ok(mut stream) = context.get_stream(STREAM).await else {
+        tracing::warn!("the write-ahead stream could not be read to bring it to its bounds");
+        return None;
+    };
+    let info = match stream.info().await {
+        Ok(info) => info.clone(),
+        Err(failed) => {
+            tracing::warn!(%failed, "the write-ahead stream could not be read to bring it to its bounds");
+            return None;
+        }
+    };
+    let held = &info.config;
+    let same = |config: &stream::Config| {
+        (held.max_age, held.max_bytes, held.num_replicas)
+            == (config.max_age, config.max_bytes, config.num_replicas)
+    };
+    if same(config) {
+        return None;
+    }
+    let standing = guard::Standing::of(&info.state);
+    // A byte bound under what the stream holds and the broker's largest
+    // write is not applied: the stream keeps its own, and the rest of the
+    // bounds are brought as ever.
+    let mut config = config.clone();
+    let bytes_kept = guard::bytes_kept(STREAM, &standing, held.max_bytes, bounds, largest_write);
+    if let Some(kept) = &bytes_kept {
+        tracing::warn!(stream = STREAM, "{kept}");
+        config.max_bytes = held.max_bytes;
+        if same(&config) {
+            return bytes_kept;
+        }
+    }
+    // The oldest write past the place is the one whose age a lower age
+    // bound is held to, where the stream's oldest is one the lake recorded:
+    // the lowest place among the writer groups, never this one's alone.
+    let lowest =
+        tokio::task::block_in_place(|| lowest_place(lake, writer.stream_name(), writer.next()));
+    let next = match lowest {
+        Ok(next) => next,
+        Err(failed) => {
+            tracing::warn!(
+                %failed,
+                "the write-ahead stream kept at its bounds: the writer groups' places could \
+                 not be read"
+            );
+            return bytes_kept;
+        }
+    };
+    let standing = match from_place(&stream, standing, next).await {
+        Ok(standing) => standing,
+        Err(failed) => {
+            tracing::warn!(
+                %failed,
+                next,
+                "the write-ahead stream kept at its bounds: its write at the lake's place \
+                 could not be read"
+            );
+            return bytes_kept;
+        }
+    };
+    if let Some(refused) = guard::bounds_drop(STREAM, &standing, next, bounds, lake.now_ns()) {
+        tracing::warn!(stream = STREAM, next, "{refused}");
+        return guard::said(Some(refused), bytes_kept.as_deref());
+    }
+    match context.update_stream(config.clone()).await {
+        Ok(_) => {
+            tracing::info!(
+                max_age_s = config.max_age.as_secs(),
+                max_bytes = config.max_bytes,
+                "the write-ahead stream brought to this release's bounds"
+            );
+            bytes_kept
+        }
+        Err(failed) => {
+            tracing::warn!(%failed, "the write-ahead stream kept at its bounds");
+            guard::said(
+                Some(format!(
+                    "the write-ahead stream {STREAM} is kept as it is, not brought to this \
+                     release's bounds: the broker refused them ({failed})"
+                )),
+                bytes_kept.as_deref(),
+            )
+        }
+    }
+}
+
+/// A task ended when this is dropped: the guard ends with its writer.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The stream looked at every [`guard::LOOK_EVERY`] against the writer's
+/// place (v31a item 5): stuck full, its member says so, degraded, with its
+/// figures; drained, it says so no longer. The place is the lowest among
+/// the writer groups' ([`lowest_place`]). Judged at each look by the
+/// stream's own bounds, as its leader says them then, its age bound held
+/// to the oldest write the lake has not recorded ([`from_place`]) -- never
+/// the chart's,
+/// which the stream does not hold where it was kept as it was (`kept`, the
+/// refusal [`bring_to_bounds`] gave, which the member says for as long as
+/// this writer runs). A look the broker does not answer changes nothing
+/// said.
+async fn guard_forever(
+    context: jetstream::Context,
+    largest_write: u64,
+    lake: Arc<Lake>,
+    place: Arc<AtomicU64>,
+    base: String,
+    kept: Option<String>,
+    waiting: impl Fn(Option<String>) + Send + Sync + 'static,
+) {
+    let mut full = guard::Full::new(guard::STUCK_AFTER, largest_write);
+    let mut said = false;
+    if kept.is_some() {
+        waiting(kept.clone());
+    }
+    loop {
+        tokio::time::sleep(guard::LOOK_EVERY).await;
+        // The lowest place among the writer groups: the age bound drops a
+        // write another group has not recorded as it does this one's.
+        let mine = place.load(Ordering::Relaxed);
+        let next = if lake.groups().several() {
+            let (lake, base) = (Arc::clone(&lake), base.clone());
+            let lowest =
+                tokio::task::spawn_blocking(move || lowest_place(&lake, &base, mine)).await;
+            match lowest {
+                Ok(Ok(next)) => next,
+                _ => {
+                    tracing::debug!("the writer groups' places were not read at this look");
+                    continue;
+                }
+            }
+        } else {
+            mine
+        };
+        // The stream, and from the lake's place: once the stream has
+        // dropped or the lake recorded its oldest, the age held to its
+        // bound is the write's at the place.
+        let looked = async {
+            let mut stream = context
+                .get_stream(STREAM)
+                .await
+                .map_err(|failed| failed.to_string())?;
+            let (state, held) = stream
+                .info()
+                .await
+                .map(|info| (info.state.clone(), info.config.clone()))
+                .map_err(|failed| failed.to_string())?;
+            // Its write at the place not read, it is judged by its bytes
+            // alone at this look.
+            let standing = guard::Standing::of(&state);
+            let standing = match from_place(&stream, standing, next).await {
+                Ok(standing) => standing,
+                Err(failed) => {
+                    tracing::debug!(%failed, next, "the write at the lake's place was not read");
+                    standing
+                }
+            };
+            Ok::<_, String>((standing, held))
+        };
+        let (standing, held) = match looked.await {
+            Ok(looked) => looked,
+            Err(failed) => {
+                tracing::debug!(%failed, "the write-ahead stream's guard could not look at it");
+                continue;
+            }
+        };
+        let bounds = Bounds {
+            max_age: held.max_age,
+            max_bytes: held.max_bytes,
+            replicas: held.num_replicas,
+        };
+        match full.looked(
+            tokio::time::Instant::now(),
+            &standing,
+            next,
+            &bounds,
+            lake.now_ns(),
+        ) {
+            Some(words) => {
+                if !said {
+                    tracing::warn!(stream = STREAM, "{words}");
+                }
+                waiting(guard::said(Some(words), kept.as_deref()));
+                said = true;
+            }
+            None if said => {
+                tracing::info!(
+                    stream = STREAM,
+                    bytes = standing.bytes,
+                    past = standing.past(next),
+                    "the lake's write-ahead stream drained: no longer at a bound"
+                );
+                waiting(guard::said(None, kept.as_deref()));
+                said = false;
+            }
+            None => {}
         }
     }
 }
@@ -2052,18 +2372,18 @@ mod tests {
 
     #[test]
     fn the_bounds_are_the_charts_or_these_and_a_bound_that_is_none_is_refused() {
-        let said = Bounds::from_said(Some("90s"), Some("64MB"), 3).unwrap();
+        let said = Bounds::from_said(Some("90s"), Some("64MB"), 3, 1 << 20).unwrap();
         assert_eq!(
             (said.max_age, said.max_bytes),
             (Duration::from_secs(90), 64 << 20)
         );
         assert_eq!(
-            Bounds::from_said(Some("2h"), Some("1GB"), 3)
+            Bounds::from_said(Some("2h"), Some("1GB"), 3, 1 << 20)
                 .unwrap()
                 .max_age,
             Duration::from_secs(7_200)
         );
-        let none = Bounds::from_said(None, Some(""), 3).unwrap();
+        let none = Bounds::from_said(None, Some(""), 3, 1 << 20).unwrap();
         assert_eq!((none.max_age, none.max_bytes), (MAX_AGE, MAX_BYTES));
         for (age, bytes, named) in [
             ("0s", "", "maxAge"),
@@ -2073,8 +2393,29 @@ mod tests {
             ("", "256Mi", "maxBytes"),
             ("", "lots", "maxBytes"),
         ] {
-            let refused = Bounds::from_said(Some(age), Some(bytes), 3).unwrap_err();
+            let refused = Bounds::from_said(Some(age), Some(bytes), 3, 1 << 20).unwrap_err();
             assert!(refused.contains(named), "{age} {bytes}: {refused}");
         }
+    }
+
+    /// The review of the stream guard, finding 5: a byte bound under 16 of
+    /// the broker's largest message is refused, naming both.
+    #[test]
+    fn a_byte_bound_under_sixteen_of_the_brokers_largest_message_is_refused() {
+        for small in ["512KB", "15MB", "16777215"] {
+            let refused = Bounds::from_said(None, Some(small), 3, 1 << 20).unwrap_err();
+            assert!(
+                refused.contains("lake.writeAhead.maxBytes")
+                    && refused.contains("broker.limits.maxPayload, 1048576 bytes"),
+                "{small}: {refused}"
+            );
+        }
+        let least = Bounds::from_said(None, Some("16MB"), 3, 1 << 20).unwrap();
+        assert_eq!(least.max_bytes, 16 << 20);
+        // The broker's largest message as the broker says it: 8 MiB takes
+        // 128 MiB, and this module's 256 MiB where the chart says nothing.
+        assert!(Bounds::from_said(None, Some("64MB"), 3, 8 << 20).is_err());
+        assert!(Bounds::from_said(None, None, 3, 8 << 20).is_ok());
+        assert!(Bounds::from_said(None, None, 3, 32 << 20).is_err());
     }
 }

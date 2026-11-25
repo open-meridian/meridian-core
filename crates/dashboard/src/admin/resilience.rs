@@ -512,7 +512,36 @@ fn profile_tab(said: &Result<ReadResilienceProfileReply, String>) -> String {
     )
 }
 
-fn member_row(m: &ComponentReport) -> String {
+/// A member's health as it reported it, in a word (v31a item 5).
+pub(crate) fn health_word(health: i32) -> &'static str {
+    use meridian_domain::v1::ComponentHealth;
+    match ComponentHealth::try_from(health).unwrap_or(ComponentHealth::Unspecified) {
+        ComponentHealth::Serving => "serving",
+        ComponentHealth::Degraded => "degraded",
+        ComponentHealth::Stopping => "stopping",
+        ComponentHealth::Unspecified => "not said",
+    }
+}
+
+pub(crate) fn member_row(m: &ComponentReport) -> String {
+    // Its mode, and where it is not serving its health, the words it said
+    // it with its title: the lake's writer, its write-ahead stream stuck
+    // full, with its figures (v31a item 5).
+    let health = health_word(m.health);
+    let mode = if m.mode.is_empty() {
+        "one copy"
+    } else {
+        &m.mode
+    };
+    let mode = match health {
+        "degraded" | "stopping" => format!("{mode}, {health}"),
+        _ => mode.to_string(),
+    };
+    let said = if m.detail.is_empty() {
+        mode.clone()
+    } else {
+        format!("{mode}: {}", m.detail)
+    };
     let lag = if m.mode == "standby" || m.mode == "reader" {
         format!("{} ms", m.lag_ms)
     } else {
@@ -520,7 +549,7 @@ fn member_row(m: &ComponentReport) -> String {
     };
     format!(
         "<tr data-member=\"{member}\"><td title=\"{component}\">{component}</td><td title=\"{member}\">{member}</td>\
-         <td title=\"{mode}\">{mode}</td><td title=\"{zone}\">{zone}</td><td class=\"num\" title=\"{lag}\">{lag}</td>\
+         <td title=\"{said}\">{mode}</td><td title=\"{zone}\">{zone}</td><td class=\"num\" title=\"{lag}\">{lag}</td>\
          <td class=\"wide num\" title=\"{restarts} {why}\">{restarts}</td></tr>",
         component = escape(&m.component),
         member = escape(if m.member.is_empty() {
@@ -528,11 +557,8 @@ fn member_row(m: &ComponentReport) -> String {
         } else {
             &m.member
         }),
-        mode = escape(if m.mode.is_empty() {
-            "one copy"
-        } else {
-            &m.mode
-        }),
+        mode = escape(&mode),
+        said = escape(&said),
         zone = escape(if m.zone.is_empty() {
             "not said"
         } else {

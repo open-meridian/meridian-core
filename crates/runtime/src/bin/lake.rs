@@ -651,7 +651,10 @@ fn run() -> Result<(), String> {
             let client = meridian_bus::NatsBackend::client(&url)
                 .await
                 .map_err(|failed| format!("the write-ahead stream's broker: {failed}"))?;
-            let bounds = write_ahead_bounds()?;
+            // The broker's largest message, as it says it: the stream
+            // holds at least 16 of them.
+            let max_payload = u64::try_from(client.server_info().max_payload).unwrap_or(u64::MAX);
+            let bounds = write_ahead_bounds(max_payload)?;
             // A shard's raise reads the stream's place (review c5a H2).
             lake.with_write_ahead(client.clone());
             let writing = Arc::clone(&lake);
@@ -789,14 +792,16 @@ fn write_ahead_on() -> bool {
 
 /// The stream's bounds (`lake.writeAhead.maxAge`, `lake.writeAhead.maxBytes`):
 /// how long it holds a write the lake has not recorded, and how much it
-/// holds; refused where the chart says something that is neither. On the
+/// holds; refused where the chart says something that is neither, or less
+/// than 16 of the broker's largest message (`max_payload` bytes). On the
 /// broker's three servers, a majority holding each write before its plugin
 /// is answered.
-fn write_ahead_bounds() -> Result<meridian_lake::write_ahead::Bounds, String> {
+fn write_ahead_bounds(max_payload: u64) -> Result<meridian_lake::write_ahead::Bounds, String> {
     meridian_lake::write_ahead::Bounds::from_said(
         var("MERIDIAN_LAKE_WRITE_AHEAD_MAX_AGE").as_deref(),
         var("MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES").as_deref(),
         3,
+        max_payload,
     )
 }
 

@@ -3016,7 +3016,14 @@ chart-check:
 			|| { echo "chart-check FAILED: lake.writeAhead $${flag:-unset} does not tell the lake MERIDIAN_LAKE_WRITE_AHEAD_$$name=$$want" >&2; exit 1; }; \
 	done; \
 	! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.writeAhead.maxAge=ten >/dev/null 2>&1 \
-		|| { echo "chart-check FAILED: lake.writeAhead.maxAge=ten rendered; it takes a whole number of s, m or h" >&2; exit 1; }
+		|| { echo "chart-check FAILED: lake.writeAhead.maxAge=ten rendered; it takes a whole number of s, m or h" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set lake.writeAhead.maxBytes=16MB 2>/dev/null \
+		| grep -A1 'name: MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES$$' | grep -q 'value: "16MB"' \
+		|| { echo "chart-check FAILED: lake.writeAhead.maxBytes=16MB, 16 times the broker's 1MB largest message, does not reach the lake" >&2; exit 1; }; \
+	for small in "--set lake.writeAhead.maxBytes=15MB" "--set lake.writeAhead.maxBytes=64MB --set broker.limits.maxPayload=8MB" "--set lake.writeAhead.maxBytes=1GB --set broker.limits.maxPayload=1GB"; do \
+		! $(HELM_TEMPLATE) check deploy/chart $$base $$small >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: $$small rendered; the write-ahead stream holds at least 16 of the broker's largest message (broker.limits.maxPayload)" >&2; exit 1; }; \
+	done
 	@# Ruling 972: lake.mallocMmapThreshold reaches the lake as glibc's
 	@# MALLOC_MMAP_THRESHOLD_, 131072 by default, and only a whole number of
 	@# bytes above 0 renders.
@@ -3490,6 +3497,18 @@ chart-check:
 		|| { echo "chart-check FAILED: the ha profile with a generated key was refused without saying why: $$said" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=warm 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: resilience.profile=warm rendered" >&2; exit 1; }; true
+	@# JetStream never syncs each write to disk (v31a item 5; PO 2026-11-20:
+	@# its cost measured, the exposure until v32 accepted): neither the
+	@# values nor either profile's render says sync_interval: always, or the
+	@# older sync_always. The broker's configuration refuses it too
+	@# (meridian-broker-config, never_syncs_always).
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	for profile in tolerant ha; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=$$profile 2>/dev/null)" \
+			|| { echo "chart-check FAILED: the $$profile profile did not render" >&2; exit 1; }; \
+		{ echo "$$said"; cat deploy/chart/values.yaml; } | tr -d ' "\t' | grep -qiE 'sync_interval[:=]always|sync_always[:=]true' \
+			&& { echo "chart-check FAILED: the $$profile profile or the values have JetStream sync every write (sync_interval: always), which is never set (PO 2026-11-20)" >&2; exit 1; }; \
+	done; true
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
 	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the ha profile did not render with the key in a Secret" >&2; exit 1; }; \

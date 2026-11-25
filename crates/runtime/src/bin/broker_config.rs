@@ -312,6 +312,7 @@ mod serve {
                 .0
             }
         };
+        crate::never_syncs_always(&current)?;
         std::fs::write(&args.out, &current)
             .map_err(|failed| format!("{} could not be written: {failed}", args.out))?;
 
@@ -342,6 +343,7 @@ mod serve {
                 _ = every.tick() => {
                     match reconciled(&api, &args, &chart, &mut hashes).await {
                         Ok(configuration) if configuration != current => {
+                            crate::never_syncs_always(&configuration)?;
                             std::fs::write(&args.out, &configuration)
                                 .map_err(|failed| format!("{} could not be written: {failed}", args.out))?;
                             signal_child(pid, libc::SIGHUP);
@@ -443,6 +445,37 @@ fn bounded(max_pending: &str, max_payload: &str) -> String {
          # is served. Read by a port-forward when a failover check fails.\n\
          http: \"127.0.0.1:8222\"\n\n"
     )
+}
+
+/// Refused: a configuration that has JetStream sync each write to disk
+/// (`sync_interval: always`, or the older `sync_always: true`; v31a item 5,
+/// PO 2026-11-20: its cost was measured and the exposure until v32
+/// accepted). Checked on what is about to be written, whoever wrote it.
+fn never_syncs_always(configuration: &str) -> Result<(), String> {
+    let said = configuration.to_ascii_lowercase();
+    let syncs = said.lines().any(|line| {
+        let line: String = line
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"')
+            .collect();
+        [
+            "sync_interval:always",
+            "sync_interval=always",
+            "sync_always:true",
+            "sync_always=true",
+        ]
+        .iter()
+        .any(|refused| line.contains(refused))
+    });
+    if syncs {
+        return Err(
+            "the broker's configuration has JetStream sync every write (sync_interval: \
+                    always), which is never set (PO 2026-11-20: its cost measured, the exposure \
+                    until v32 accepted)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn clustered(
@@ -626,6 +659,7 @@ fn run() -> Result<(), String> {
     }
 
     let configuration = rendered(HEADER, &admitted);
+    never_syncs_always(&configuration)?;
     match out.as_str() {
         "" => print!("{configuration}"),
         path => std::fs::write(path, configuration)
@@ -636,6 +670,30 @@ fn run() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// v31a item 5 (PO 2026-11-20): JetStream never syncs each write to
+    /// disk (`sync_interval: always`, or its older `sync_always`), so a
+    /// configuration that says so is refused before it is written, naming
+    /// the ruling; the one this binary writes says neither.
+    #[test]
+    fn a_configuration_that_syncs_every_write_is_refused() {
+        for said in [
+            "jetstream {\n  store_dir: \"/data/jetstream\"\n  sync_interval: always\n}\n",
+            "jetstream {\n  sync_interval: \"always\"\n}\n",
+            "jetstream {\n  sync_always: true\n}\n",
+            "jetstream: { SYNC_INTERVAL = always }\n",
+        ] {
+            let refused = super::never_syncs_always(said).unwrap_err();
+            assert!(refused.contains("sync_interval: always"), "{refused}");
+            assert!(refused.contains("2026-11-20"), "{refused}");
+        }
+        let written = super::clustered("b", &[], "256MB", "/data/jetstream", "16MB", "");
+        assert_eq!(super::never_syncs_always(&written), Ok(()));
+        assert_eq!(
+            super::never_syncs_always("jetstream {\n  sync_interval: 2m\n}\n"),
+            Ok(())
+        );
+    }
+
     #[test]
     fn the_brokers_bounds_are_the_charts_and_a_size_it_cannot_read_is_refused_naming_it() {
         let said = super::bounded("32MB", "1MB");

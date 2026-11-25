@@ -322,7 +322,10 @@ or GB. Nothing where JetStream does not run. Takes the chart.
 
 {{/*
 lake.writeAhead.maxBytes in MB, refused unless it is a whole number above 0
-of MB or GB. Takes the chart.
+of MB or GB, and at least 16 times the broker's largest message
+(broker.limits.maxPayload): a stream with less room than one write is at
+its bound for that write, and one of a few writes is full at once. Takes the
+chart.
 */}}
 {{- define "meridian-runtime.writeAheadMiB" -}}
 {{- $w := .Values.lake.writeAhead | default dict }}
@@ -330,8 +333,20 @@ of MB or GB. Takes the chart.
 {{- if not (regexMatch "^[1-9][0-9]*(MB|GB)$" $bytes) }}
 {{- fail (printf "lake.writeAhead.maxBytes is %v; a whole number above 0 of MB or GB, as 256MB: how much the lake's write-ahead stream holds before it refuses a write" $bytes) }}
 {{- end }}
-{{- $n := int (regexFind "^[0-9]+" $bytes) }}
-{{- if hasSuffix "GB" $bytes }}{{ mul $n 1024 }}{{ else }}{{ $n }}{{ end }}
+{{- $mib := int (regexFind "^[0-9]+" $bytes) }}
+{{- if hasSuffix "GB" $bytes }}{{ $mib = mul $mib 1024 }}{{ end }}
+{{- /* The broker's configuration refuses a maxPayload it does not read. */}}
+{{- $payload := toString ((.Values.broker.limits | default dict).maxPayload | default "1MB") }}
+{{- if regexMatch "^[1-9][0-9]*(KB|MB|GB)?$" $payload }}
+{{- $largest := int (regexFind "^[0-9]+" $payload) }}
+{{- if hasSuffix "KB" $payload }}{{ $largest = mul $largest 1024 }}{{ end }}
+{{- if hasSuffix "MB" $payload }}{{ $largest = mul $largest 1048576 }}{{ end }}
+{{- if hasSuffix "GB" $payload }}{{ $largest = mul $largest 1073741824 }}{{ end }}
+{{- if lt (mul $mib 1048576) (mul 16 $largest) }}
+{{- fail (printf "lake.writeAhead.maxBytes is %v; at least 16 times broker.limits.maxPayload (%v), the broker's largest message: the lake's write-ahead stream refuses a write it has no room for" $bytes $payload) }}
+{{- end }}
+{{- end }}
+{{- $mib }}
 {{- end -}}
 
 {{/*

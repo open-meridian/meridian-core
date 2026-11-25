@@ -298,6 +298,11 @@ fn jetstream_grants(components: &[&str]) -> Vec<String> {
             format!("$JS.API.CONSUMER.INFO.{stream}.*"),
             format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.*"),
             format!("$JS.API.CONSUMER.DELETE.{stream}.*"),
+            // Its write at a place, read by its sequence for its time
+            // (`direct_get`): the age a lower age bound and the guard's
+            // alarm are held to (v31a item 5). By sequence alone, the
+            // subject without a suffix: never a read by a subject.
+            format!("$JS.API.DIRECT.GET.{stream}"),
         ]);
     }
     granted
