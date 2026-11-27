@@ -239,7 +239,13 @@ if [ -n "${MERIDIAN_BACKUP_HOLD:-}" ]; then
 	mkdir -p /work/held
 	cp "$partial" "/work/held/$name" || { rm -f "$partial"; fail "the copy held for meridian backup could not be made"; }
 fi
+# On disk before it carries its final name, and the name on disk before this
+# says it wrote one: a power loss otherwise leaves a backup that is there,
+# named whole, and empty (the deployment's key was, LazyFS run 2). `sync` here
+# is coreutils', which syncs the file or the folder it is given.
+sync "$partial" || { rm -f "$partial"; fail "the backup could not be synced to disk"; }
 mv "$partial" "/backups/$name"
+sync /backups || fail "the backup's name could not be synced to disk"
 rm -rf "$work"
 say "wrote $name $(wc -c <"/backups/$name" | tr -d ' ') bytes sha256 $(sha256sum "/backups/$name" | cut -d' ' -f1)"
 

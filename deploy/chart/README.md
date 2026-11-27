@@ -255,7 +255,12 @@ than `maxAge` leaves a gap in each dataset whose writes the stream dropped,
 recorded, asked again of the data plugin where its dataset declares
 `backfill`, and marked unrecovered otherwise. Each server's JetStream store
 is sized to hold `maxBytes` beside the analytics units' queue, and the chart
-refuses a `broker.jetstream.size` too small for it.
+refuses a `broker.jetstream.size` too small for it. `maxBytes` must be at least 16
+times `broker.limits.maxPayload`, the broker's largest message, and the chart
+refuses less. A `maxBytes` lowered to less than the stream holds plus one
+largest message is not applied: the stream keeps its bound, the lake's log
+says why, and the lower bound is applied when the lake's writer next starts
+with room for it.
 
 A profile is changed on a live install by an upgrade (`meridian
 upgrade-deployment --set resilience.profile=ha`, and back). A StatefulSet's
