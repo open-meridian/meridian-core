@@ -17,7 +17,11 @@
 //! stream stuck full, as the lake's writer says first in its report's words
 //! (v31a item 5, 0-J), is a standing notice to the deployment admins,
 //! `component-write-ahead-stuck-full`, and its clearing once no member says
-//! so, `component-write-ahead-drained`.
+//! so, `component-write-ahead-drained`. The broker refusing the lake's
+//! write-ahead writes, or not answering them, for 30 s, as the writer says
+//! it apart from stuck full, is one too, `component-write-ahead-refused`,
+//! and its clearing once no member says so, `component-write-ahead-accepted`
+//! (INTERIM(v32), the proposal of 2026-11-27, A1).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -111,6 +115,12 @@ pub struct Judge {
     /// time its stream went stuck. One is here once its stuck notice is
     /// kept, and until its drained notice is ([`Judge::kept`]).
     stuck_full: BTreeMap<String, i64>,
+    /// The core components whose broker refuses their write-ahead writes,
+    /// or does not answer them, as one of their members said (INTERIM(v32),
+    /// the proposal of 2026-11-27, A1), each with its episode: the time the
+    /// refusals began. One is here once its refused notice is kept, and
+    /// until its accepted notice is ([`Judge::kept`]).
+    refused: BTreeMap<String, i64>,
 }
 
 fn mib(bytes: u64) -> u64 {
@@ -260,6 +270,7 @@ impl Judge {
                 .is_some_and(|last| last.at_ns >= now_ns - KEPT_NS)
         });
         opened.extend(self.stuck_full(members, now_ns));
+        opened.extend(self.refused(members, now_ns));
         opened
     }
 
@@ -285,52 +296,49 @@ impl Judge {
     /// spell to a copy that kept its notice, another to one started since.
     fn stuck_full(&self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
         let stuck = meridian_bus::write_ahead::STUCK_FULL;
-        let hour_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
-        // Each core component reporting, and of its members saying so the
-        // one whose stream went stuck first.
-        let mut said: BTreeMap<&str, Option<(i64, &ComponentReport)>> = BTreeMap::new();
-        for report in members
-            .iter()
-            .filter(|r| !r.component.starts_with("sidecar-"))
-        {
-            let saying = said.entry(report.component.as_str()).or_default();
-            if report.detail.starts_with(stuck) {
-                let since =
-                    meridian_bus::write_ahead::stuck_since(&report.detail).unwrap_or(hour_ns);
-                if saying.is_none_or(|(first, _)| since < first) {
-                    *saying = Some((since, report));
-                }
-            }
-        }
-        let mut opened = Vec::new();
-        for (component, saying) in said {
-            let (name, window_ns, about) = match (saying, self.stuck_full.get(component)) {
-                (Some((since, report)), None) => (
-                    "write-ahead-stuck-full",
-                    since,
-                    format!(
-                        "{component}/{}: {}. Standing until it drains; its cause goes to a diagnosis",
-                        report.member, report.detail
-                    ),
-                ),
-                (None, Some(since)) => (
-                    "write-ahead-drained",
-                    *since,
-                    format!("{component}: the lake's write-ahead stream drained, no longer at a bound"),
-                ),
-                _ => continue,
-            };
-            let kind = format!("component-{name}");
-            opened.push(Opened {
-                of: component.to_string(),
-                plugin: false,
-                event: format!("{kind}|{component}|{window_ns}"),
-                kind,
-                about,
-                window_ns,
-            });
-        }
-        opened
+        standing(
+            members,
+            now_ns,
+            &self.stuck_full,
+            |detail| detail.starts_with(stuck),
+            meridian_bus::write_ahead::stuck_since,
+            (
+                "write-ahead-stuck-full",
+                "Standing until it drains; its cause goes to a diagnosis",
+            ),
+            (
+                "write-ahead-drained",
+                "the lake's write-ahead stream drained, no longer at a bound",
+            ),
+        )
+    }
+
+    /// The broker refusing the lake's write-ahead writes, or not answering
+    /// them, as a core member's report says (INTERIM(v32), the proposal of
+    /// 2026-11-27, A1; [`meridian_bus::write_ahead::REFUSED`]): a standing
+    /// notice, `component-write-ahead-refused`, opened once an episode while
+    /// any member of the component says so, and its clearing,
+    /// `component-write-ahead-accepted`, once none of those reporting does
+    /// -- the shape, the windows and the offering again of
+    /// [`Judge::stuck_full`]'s, an episode windowed by the time its
+    /// refusals began as the lake's guard says it. Its words name the
+    /// component and say what the broker does; why is not inferred.
+    fn refused(&self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
+        standing(
+            members,
+            now_ns,
+            &self.refused,
+            meridian_bus::write_ahead::says_refused,
+            meridian_bus::write_ahead::refused_since,
+            (
+                "write-ahead-refused",
+                "Standing until a write is accepted again",
+            ),
+            (
+                "write-ahead-accepted",
+                "the lake's write-ahead writes are accepted by the broker again",
+            ),
+        )
     }
 
     /// The conductor did not answer at `now_ns`: its silence opens a notice
@@ -376,7 +384,8 @@ impl Judge {
 
     /// What one judging opened is kept, or there was nobody to tell: the
     /// conductor's silence, among them, is not offered again while it lasts,
-    /// nor a stream's stuck spell while it stands, nor its draining.
+    /// nor a stream's stuck spell while it stands, nor its draining, nor a
+    /// refused episode while it stands, nor its writes accepted again.
     pub fn kept(&mut self, opened: &[Opened]) {
         for one in opened {
             match one.kind.as_str() {
@@ -388,6 +397,14 @@ impl Judge {
                 }
                 "component-write-ahead-drained" => {
                     self.stuck_full.remove(&one.of);
+                }
+                // A refused episode stands from its notice kept to its
+                // accepted notice kept (INTERIM(v32)).
+                "component-write-ahead-refused" => {
+                    self.refused.insert(one.of.clone(), one.window_ns);
+                }
+                "component-write-ahead-accepted" => {
+                    self.refused.remove(&one.of);
                 }
                 _ => {}
             }
@@ -403,6 +420,66 @@ impl Judge {
         let last = kept.samples.back()?.restarts;
         Some((peak, last.saturating_sub(first)))
     }
+}
+
+/// A standing condition of a core component's write-ahead stream, as its
+/// members' reports say it ([`Judge::stuck_full`], [`Judge::refused`]):
+/// opened as `open` while a member `says` it, once (`standing` holds the
+/// components whose opening was kept, each with its window), and cleared
+/// as `clear` once none of those reporting does. The window is the
+/// earliest time a member says (`since`), or the hour judged where none
+/// reads; the clearing carries the opening's. Each is `(name, words)`: the
+/// opening's words follow the member's, the clearing's the component's.
+fn standing(
+    members: &[ComponentReport],
+    now_ns: i64,
+    standing: &BTreeMap<String, i64>,
+    says: impl Fn(&str) -> bool,
+    since: impl Fn(&str) -> Option<i64>,
+    open: (&str, &str),
+    clear: (&str, &str),
+) -> Vec<Opened> {
+    let hour_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
+    // Each core component reporting, and of its members saying so the
+    // one whose condition began first.
+    let mut said: BTreeMap<&str, Option<(i64, &ComponentReport)>> = BTreeMap::new();
+    for report in members
+        .iter()
+        .filter(|r| !r.component.starts_with("sidecar-"))
+    {
+        let saying = said.entry(report.component.as_str()).or_default();
+        if says(&report.detail) {
+            let began = since(&report.detail).unwrap_or(hour_ns);
+            if saying.is_none_or(|(first, _)| began < first) {
+                *saying = Some((began, report));
+            }
+        }
+    }
+    let mut opened = Vec::new();
+    for (component, saying) in said {
+        let (name, window_ns, about) = match (saying, standing.get(component)) {
+            (Some((began, report)), None) => (
+                open.0,
+                began,
+                format!(
+                    "{component}/{}: {}. {}",
+                    report.member, report.detail, open.1
+                ),
+            ),
+            (None, Some(began)) => (clear.0, *began, format!("{component}: {}", clear.1)),
+            _ => continue,
+        };
+        let kind = format!("component-{name}");
+        opened.push(Opened {
+            of: component.to_string(),
+            plugin: false,
+            event: format!("{kind}|{component}|{window_ns}"),
+            kind,
+            about,
+            window_ns,
+        });
+    }
+    opened
 }
 
 /// Whether the hourly peaks of the last [`CLIMBING_HOURS`] whole hours rose
@@ -741,6 +818,117 @@ mod tests {
         let dropped = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
         let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 5 * MINUTE);
         assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
+        assert_eq!(opened[0].event, dropped[0].event);
+    }
+
+    /// The lake's writer's words for the broker refusing its write-ahead
+    /// stream since `since`, as its guard says them (INTERIM(v32), A1).
+    fn refused_since(member: &str, since: &str) -> ComponentReport {
+        ComponentReport {
+            member: member.into(),
+            detail: format!(
+                "{} for 30s, since {since}: every look at the stream refused or not answered; \
+                 the broker's last: JetStream system temporarily unavailable (503, 10008)",
+                meridian_bus::write_ahead::REFUSED
+            ),
+            ..lake(MIB, 0, 0, 0)
+        }
+    }
+
+    /// The proposal of 2026-11-27, A1 (INTERIM(v32)): the lake's writer
+    /// saying the broker refuses its write-ahead writes, or does not answer
+    /// them, opens a standing notice to the deployment admins once an
+    /// episode -- the writer moved, its successor saying it too -- naming
+    /// the component and inferring nothing more; and its accepted notice
+    /// once no member says it. A second episode within the hour is its own.
+    /// Neither is stuck full, nor drained.
+    #[test]
+    fn a_refused_write_ahead_opens_a_standing_notice_once_an_episode_and_an_accepted_notice() {
+        let mut judge = Judge::default();
+        let first = refused_since("meridian-lake-0", "2026-10-26T07:33:50Z");
+        let opened = judge.judge(std::slice::from_ref(&first), T0 + MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-refused"]);
+        assert!(!opened[0].plugin && opened[0].of == "lake");
+        let about = &opened[0].about;
+        for part in [
+            "lake/meridian-lake-0",
+            "refused or not answered by the broker",
+        ] {
+            assert!(about.contains(part), "{part} in {about}");
+        }
+        assert!(!about.contains("disk"), "nothing inferred: {about}");
+        let event = opened[0].event.clone();
+        judge.kept(&opened);
+        assert!(judge.judge(&[first], T0 + 2 * MINUTE).is_empty());
+        assert!(
+            judge
+                .judge(
+                    &[refused_since("meridian-lake-1", "2026-10-26T07:35:10Z")],
+                    T0 + 3 * MINUTE
+                )
+                .is_empty(),
+            "the writer moved, still refused: nothing new"
+        );
+        let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-accepted"]);
+        assert!(opened[0].about.starts_with("lake: "), "{}", opened[0].about);
+        assert_eq!(opened[0].window_ns, judge.refused["lake"]);
+        judge.kept(&opened);
+        assert!(judge
+            .judge(&[lake(MIB, 0, 0, 0)], T0 + 5 * MINUTE)
+            .is_empty());
+        let opened = judge.judge(
+            &[refused_since("meridian-lake-1", "2026-10-26T07:39:00Z")],
+            T0 + 6 * MINUTE,
+        );
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-refused"]);
+        assert_ne!(opened[0].event, event, "a second episode its own event");
+    }
+
+    /// Stuck full files as it did beside a refusal: a member saying both
+    /// opens both notices, each its own; refused alone opens no stuck-full
+    /// notice, stuck alone no refused one; and each clears on its own.
+    #[test]
+    fn stuck_full_and_refused_open_their_own_notices_side_by_side() {
+        let mut judge = Judge::default();
+        let stuck = stuck_since("meridian-lake-0", "2026-10-26T07:33:20Z");
+        let opened = judge.judge(std::slice::from_ref(&stuck), T0 + MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-stuck-full"]);
+        judge.kept(&opened);
+        let both = ComponentReport {
+            detail: format!(
+                "{}; {}",
+                stuck.detail,
+                refused_since("meridian-lake-0", "2026-10-26T07:34:00Z").detail
+            ),
+            ..stuck.clone()
+        };
+        let opened = judge.judge(std::slice::from_ref(&both), T0 + 2 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-refused"]);
+        judge.kept(&opened);
+        let opened = judge.judge(std::slice::from_ref(&stuck), T0 + 3 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-accepted"]);
+        judge.kept(&opened);
+        let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
+        judge.kept(&opened);
+        assert!(judge.stuck_full.is_empty() && judge.refused.is_empty());
+    }
+
+    /// Like a stuck notice, a refused or accepted notice whose keeping
+    /// failed is offered again at the next judging, as the same event.
+    #[test]
+    fn a_refused_notice_that_was_not_kept_is_offered_again() {
+        let mut judge = Judge::default();
+        let refused = refused_since("meridian-lake-0", "2026-10-26T07:33:50Z");
+        let dropped = judge.judge(std::slice::from_ref(&refused), T0 + MINUTE);
+        let opened = judge.judge(std::slice::from_ref(&refused), T0 + 2 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-refused"]);
+        assert_eq!(opened[0].event, dropped[0].event);
+        judge.kept(&opened);
+        let dropped = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 3 * MINUTE);
+        let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-accepted"]);
         assert_eq!(opened[0].event, dropped[0].event);
     }
 
