@@ -845,5 +845,153 @@ class BrokerDiskFull(unittest.TestCase):
         self.assertTrue(all(v["spec"]["hostPath"]["path"].startswith(disk) for v in volumes))
 
 
+class DiskFull:
+    """The class's world, its clock stood in for: the broker refuses a
+    price `refused_after` s into the fault, the notice is filed
+    `notice_after` s after the first refusal (None: never), the lake
+    acknowledges again `back_after` s after the room is given (None:
+    never); the prices lost, the gaps and what the broker said given."""
+
+    def __init__(self, refused_after=4, notice_after=50, back_after=20, lost=(), gaps=(), said=None,
+                 made_again=False, raise_in_fill=False):
+        self.now = [1_000_000.0]
+        self.refused_after, self.notice_after, self.back_after = refused_after, notice_after, back_after
+        self.lost, self.gaps, self.said, self.made_again = list(lost), list(gaps), said or {}, made_again
+        self.raise_in_fill, self.rooms, self.claims = raise_in_fill, 0, []
+        self.start = self.now[0]
+
+    def refused(self, began_ms):
+        at = self.start + self.refused_after
+        return [(int(at * 1000), "UNAVAILABLE: no space")] if self.now[0] >= at else []
+
+    def notices(self, since_ns):
+        if self.notice_after is None:
+            return []
+        at = self.start + self.refused_after + self.notice_after
+        return [int(at * 1e9)] if self.now[0] >= at else []
+
+    def acked_after(self, at_ms):
+        if self.back_after is None or self.room_at is None:
+            return None
+        at = self.room_at + self.back_after
+        return int(at * 1000) if self.now[0] >= at else None
+
+    def fill(self):
+        if self.raise_in_fill:
+            raise SystemExit("kubectl exec failed")
+        return 1 << 30
+
+    def give_room(self):
+        self.rooms += 1
+        self.room_at = self.now[0]
+
+    def run(self):
+        self.room_at = None
+        checks = Checks()
+        acked = {f"price {n}": int((self.start + n) * 1000) for n in range(1, 30)}
+        patches = [
+            mock.patch.object(run, "PROFILE", "ha"), mock.patch.object(run, "BROKER_DISK", "/disk"),
+            mock.patch.object(run, "DRIVEN", True),
+            mock.patch.object(run, "broker_disk_mounted", lambda s: True),
+            mock.patch.object(run, "wait_for", lambda *a, **k: None),
+            mock.patch.object(run, "fill_disk", self.fill), mock.patch.object(run, "give_room", self.give_room),
+            mock.patch.object(run, "host_disk", lambda: (1 << 30, 0)),
+            mock.patch.object(run, "prices_refused", self.refused),
+            mock.patch.object(run, "stuck_notices", self.notices),
+            mock.patch.object(run, "price_acked_after", self.acked_after),
+            mock.patch.object(run, "store_logs_at_first_refusal", lambda *a: None),
+            mock.patch.object(run, "broker_disk_said", lambda began: self.said),
+            mock.patch.object(run, "lake_said_since", lambda began: {
+                "lake-0": run.MADE_AGAIN if self.made_again else ""}),
+            mock.patch.object(run, "gap_windows", lambda dataset, since: self.gaps),
+            mock.patch.object(run, "gaps_found_in", lambda dataset, since: {}),
+            mock.patch.object(run, "store_rpo", lambda: {"book": {"lost": []}, "lake": {"lost": self.lost}}),
+            mock.patch.object(run, "driver_acked", lambda: {"price": acked}),
+            mock.patch.object(run, "claim", lambda s, *said: self.claims.append(said)),
+            mock.patch.object(run, "figure", lambda *a, **k: None),
+            mock.patch.object(run.time, "time", lambda: self.now[0]),
+            mock.patch.object(run.time, "sleep", lambda seconds: self.now.__setitem__(0, self.now[0] + seconds)),
+        ]
+        for patch in patches:
+            patch.start()
+        try:
+            run.FAILURES["broker-disk-full"](checks)
+        except SystemExit:
+            pass
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        return checks
+
+    def failed(self, checks):
+        return [what for ok, what in checks.said if not ok]
+
+
+class BrokerDiskFullAsserted(unittest.TestCase):
+    """The class's assertions (the spec's row, its bounds candidates): the
+    standing notice within 2 minutes of the first refusal, the lake's
+    writes acknowledged again within 2 minutes of the room given back, no
+    acknowledged price missing outside a marked gap, and a stream deleted
+    as orphaned coming out as a gap."""
+
+    def test_all_held_is_green_and_the_room_given_back_once(self):
+        world = DiskFull()
+        checks = world.run()
+        self.assertEqual(world.failed(checks), [])
+        self.assertEqual(world.rooms, 1)
+        (failure, component, seconds, bound, extra), = world.claims
+        self.assertEqual((failure, component, bound), ("broker-disk-full", "lake", 120))
+        self.assertLessEqual(seconds, 120)
+        self.assertGreaterEqual(extra["held_s"], 90)
+
+    def test_no_notice_fails_naming_its_bound(self):
+        world = DiskFull(notice_after=None)
+        failed = world.failed(world.run())
+        self.assertEqual(len(failed), 1, failed)
+        self.assertIn("the standing notice (component-write-ahead-stuck-full) within 120s", failed[0])
+        self.assertIn("none within", failed[0])
+
+    def test_a_late_notice_fails_and_says_how_late(self):
+        failed = DiskFull(notice_after=150).failed(DiskFull(notice_after=150).run())
+        self.assertEqual(len(failed), 1, failed)
+        self.assertRegex(failed[0], r"\(15\d(\.\d)?s\)")
+
+    def test_writes_never_acknowledged_again_are_claimed_past_the_bound(self):
+        world = DiskFull(back_after=None)
+        world.run()
+        (_, _, seconds, bound, extra), = world.claims
+        self.assertGreater(seconds, bound)
+        self.assertIs(extra["acknowledged_again"], False)
+
+    def test_a_lost_price_inside_a_marked_gap_holds_and_outside_fails(self):
+        # Acknowledged at the start + n s; the gap marks 20 s to 30 s in.
+        gap = [(int((1_000_000 + 20) * 1e9), int((1_000_000 + 30) * 1e9))]
+        inside = DiskFull(lost=["price 25"], gaps=gap)
+        self.assertEqual(inside.failed(inside.run()), [])
+        outside = DiskFull(lost=["price 5"], gaps=gap)
+        failed = outside.failed(outside.run())
+        self.assertEqual(len(failed), 1, failed)
+        self.assertIn("1 of them in no gap: price 5", failed[0])
+
+    def test_a_stream_deleted_as_orphaned_without_a_gap_fails(self):
+        said = {"js-0": ["[WRN] Detected orphaned stream '$G > LAKE_WRITE_AHEAD', will cleanup"]}
+        for world in (DiskFull(said=said), DiskFull(made_again=True)):
+            failed = world.failed(world.run())
+            self.assertEqual(len(failed), 1, failed)
+            self.assertIn("deleted as orphaned", failed[0])
+        held = DiskFull(said=said, gaps=[(1, 2)])
+        self.assertEqual(held.failed(held.run()), [])
+
+    def test_the_room_is_given_back_whatever_stops_the_fill(self):
+        world = DiskFull(raise_in_fill=True)
+        world.run()
+        self.assertEqual(world.rooms, 1)
+
+    def test_a_price_outside_every_gap_s_span_is_named(self):
+        acked = {"a": 100_000, "b": 200_000}
+        windows = [(99_000 * 10**6, 99_500 * 10**6)]
+        self.assertEqual(run.outside_gaps(["a", "b"], acked, windows), ["b"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
