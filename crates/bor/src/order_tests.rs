@@ -1285,6 +1285,74 @@ async fn a_fill_with_no_settlement_date_is_malformed_and_a_bust_reverses_the_pos
 
 // ── Child orders (the split link) ───────────────────────────────────────────
 
+/// Roadmap v31a item 7.2 (review G, 2026-11-20): a fill's security and cash
+/// pend to its settlement date, and nothing the book runs by itself -- no
+/// sweep, no read -- moves them to settled once that date has passed: only
+/// an adjustment does. Kept failing, for the proposal.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "v31a item 7.2: settlement promotion, proposal"]
+async fn a_fill_pending_to_its_settlement_date_is_settled_once_the_date_has_passed() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let placement = place(&w, &order.order_id, "10", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    execute(&w, &fill(&placement.placement_id, "10", "SETTLES:1"))
+        .await
+        .unwrap();
+    let aapl = |business_date: &str| {
+        w.store
+            .positions(&crate::store::PositionsRead {
+                scope: Scope::Everything,
+                account_id: ACC.into(),
+                since: None,
+                business_date: business_date.into(),
+                at: None,
+                limit: 100,
+                cursor: String::new(),
+            })
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|position| position.instrument_id == AAPL)
+            .unwrap()
+    };
+    let booked = aapl("2026-10-13");
+    assert_eq!(read(&booked.settled_quantity), "0");
+    assert_eq!(booked.pending.len(), 1);
+    assert_eq!(booked.pending[0].value_date, "2026-10-14");
+    assert_eq!(read(&booked.pending[0].quantity), "10");
+
+    // Four hundred days on, well past the settlement date by the book's
+    // clock, and every sweep the book runs by itself.
+    w.clock.advance(400 * 86_400 * 1_000_000_000);
+    assert!(crate::dates::date_of(w.bus.clock().now_ns()).as_str() > "2026-10-14");
+    let bus = w.bus.clone();
+    let store: Arc<dyn Store> = w.store.clone();
+    tokio::task::spawn_blocking(move || {
+        expire_due(&bus, &store).unwrap();
+        crate::booking_service::sweep_children(&bus, &*store).unwrap();
+        crate::factors::sweep(&bus, &*store).unwrap();
+    })
+    .await
+    .unwrap();
+
+    let later = aapl(&crate::dates::date_of(w.bus.clock().now_ns()));
+    assert_eq!(read(&later.trade_date_quantity), "10");
+    assert_eq!(
+        (read(&later.settled_quantity), later.pending.len()),
+        ("10".to_string(), 0),
+        "still pending to {:?} after its date",
+        later
+            .pending
+            .iter()
+            .map(|pending| pending.value_date.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_child_is_released_within_its_parent_commits_it_and_its_fills_are_the_parents() {
     let w = wired();

@@ -4992,6 +4992,138 @@ fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
     assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(4)));
 }
 
+/// v31a, item 7.4, the remaining class: a write the lake refused, its
+/// caller answered the refusal, is never recorded after. The refusal is
+/// kept nowhere but in the lake's place having passed the write: a place
+/// taken back -- a failover that lost the commit which passed it -- has the
+/// write taken again and judged afresh, and a dataset its instance's
+/// catalogue declares by then is recorded, after its caller was told it
+/// was not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "v31a item 7.4: placed in v32 lake (2)"]
+async fn a_write_refused_and_answered_is_not_recorded_when_the_lakes_place_is_taken_back() {
+    use meridian_domain::v1::{DatasetEntitlement, DatasetRef, RecordTradesRequest};
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{taken_past_a_switch, Taken, Writer};
+    use meridian_pb::v1::{DatasetDeclaration, ObservationMode};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    // Each dropped off the runtime, a failed run's too, its schema with it.
+    let (url, store) = tokio::task::block_in_place(|| isolated("i74"));
+    let store = OffRuntime::new(Arc::new(store));
+    let kept = unique("coinbase-1:i74-kept");
+    let late = unique("coinbase-1:i74-late");
+    let subject = unique("LCL-BTC");
+    // The catalogue declares `kept` alone.
+    let lake = OffRuntime::new(tokio::task::block_in_place(|| {
+        ha_lake(&store, "lake-1", &kept)
+    }));
+    let write = |n: u64, dataset: &str| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.i74.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("i74-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(dataset, &format!("p{n}"), &subject, 7_000 + n as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.to_string(),
+        timeout_ms: None,
+    };
+    let mut writer = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake.clone(), STREAM, 0)).unwrap(),
+    );
+    // Write 1, declared, is recorded: the lake's place is 1.
+    let answered = taken_past_a_switch(&mut writer, vec![write(1, &kept)])
+        .await
+        .unwrap();
+    assert!(answered[0].1.is_ok(), "{answered:?}");
+    // Write 2 is refused -- its dataset is none its instance's catalogue
+    // declares -- and its caller answered so: the place passes it.
+    let answered = taken_past_a_switch(&mut writer, vec![write(2, &late)])
+        .await
+        .unwrap();
+    assert_eq!(answered[0].0.as_deref(), Some("_INBOX.i74.2"));
+    let why = answered[0].1.clone().expect_err("write 2 is refused");
+    assert!(why.contains("catalogue declares"), "{why}");
+    assert_eq!(writer.next(), 3);
+    assert!(!tokio::task::block_in_place(|| store.heads())
+        .unwrap()
+        .contains_key(&late));
+    // A failover that lost the commit which passed write 2: the place is 1.
+    let mut client = OffRuntime::new(
+        tokio::task::block_in_place(|| postgres::Client::connect(&url, postgres::NoTls)).unwrap(),
+    );
+    let back = tokio::task::block_in_place(|| {
+        client.execute(
+            "UPDATE lake_write_ahead SET sequence = 1, at_ns = 1001 WHERE sequence = 2",
+            &[],
+        )
+    })
+    .unwrap();
+    assert_eq!(back, 1, "the lake's one place, taken back");
+    // The catalogue declares the dataset.
+    let declared = |dataset: &str| DatasetRef {
+        dataset: dataset.to_string(),
+        instance: "coinbase-1".into(),
+        vendor: "Coinbase".into(),
+        declaration: Some(DatasetDeclaration {
+            key: dataset.split_once(':').unwrap().1.into(),
+            vendor: "Coinbase".into(),
+            data_types: vec!["meridian.v1.Trade".into()],
+            modes: vec![ObservationMode::Pull as i32],
+            history: 3650,
+            day_time_zone: "Etc/UTC".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    tokio::task::block_in_place(|| {
+        lake.configured(&EntitlementsChangedEvent {
+            datasets: vec![declared(&kept), declared(&late)],
+            licences: vec![],
+            entitlements: vec![DatasetEntitlement {
+                dataset: kept.clone(),
+                instance: "reporting-1".into(),
+                allowed: true,
+                ..Default::default()
+            }],
+            changed_at_ns: SystemClock.now_ns(),
+        })
+    });
+    // The writer reads its place again and takes write 2 again, as the
+    // stream gives it.
+    tokio::task::block_in_place(|| writer.reread()).unwrap();
+    assert_eq!(writer.next(), 2);
+    let again = taken_past_a_switch(&mut writer, vec![write(2, &late)])
+        .await
+        .unwrap();
+    let heads = tokio::task::block_in_place(|| store.heads()).unwrap();
+    assert!(
+        !heads.contains_key(&late),
+        "write 2, refused and its caller answered so, was recorded when taken again: its \
+         dataset's head is {:?}, and it was answered {again:?}",
+        heads.get(&late)
+    );
+}
+
 /// Contract v30, stage E (W10.14): what a batch from the write-ahead stream
 /// found -- the runs the stream dropped, each dataset's latest valid time,
 /// each gap -- commits with it, and each gap's next state is its own
@@ -13023,6 +13155,74 @@ fn a_shard_s_fence_commits_on_the_synchronous_standby() {
         (row.get(0), row.get(1))
     };
     assert_eq!((epoch, through), (2, 9));
+}
+
+/// v31a, item 7.5: a batch from the write-ahead stream commits on the
+/// synchronous standby. The lake's place in the stream commits with the
+/// batch's rows, and the stream drops a write by its age: a batch committed
+/// locally alone, lost with its database's failover after the stream
+/// dropped its writes, is lost for good, each answered as recorded. Read at
+/// the commit itself, by a trigger deferred to it on the lake's place, on a
+/// store connected as a lake connects.
+#[test]
+#[ignore = "v31a item 7.5: placed in v32 lake (2)"]
+fn a_batch_from_the_stream_commits_on_the_synchronous_standby() {
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    let (url, store) = isolated("i75");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .batch_execute(
+            "CREATE TABLE i75_seen (setting text NOT NULL);
+             CREATE FUNCTION i75_see() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 INSERT INTO i75_seen VALUES (current_setting('synchronous_commit'));
+                 RETURN NEW;
+             END $$;
+             CREATE CONSTRAINT TRIGGER i75_at_commit AFTER INSERT OR UPDATE ON lake_write_ahead
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION i75_see();",
+        )
+        .unwrap();
+    let stream = unique("STREAM");
+    let dataset = unique("coinbase-1:i75");
+    let subject = unique("LCL-BTC");
+    let at = |sequence: u64| WriteAheadPosition {
+        sequence,
+        at_ns: 1_000 + sequence as i64,
+    };
+    // The stream's first batch, and one after it: the place made, then moved.
+    for (after, through, amount) in [(None, at(1), 10), (Some(at(1)), at(2), 11)] {
+        let done = store
+            .record_write_ahead(
+                WriteAheadBatch {
+                    stream: stream.clone(),
+                    after,
+                    through,
+                    parts: vec![(
+                        dataset.clone(),
+                        vec![close(&dataset, "x", &subject, "2026-10-07", amount)],
+                    )],
+                    ..Default::default()
+                },
+                5_000,
+            )
+            .unwrap();
+        assert!(done[0].is_ok(), "{done:?}");
+    }
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(2)));
+    let seen: Vec<String> = client
+        .query("SELECT setting FROM i75_seen", &[])
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(seen.len(), 2, "each batch's commit of the place: {seen:?}");
+    assert!(
+        seen.iter()
+            .all(|setting| setting == "on" || setting == "remote_apply"),
+        "a batch from the stream committed with synchronous_commit {seen:?}: never waiting on \
+         the synchronous standby, so lost with a failover, and past the stream's bound for good"
+    );
+    drop((client, store, url));
 }
 
 /// Review c5a2 N6: a take is numbered by the shard's row, which holds the
