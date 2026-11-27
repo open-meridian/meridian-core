@@ -117,3 +117,58 @@ fn the_deployments_key_is_written_whole() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A key that is there and damaged is an error, never a new key: a new key
+/// is another deployment. One byte gone bad (not text any more) used to read
+/// as "no key", and the start replaced it.
+#[test]
+fn a_key_with_a_bad_byte_is_an_error_and_stays_as_it_is() {
+    let dir = folder("bad-byte");
+    let path = dir.join("key.pem");
+    let path_text = path.to_str().unwrap();
+    assert!(crate::key_at(path_text).is_ok());
+    let mut bytes = std::fs::read(&path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] = 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let Err(said) = crate::key_at(path_text) else {
+        panic!("a damaged key was replaced by a new one");
+    };
+
+    assert!(said.contains(path_text), "the error names the path: {said}");
+    assert!(!said.contains("PRIVATE KEY"), "and never the key");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "the bytes on disk");
+    assert_eq!(names(&dir), ["key.pem"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A key that is there and may not be read is an error too, and the file is
+/// the one that was there. Skipped where the read is allowed anyway (root).
+#[cfg(unix)]
+#[test]
+fn a_key_that_may_not_be_read_is_an_error_and_stays_the_same_file() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let dir = folder("unreadable");
+    let path = dir.join("key.pem");
+    let path_text = path.to_str().unwrap();
+    assert!(crate::key_at(path_text).is_ok());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let before = std::fs::metadata(&path).unwrap();
+
+    let Err(said) = crate::key_at(path_text) else {
+        panic!("a key that could not be read was replaced by a new one");
+    };
+
+    assert!(said.contains(path_text), "the error names the path: {said}");
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(after.ino(), before.ino(), "the same file");
+    assert_eq!(after.len(), before.len());
+    assert_eq!(names(&dir), ["key.pem"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

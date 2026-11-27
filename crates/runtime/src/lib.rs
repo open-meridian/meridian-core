@@ -1237,10 +1237,16 @@ pub fn names_from(raw: Option<String>) -> Vec<String> {
 /// Generated here rather than handed in, because the private half has no reason
 /// to exist anywhere else. The platform never sees one and has nowhere to put
 /// one.
+///
+/// "None" is only a file that is not there. A key that is there and cannot be
+/// read -- damaged, not this user's to read, a failing disk -- is an error
+/// naming the path, and is left as it is: a new key in its place would be
+/// another deployment.
 pub fn key_at(path: &str) -> Result<DeploymentKey, String> {
-    if let Ok(pem) = std::fs::read_to_string(path) {
-        return DeploymentKey::from_pkcs8_pem(&pem)
-            .map_err(|failed| format!("the key at {path} could not be read: {failed}"));
+    match std::fs::read(path) {
+        Ok(pem) => return key_from(path, &pem),
+        Err(none) if none.kind() == std::io::ErrorKind::NotFound => {}
+        Err(failed) => return Err(format!("the key at {path} could not be read: {failed}")),
     }
 
     let key = DeploymentKey::generate();
@@ -1254,6 +1260,14 @@ pub fn key_at(path: &str) -> Result<DeploymentKey, String> {
 
     tracing::info!(path, "generated a deployment key");
     Ok(key)
+}
+
+/// The key these bytes are, or an error that names the path and never them.
+fn key_from(path: &str, pem: &[u8]) -> Result<DeploymentKey, String> {
+    let unreadable =
+        |failed: &dyn std::fmt::Display| format!("the key at {path} could not be read: {failed}");
+    let pem = std::str::from_utf8(pem).map_err(|failed| unreadable(&failed))?;
+    DeploymentKey::from_pkcs8_pem(pem).map_err(|failed| unreadable(&failed))
 }
 
 /// Stop on either signal, because compose sends one and a terminal sends the
