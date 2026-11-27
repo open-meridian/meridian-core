@@ -1,0 +1,32 @@
+# Interims (S4), generated from the INTERIM(vNN) markers by `tools/code_structure.py interims --write`. Roadmap version: v31a.
+# version	place	reason
+v31b	tools/pins-allowlist.txt	the backup run's CLI (ci.yaml) and its kept e2e image (cargo-cache.yaml) read meridian-cli's main; pinned to a CLI release in a file the two read, as tools/ci-sdk.txt pins the SDK
+v31b	tools/pins-allowlist.txt	the platform runs read meridian-platform's main, as design's gates read their siblings; pinned to a platform commit with the bundle
+v31b	tools/pins-allowlist.txt	the shared suggestion-licence action is read at core's main in every public repository's copy (licence.yaml, the same everywhere); pinned to a core SHA in all of them in one sweep
+v32	crates/bor/src/postgres.rs	asked before every read naming an account only because
+v32	crates/bor/src/spread.rs	a stop-gap for a view of the owners read on a timer,
+v32	crates/bus/src/inbox.rs	gives the thread back the asker it held before an answer,
+v32	crates/bus/src/inbox.rs	run `answer` with the credential that asked known to it
+v32	crates/bus/src/inbox.rs	the credential that asked the request this thread answers,
+v32	crates/bus/src/inbox.rs	the credential whose inbox the request being answered
+v32	crates/bus/src/inbox.rs	whether the request this thread answers was asked by
+v32	crates/bus/src/nats.rs	who asked, by the inbox its answer goes
+v32	crates/bus/src/router.rs	[`crate::inbox::asked_by`]).
+v32	crates/bus/tests/nats.rs	
+v32	crates/bus/tests/nats.rs	
+v32	crates/bus/tests/nats.rs	a known gap, the asker read from the reply inbox; v32.8 turns it green"]
+v32	crates/config/src/service.rs	replaced by v32.8's conductor check, with
+v32	crates/config/src/service.rs	the sender a request names is its sidecar's to set, and
+v32	crates/config/src/service.rs	v32.8's conductor check, with delegation, replaces it.
+v32	crates/config/src/tests.rs	deleted with the reply-inbox check.
+v32	crates/lake/src/postgres.rs	gone when v32's ownership record says where a range is
+v32	crates/lake/src/postgres/moves.rs	read before every read of a dataset over several
+v32	crates/lake/src/service.rs	sent by the instance's own credential -- the owner
+v32	crates/lake/src/spread.rs	a stop-gap for a view of the owners read on a timer;
+v32	crates/lake/src/spread.rs	gone with [`Self::follow_owners`], when v32's
+v32	crates/lake/src/tests/shards.rs	deleted with the reply-inbox check.
+v32	crates/lake/src/write_ahead/guard.rs	decision 3 removes the stream).
+v33	crates/runtime/src/preflight.rs	
+v33	crates/runtime/src/preflight.rs	gone once
+v33	deploy/chart/templates/_plugin.tpl	its sidecar asks on inboxes named for its credential,
+v33	deploy/chart/templates/preflight-job.yaml	the launched plugins' sidecars (review-core-2c, finding

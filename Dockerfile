@@ -139,6 +139,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/meridian-analytics /usr/local/bin/meridian-analytics
+# Its licence and notice ship with it (S10; tools/code-structure.toml).
+COPY LICENSE NOTICE /usr/share/doc/meridian/
 # A command is chosen -- coordinator or worker -- never inherited.
 ENTRYPOINT []
 # The release its binary reports, said on the image too: publish reads it to
@@ -180,6 +182,11 @@ COPY --from=build /usr/local/bin/meridian-launcher /usr/local/bin/meridian-launc
 COPY --from=build /usr/local/bin/meridian-analytics /usr/local/bin/meridian-analytics
 # One directory per version, where the dashboard looks (MERIDIAN_UI_DIR).
 COPY --from=ui /ui/dist/ /usr/share/meridian/ui/
+# The licences and notices of what the image ships (S10;
+# tools/code-structure.toml): core's, and the kit's own (Apache-2.0), kept
+# out of the kit's directory, where every entry is a version.
+COPY LICENSE NOTICE /usr/share/doc/meridian/
+COPY --from=ui /ui/LICENSE /ui/NOTICE /usr/share/doc/meridian-ui/
 
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.

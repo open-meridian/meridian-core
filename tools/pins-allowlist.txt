@@ -1,0 +1,5 @@
+# S5's exceptions: the finding's text, then ` # ` and its INTERIM marker. A change here carries a
+# `Baseline-Change:` trailer.
+uses open-meridian/meridian-core/.github/actions/licence-check@main # INTERIM(v31b): the shared suggestion-licence action is read at core's main in every public repository's copy (licence.yaml, the same everywhere); pinned to a core SHA in all of them in one sweep
+checks out open-meridian/meridian-cli at its default branch # INTERIM(v31b): the backup run's CLI (ci.yaml) and its kept e2e image (cargo-cache.yaml) read meridian-cli's main; pinned to a CLI release in a file the two read, as tools/ci-sdk.txt pins the SDK
+checks out open-meridian/meridian-platform at its default branch # INTERIM(v31b): the platform runs read meridian-platform's main, as design's gates read their siblings; pinned to a platform commit with the bundle
