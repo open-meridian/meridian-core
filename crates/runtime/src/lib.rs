@@ -11,6 +11,7 @@
 //! sitting, which is the point of them being separate.
 
 pub mod broker;
+pub mod durable;
 pub mod launched;
 pub mod launcher;
 pub mod lease;
@@ -1245,28 +1246,14 @@ pub fn key_at(path: &str) -> Result<DeploymentKey, String> {
     let key = DeploymentKey::generate();
     let pem = key.private_key_pem().map_err(|failed| failed.to_string())?;
 
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|failed| format!("could not create {}: {failed}", parent.display()))?;
-    }
-    std::fs::write(path, &pem).map_err(|failed| format!("could not write {path}: {failed}"))?;
-    restrict(path)?;
+    // Whole and synced before it is used, its owner's alone (0o600): a key
+    // handed out and then lost to a power loss is a deployment that cannot
+    // start, and a new one would be another deployment.
+    durable::write_whole(std::path::Path::new(path), pem.as_bytes())
+        .map_err(|failed| format!("could not write {path}: {failed}"))?;
 
     tracing::info!(path, "generated a deployment key");
     Ok(key)
-}
-
-#[cfg(unix)]
-fn restrict(path: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|failed| format!("could not restrict {path}: {failed}"))
-}
-
-#[cfg(not(unix))]
-fn restrict(_path: &str) -> Result<(), String> {
-    Ok(())
 }
 
 /// Stop on either signal, because compose sends one and a terminal sends the

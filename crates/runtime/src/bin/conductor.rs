@@ -752,7 +752,12 @@ async fn enrol_with_code(
                 fingerprint = enrolled.fingerprint,
                 "this deployment enrolled its key"
             );
-            if let Err(failed) = std::fs::write(&marker, &enrolled.fingerprint) {
+            // Whole and synced, as the key beside it is: a marker lost or
+            // emptied by a power loss is an enrolled deployment that reads as
+            // not enrolled, or as enrolled under no fingerprint.
+            if let Err(failed) =
+                meridian_runtime::durable::write_whole(&marker, enrolled.fingerprint.as_bytes())
+            {
                 tracing::warn!(
                     %failed,
                     "the key is enrolled and the marker could not be written; \
