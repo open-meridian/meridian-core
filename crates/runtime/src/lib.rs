@@ -1249,13 +1249,20 @@ pub fn key_at(path: &str) -> Result<DeploymentKey, String> {
         Err(failed) => return Err(format!("the key at {path} could not be read: {failed}")),
     }
 
+    // What a start killed part-way left beside it: each a whole private key
+    // that no deployment uses.
+    let target = std::path::Path::new(path);
+    durable::remove_stale_parts(target).map_err(|failed| {
+        format!("could not remove what an earlier start left beside {path}: {failed}")
+    })?;
+
     let key = DeploymentKey::generate();
     let pem = key.private_key_pem().map_err(|failed| failed.to_string())?;
 
     // Whole and synced before it is used, its owner's alone (0o600): a key
     // handed out and then lost to a power loss is a deployment that cannot
     // start, and a new one would be another deployment.
-    durable::write_whole(std::path::Path::new(path), pem.as_bytes())
+    durable::write_whole(target, pem.as_bytes())
         .map_err(|failed| format!("could not write {path}: {failed}"))?;
 
     tracing::info!(path, "generated a deployment key");

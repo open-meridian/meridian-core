@@ -1,4 +1,4 @@
-use super::testing::{folder, names, FAIL_BEFORE, STEPS};
+use super::testing::{folder, names, AT_STEP, FAIL_BEFORE, STEPS};
 use super::write_whole;
 
 /// The brief's order, which is the whole of the helper: the data synced
@@ -170,5 +170,86 @@ fn a_key_that_may_not_be_read_is_an_error_and_stays_the_same_file() {
     assert_eq!(after.ino(), before.ino(), "the same file");
     assert_eq!(after.len(), before.len());
     assert_eq!(names(&dir), ["key.pem"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A panic part-way leaves nothing of this call's beside the target: the
+/// temporary file of a key is a whole private key.
+#[test]
+fn a_panic_before_the_rename_leaves_no_temporary_file() {
+    let dir = folder("panics");
+    let path = dir.join("kept");
+    std::fs::write(&path, b"the old file").unwrap();
+
+    AT_STEP.with(|at| *at.borrow_mut() = Some(("synced", Box::new(|| panic!("a test's panic")))));
+    let unwound = std::panic::catch_unwind(|| write_whole(&path, b"the new file"));
+    AT_STEP.with(|at| *at.borrow_mut() = None);
+
+    assert!(unwound.is_err(), "the panic came through");
+    assert_eq!(std::fs::read(&path).unwrap(), b"the old file");
+    assert_eq!(names(&dir), ["kept"], "no temporary file is left");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What a killed start left beside the key is removed by the next one, and
+/// only that: the key's own temporary files, by their exact names.
+#[test]
+fn a_start_removes_the_temporary_files_an_earlier_one_left_beside_the_key() {
+    let dir = folder("stale");
+    let path = dir.join("key.pem");
+    for left in [
+        ".key.pem.0123456789abcdef.part",
+        ".key.pem.part",
+        ".key.enrolled.0123456789abcdef.part",
+        "key.pem.0123456789abcdef.part",
+    ] {
+        std::fs::write(dir.join(left), b"left by a crash").unwrap();
+    }
+
+    assert!(crate::key_at(path.to_str().unwrap()).is_ok());
+
+    assert_eq!(
+        names(&dir),
+        [
+            ".key.enrolled.0123456789abcdef.part",
+            ".key.pem.part",
+            "key.pem",
+            "key.pem.0123456789abcdef.part",
+        ]
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A symbolic link at the target is refused: a rename would replace the link
+/// and leave what it pointed at, or where it pointed, without the file.
+#[cfg(unix)]
+#[test]
+fn a_target_that_is_a_symbolic_link_is_refused_and_left() {
+    let dir = folder("link");
+    let path = dir.join("kept");
+
+    // Dangling first, then pointing at a file.
+    for there in [false, true] {
+        let elsewhere = dir.join("elsewhere");
+        if there {
+            std::fs::write(&elsewhere, b"the old file").unwrap();
+        }
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        let failed = write_whole(&path, b"the new file").unwrap_err();
+
+        assert!(
+            failed.to_string().contains(path.to_str().unwrap()),
+            "the error names the path: {failed}"
+        );
+        assert_eq!(std::fs::read_link(&path).unwrap(), elsewhere, "the link");
+        if there {
+            assert_eq!(std::fs::read(&elsewhere).unwrap(), b"the old file");
+            assert_eq!(names(&dir), ["elsewhere", "kept"]);
+        } else {
+            assert_eq!(names(&dir), ["kept"]);
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
