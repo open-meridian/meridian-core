@@ -566,6 +566,24 @@ class NightRun(unittest.TestCase):
         self.assertIn('| tee "$RUNNER_TEMP/make.log"', run_job)
         self.assertIn("id: make", run_job)
 
+    def test_the_broker_s_disk_full_runs_on_a_bounded_filesystem_made_before_the_cluster(self):
+        """Fault 1 (ruled 2026-11-27): in ha, when broker-disk-full is asked
+        for, a loop-mounted ext4 of 1 GiB, made before e2e-cluster-k3d, which
+        mounts it on every node; never otherwise."""
+        run_job = self.workflow().split("\n  failover-repeat:\n", 1)[1].split("\n  failover-verdict:\n", 1)[0]
+        steps = run_job.split("\n      - ")
+        disk = next(step for step in steps if step.startswith("name: The broker's bounded disk"))
+        self.assertLess(run_job.index("name: The broker's bounded disk"), run_job.index("name: make e2e-cluster-k3d"))
+        self.assertIn("matrix.profile == 'ha'", disk)
+        self.assertIn("',broker-disk-full,'", disk)
+        for said in ("fallocate -l 1G", "mkfs.ext4 -q -F -m 0", "mount -o loop", 'E2E_K3D_BROKER_DISK=$disk'):
+            self.assertIn(said, disk)
+        with open(os.path.join(TOOLS, "..", "Makefile")) as f:
+            makefile = f.read()
+        self.assertIn('--volume $(E2E_K3D_BROKER_DISK):$(E2E_K3D_BROKER_DISK)@server:*;agent:*', makefile)
+        self.assertIn("E2E_BROKER_DISK=$(E2E_K3D_BROKER_DISK)", makefile)
+        self.assertRegex(makefile, r"(?m)^E2E_K3D_BROKER_DISK \?=$")
+
 
 if __name__ == "__main__":
     unittest.main()

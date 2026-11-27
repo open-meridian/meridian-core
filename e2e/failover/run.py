@@ -295,7 +295,7 @@ SCALE_FIGURES = os.environ.get("E2E_WRITE_SCALE_FIGURES", ".e2e-write-scale.json
 
 # The classes that read RPO through the stores themselves, and say it in
 # their claims; after every other, the driver's rows are held all the same.
-RPO_IN_CLASS = {"db-primary", "torn-write", "zone", "broker-crash-loop"}
+RPO_IN_CLASS = {"db-primary", "torn-write", "zone", "broker-crash-loop", "broker-disk-full"}
 # The oms driver's history (Jepsen's invoke/ok/fail/info), kept for Elle.
 HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
@@ -611,6 +611,15 @@ def install(s):
         if TLS:
             values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
+        if broker_disk_asked():
+            # The JetStream servers' stores on the bounded filesystem, in
+            # volumes of the class's own (broker_disk_volumes), made once
+            # the servers' first claims are let go, below.
+            if not BROKER_DISK or not os.path.ismount(BROKER_DISK):
+                raise SystemExit(f"broker-disk-full needs a bounded filesystem mounted on this machine and on "
+                                 f"every node at E2E_BROKER_DISK ('{BROKER_DISK}'): failover-repeat's step "
+                                 "\"The broker's bounded disk\", and E2E_K3D_BROKER_DISK to e2e-cluster-k3d")
+            values += ["--set", f"broker.jetstream.storageClassName={BROKER_DISK_CLASS}"]
         values += ["--set", f"database.brought.patroniImage={POSTGRES_IMAGE}"]
     public = None
     if DRIVEN:
@@ -686,6 +695,8 @@ def install(s):
         kubectl("delete", "pvc", "--ignore-not-found", "--wait", "--timeout=120s",
                 *[f"jetstream-{broker_set()}-{i}" for i in range(servers)])
         kubectl("patch", "statefulset", broker_set(), "--type", "merge", "-p", pin)
+        if broker_disk_asked():
+            broker_disk_volumes(servers)
         kubectl("scale", "statefulset", broker_set(), f"--replicas={servers}")
         # Formed again before first run starts the stores, which make their
         # streams on it: CI run 43185314225's lake write-ahead stream, made
@@ -5794,6 +5805,296 @@ def write_ahead_bound(s):
     s.check(acks, "write-ahead-bound: the driver acknowledged by the lake again")
 
 
+# ── The broker's disk full (fault 1; ha only; ruled 2026-11-27) ─────────
+#
+# Every JetStream server's store on one bounded filesystem (BROKER_DISK):
+# a loop-mounted ext4 of 1 GiB the runner made before the cluster
+# (failover-repeat's "The broker's bounded disk"), mounted on every node at
+# the same path, the servers' volumes static ones of a class of the run's
+# own on it. The databases stay on the nodes' own disk. The class fills it
+# from this machine's side, as a disk fills, holds it, and gives the room
+# back; no person acts.
+BROKER_DISK = os.environ.get("E2E_BROKER_DISK", "")
+BROKER_DISK_CLASS = "meridian-e2e-broker-disk"
+
+
+def broker_disk_asked():
+    """Whether this run injects the broker's disk full: asked for by name
+    (in no profile's default), in ha, where JetStream runs."""
+    return PROFILE == "ha" and "broker-disk-full" in os.environ.get("FAILURE", "").split(",")
+
+
+def broker_disk_volumes(servers):
+    """The JetStream servers' volumes on the bounded filesystem: a directory
+    each, any user's to write (the broker runs with every capability
+    dropped), and a static volume each bound ahead to its server's claim
+    (`jetstream-<set>-<n>`), so the claims the install made again find
+    them. Called with the servers stopped and their first claims gone."""
+    volumes = []
+    for n in range(servers):
+        path = os.path.join(BROKER_DISK, f"jetstream-{n}")
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0o777)
+        volumes.append({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": f"{NAMESPACE}-jetstream-{n}"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                     "persistentVolumeReclaimPolicy": "Retain", "storageClassName": BROKER_DISK_CLASS,
+                     "hostPath": {"path": path, "type": "Directory"},
+                     "claimRef": {"namespace": NAMESPACE, "name": f"jetstream-{broker_set()}-{n}"}}})
+    run("kubectl", "apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "List",
+                                                          "items": volumes}).encode())
+
+
+def disk_of(pod_name):
+    """The filesystem a broker server's JetStream store is on, as `df` in
+    its pod says it: (total bytes, available bytes, its source), or None."""
+    done = kubectl("exec", pod_name, "-c", "broker", "--", "df", "-P", "-B1", "/data/jetstream", check=False)
+    lines = done.stdout.decode(errors="replace").splitlines()
+    parts = lines[-1].split() if done.returncode == 0 and len(lines) >= 2 else []
+    if len(parts) < 6 or not parts[1].isdigit() or not parts[3].isdigit():
+        return None
+    return int(parts[1]), int(parts[3]), parts[0]
+
+
+def host_disk():
+    """The bounded filesystem as this machine sees it: (total, available) bytes."""
+    held = os.statvfs(BROKER_DISK)
+    return held.f_blocks * held.f_frsize, held.f_bavail * held.f_frsize
+
+
+def broker_disk_mounted(s):
+    """Every JetStream server's store on the bounded filesystem: `df` in each
+    of the three servers' pods names a filesystem of the size this
+    machine's mount has, byte for byte."""
+    total, _ = host_disk()
+    servers = jetstream_servers()
+    said = {pod: disk_of(pod) for pod in servers}
+    for pod, disk in said.items():
+        s.note(f"broker-disk-full: {pod}'s /data/jetstream: "
+               + (f"{disk[0]} bytes, {disk[1]} free, on {disk[2]}" if disk else "df said nothing"))
+    s.note(f"broker-disk-full: this machine's {BROKER_DISK}: {total} bytes")
+    on_it = len(servers) == 3 and all(disk and disk[0] == total for disk in said.values())
+    s.check(on_it, f"broker-disk-full: each of the {len(servers)} JetStream servers' stores on the bounded "
+            f"filesystem, {total} bytes (df in each pod)")
+    return on_it
+
+
+# The fault's times: held this long from the broker's first refusal; the
+# candidate bounds of the spec's row (stated once CI shows them): the
+# standing notice within 2 minutes of the first refusal, the lake's writes
+# acknowledged again within 2 minutes of the room given back. Filled, the
+# broker is given this long to refuse a write; given room, the class
+# watches this long for what it measures, past either bound, so a late
+# answer is a figure and not only "not within".
+DISK_FULL_HELD_S = 90
+DISK_FULL_NOTICE_S = 120
+DISK_FULL_BACK_S = 120
+DISK_FULL_REFUSED_S = 180
+DISK_FULL_WATCH_S = 600
+BROKER_DISK_FILLER = "e2e-broker-disk-filler"
+STUCK_FULL_NOTICE = "component-write-ahead-stuck-full"
+# What a broker server says of its store full, and of a stream it deleted
+# as orphaned (fault 1: "Detected orphaned stream '$G > LAKE_WRITE_AHEAD',
+# will cleanup").
+BROKER_DISK_WORDS = ("no space", "insufficient", "resources", "orphaned", "out of", "JetStream")
+
+
+def fill_disk():
+    """The bounded filesystem filled from this machine's side, as a disk
+    fills: one filler file taking every free block, in steps halved down
+    to a block until the filesystem has none. Called again as the store
+    frees what it held, it takes that too. The bytes it holds."""
+    path = os.path.join(BROKER_DISK, BROKER_DISK_FILLER)
+    with open(path, "ab") as filler:
+        size = os.fstat(filler.fileno()).st_size
+        step = 64 << 20
+        while step >= 4096:
+            try:
+                os.posix_fallocate(filler.fileno(), size, step)
+                size += step
+            except OSError:
+                step //= 2
+    return size
+
+
+def give_room():
+    """The filler removed: the fault ending, by nobody's act."""
+    try:
+        os.remove(os.path.join(BROKER_DISK, BROKER_DISK_FILLER))
+    except FileNotFoundError:
+        pass
+
+
+def stuck_notices(since_ns):
+    """When each standing stuck-full notice was filed since `since_ns`
+    (dashboard_notice.changed_ns, one a deployment admin), oldest first."""
+    try:
+        said = psql(f"select changed_ns from dashboard_notice where kind = '{STUCK_FULL_NOTICE}' "
+                    f"and changed_ns >= {since_ns} order by changed_ns", quiet=True)
+    except SystemExit:
+        return []
+    return [int(line) for line in said.split() if line.strip().isdigit()]
+
+
+def prices_refused(began_ms):
+    """The data driver's prices refused or answered by nothing since
+    `began_ms`: (when refused, ms; its words) each, oldest first."""
+    return [(at, words) for at, kind, words in not_answered(began_ms, int(time.time() * 1000) + 1)
+            if kind == "price"]
+
+
+def price_acked_after(at_ms):
+    """When the lake first acknowledged a price after `at_ms`, or None."""
+    after = [at for at in driver_acked().get("price", {}).values() if at > at_ms]
+    return min(after) if after else None
+
+
+def broker_disk_said(began):
+    """What each broker server said since `began` of its store, and before
+    it restarted: each line with BROKER_DISK_WORDS, by server."""
+    said = {}
+    for pod in broker_servers():
+        lines = []
+        for previous in ((), ("--previous",)):
+            done = kubectl("logs", pod, "-c", "broker", *previous, f"--since={int(time.time() - began) + 30}s",
+                           check=False, quiet=True)
+            lines += [line for line in done.stdout.decode(errors="replace").splitlines()
+                      if any(w.lower() in line.lower() for w in BROKER_DISK_WORDS)]
+        said[pod] = lines
+    return said
+
+
+def orphaned(said):
+    """Whether a broker server deleted the lake's write-ahead stream as
+    orphaned, by what the servers said (broker_disk_said)."""
+    return any("orphaned" in line and WRITE_AHEAD_STREAM in line for lines in said.values() for line in lines)
+
+
+def gap_windows(dataset, since_ns):
+    """Each gap of `dataset` recorded since `since_ns`, as the valid time
+    it marks: (valid_from_ns, valid_until_ns), from its latest record."""
+    said = psql("select encode((array_agg(body order by change_id desc))[1], 'hex') from lake_dataset_gap "
+                f"where dataset = '{dataset}' and recorded_at_ns >= {since_ns} group by gap_id", quiet=True)
+    windows = []
+    for line in said.split():
+        body = bytes.fromhex(line.strip())
+        windows.append((varint_field(body, 4) or 0, varint_field(body, 5) or 0))
+    return windows
+
+
+def outside_gaps(lost, acked, windows, written_s=60):
+    """Of the prices lost (in no database of the lake), those inside no
+    marked gap: a price's valid time is when it was written, within
+    `written_s` before it was acknowledged, so a gap marks it where its
+    window meets that span."""
+    outside = []
+    for ident in lost:
+        at_ns = acked.get(ident, 0) * 1_000_000
+        if not any(start <= at_ns and until >= at_ns - written_s * 1_000_000_000 for start, until in windows):
+            outside.append(ident)
+    return outside
+
+
+def broker_disk_full(s):
+    """FAILURE=broker-disk-full (ha; fault 1, the fault-injection report of
+    2026-11-20, finding 1; the resilience spec's section 10 class table,
+    its bounds candidates): every JetStream server's store on one bounded
+    filesystem (broker_disk_mounted), filled from this machine's side
+    until the broker refuses the lake's writes, held so DISK_FULL_HELD_S,
+    then given its room back, by nobody's act. Held to: the standing
+    stuck-full notice within DISK_FULL_NOTICE_S of the first refusal; the
+    lake acknowledging the driver's prices again within DISK_FULL_BACK_S
+    of the room given back; every acknowledged price recorded or inside a
+    marked gap, none silently missing, and every acknowledged order kept;
+    and where a server deleted the write-ahead stream as orphaned, the
+    writes it held come out as a marked gap. The databases are on the
+    nodes' own disk, never on the filled one."""
+    print("F: broker-disk-full: every JetStream server's store on one bounded filesystem, filled", flush=True)
+    if PROFILE != "ha" or not BROKER_DISK or not DRIVEN:
+        s.check(False, "broker-disk-full: runs in ha alone, driven, on the bounded filesystem (E2E_BROKER_DISK)")
+        return
+    if not broker_disk_mounted(s):
+        return
+    wait_for("lake settled", lambda: members_settled("lake"), seconds=300)
+    dataset = "drive-data:drive"
+    began = time.time()
+    began_ms, since_ns = int(began * 1000), int(began * 1e9)
+    try:
+        held = fill_disk()
+        s.note(f"broker-disk-full: the filler holds {held} bytes; {host_disk()[1]} free")
+        first = None
+        until = time.time() + DISK_FULL_REFUSED_S
+        while time.time() < until:
+            fill_disk()
+            refused = prices_refused(began_ms)
+            if refused:
+                first = refused[0]
+                break
+            time.sleep(2)
+        s.check(first is not None, f"broker-disk-full: the broker refused the lake's writes within "
+                f"{DISK_FULL_REFUSED_S}s of its disk full"
+                + (f" ({round(first[0] / 1000 - began, 1)}s: {first[1][:200]})" if first else ""))
+        first_s = first[0] / 1000 if first else time.time()
+        if first:
+            store_logs_at_first_refusal("broker-disk-full", "the broker's disk full")
+        notices = []
+        while time.time() < first_s + DISK_FULL_HELD_S:
+            fill_disk()
+            notices = notices or stuck_notices(since_ns)
+            time.sleep(2)
+    finally:
+        give_room()
+    room = time.time()
+    room_ms = int(room * 1000)
+    s.note(f"broker-disk-full: room given back {round(room - first_s, 1)}s after the first refusal; "
+           f"{host_disk()[1]} free")
+    back = None
+    until = room + DISK_FULL_WATCH_S
+    while time.time() < until and not (notices and back):
+        notices = notices or stuck_notices(since_ns)
+        back = back or price_acked_after(room_ms)
+        time.sleep(3)
+    noticed_s = round(notices[0] / 1e9 - first_s, 1) if notices else None
+    s.check(noticed_s is not None and noticed_s <= DISK_FULL_NOTICE_S,
+            f"broker-disk-full: the standing notice ({STUCK_FULL_NOTICE}) within {DISK_FULL_NOTICE_S}s of the "
+            "first refusal (" + (f"{noticed_s}s" if noticed_s is not None else
+                                 f"none within {round(until - first_s)}s") + ")")
+    figure("broker-disk-full: the standing notice after the first refusal", noticed_s=noticed_s)
+    back_s = (back / 1000 - room) if back else time.time() - room
+    # Said, as the claim's public line keeps no figure (dispatch 46054350057
+    # read its 211 s from the driver's log).
+    s.note(f"broker-disk-full: the lake acknowledged a price again {round(back_s, 1)}s after the room given back"
+           if back else f"broker-disk-full: the lake acknowledged no price within {round(back_s)}s of the room")
+    claim(s, "broker-disk-full", "lake", back_s, DISK_FULL_BACK_S,
+          {"what": "from the room given back to the lake acknowledging a price again",
+           "acknowledged_again": back is not None, "held_s": round(room - first_s, 1),
+           "notice_s": noticed_s})
+    said = broker_disk_said(began)
+    for pod, lines in said.items():
+        for line in lines[-8:]:
+            s.note(f"broker-disk-full: {pod}: {line[-300:]}")
+    made_again = sorted(name for name, log in lake_said_since(began).items() if MADE_AGAIN in log)
+    gaps = gap_windows(dataset, since_ns)
+    unattributed = gaps_found_in("", since_ns)
+    if orphaned(said) or made_again:
+        s.check(bool(gaps) or bool(unattributed),
+                "broker-disk-full: the write-ahead stream deleted as orphaned "
+                f"({'made again: ' + ', '.join(made_again) if made_again else 'the broker said so'}), "
+                f"the writes it held come out as a marked gap ({len(gaps)} of {dataset}, "
+                f"{len(unattributed)} unattributed)")
+    else:
+        s.note("broker-disk-full: no server deleted the write-ahead stream as orphaned")
+    rpo = store_rpo()
+    book, lake = rpo["book"], rpo["lake"]
+    s.check(not book["lost"], f"broker-disk-full: every order and placement the book acknowledged is in it "
+            f"({len(book['lost'])} lost{': ' + ', '.join(book['lost'][:5]) if book['lost'] else ''})")
+    outside = outside_gaps(lake["lost"], driver_acked().get("price", {}), gaps)
+    s.check(not outside, f"broker-disk-full: every price the lake acknowledged recorded or inside a marked "
+            f"gap, none silently missing ({len(lake['lost'])} not recorded, {len(outside)} of them in no gap"
+            f"{': ' + ', '.join(outside[:5]) if outside else ''}; {len(gaps)} gap(s) of {dataset})")
+
+
 STANDBY_LOST = {}
 
 
@@ -6843,6 +7144,7 @@ FAILURES = {
     "standing-coordinator": standing_coordinator,
     "apiserver": apiserver_lost,
     "write-ahead-bound": write_ahead_bound,
+    "broker-disk-full": broker_disk_full,
 }
 
 
