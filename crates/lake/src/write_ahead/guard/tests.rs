@@ -304,3 +304,191 @@ fn a_stream_within_one_largest_write_of_a_lower_byte_bound_keeps_its_bound() {
     assert_eq!(bytes_kept("S", &near, 128 << 20, &to(128), largest), None);
     assert_eq!(bytes_kept("S", &near, 128 << 20, &to(256), largest), None);
 }
+
+/// The broker's refusal of the guard's looks, or its silence, over a while
+/// (INTERIM(v32), the proposal of 2026-11-27, A1): the times are looks,
+/// every LOOK_EVERY, from `start`.
+fn refusals(
+    refused: &mut Refused,
+    start: tokio::time::Instant,
+    from_s: u64,
+    to_s: u64,
+    now: i64,
+) -> Option<String> {
+    let mut said = None;
+    for s in (from_s..=to_s).step_by(LOOK_EVERY.as_secs() as usize) {
+        said = refused.refused(
+            start + Duration::from_secs(s),
+            now + s as i64 * S,
+            "JetStream system temporarily unavailable (503, 10008)",
+        );
+    }
+    said
+}
+
+/// 30 s of looks the broker refused: the writer's member says so, its own
+/// state, apart from stuck full, since the first refusal and with the
+/// broker's last words; not a look before; never stuck full.
+#[tokio::test(start_paused = true)]
+async fn thirty_seconds_of_refused_looks_are_said_as_their_own_state() {
+    let now = 1_700_000_000 * S;
+    let start = tokio::time::Instant::now();
+    let mut refused = Refused::new(REFUSED_AFTER);
+    assert_eq!(
+        refusals(&mut refused, start, 0, 25, now),
+        None,
+        "25 s: nothing yet"
+    );
+    let said = refused
+        .refused(
+            start + REFUSED_AFTER,
+            now + 30 * S,
+            "JetStream not enabled (10076)",
+        )
+        .expect("refused for 30 s");
+    assert!(said.starts_with(REFUSED), "{said}");
+    assert!(!said.contains(STUCK_FULL), "{said}");
+    assert_eq!(
+        meridian_bus::write_ahead::refused_since(&said),
+        Some(now),
+        "since the first refusal: {said}"
+    );
+    for part in ["for 30s", "JetStream not enabled (10076)"] {
+        assert!(said.contains(part), "{part} in {said}");
+    }
+    assert!(!said.contains("disk"), "nothing inferred: {said}");
+    // It goes on being said while the broker refuses.
+    assert!(refused
+        .refused(start + Duration::from_secs(35), now + 35 * S, "timed out")
+        .is_some_and(|said| said.contains("for 35s")));
+}
+
+/// Never on a single refusal: a broker answering again within 30 s says
+/// nothing, and a write it accepted then ends the spell; the bound counts
+/// again from the next refusal.
+#[tokio::test(start_paused = true)]
+async fn twenty_nine_seconds_of_refusals_then_an_accepted_write_say_nothing() {
+    let now = 1_700_000_000 * S;
+    let start = tokio::time::Instant::now();
+    let at = |s: u64| start + Duration::from_secs(s);
+    let mut refused = Refused::new(REFUSED_AFTER);
+    assert_eq!(refused.answered(at(0), 100), None);
+    assert_eq!(refusals(&mut refused, start, 1, 26, now), None);
+    assert_eq!(refused.refused(at(29), now + 29 * S, "refused"), None);
+    assert_eq!(
+        refused.answered(at(29) + Duration::from_millis(500), 101),
+        None,
+        "a write accepted at 29.5 s"
+    );
+    assert_eq!(
+        refused.refused(at(31), now + 31 * S, "refused"),
+        None,
+        "the spell begins again at 31 s"
+    );
+    assert_eq!(
+        refusals(&mut refused, start, 36, 56, now),
+        None,
+        "25 s of the new spell"
+    );
+    assert!(
+        refused.refused(at(61), now + 61 * S, "refused").is_some(),
+        "30 s of it"
+    );
+    // One answer within the bound, no write: the spell ends unsaid all the same.
+    let mut answered = Refused::new(REFUSED_AFTER);
+    assert_eq!(refusals(&mut answered, start, 0, 25, now), None);
+    assert_eq!(answered.answered(at(27), 100), None);
+    assert_eq!(answered.refused(at(30), now + 30 * S, "refused"), None);
+}
+
+/// A look the broker does not answer counts as a refused one: 30 s of
+/// silence, or of silence and refusals mixed, is said the same way.
+#[tokio::test(start_paused = true)]
+async fn unanswered_looks_count_as_refused_ones() {
+    let now = 1_700_000_000 * S;
+    let start = tokio::time::Instant::now();
+    let at = |s: u64| start + Duration::from_secs(s);
+    let mut silent = Refused::new(REFUSED_AFTER);
+    // A look timing out takes its own five seconds: one every ten.
+    for s in [0, 10, 20] {
+        assert_eq!(silent.refused(at(s), now + s as i64 * S, "timed out"), None);
+    }
+    let said = silent
+        .refused(at(30), now + 30 * S, "timed out")
+        .expect("30 s unanswered");
+    assert!(
+        said.starts_with(REFUSED) && said.contains("timed out"),
+        "{said}"
+    );
+    let mut mixed = Refused::new(REFUSED_AFTER);
+    mixed.refused(at(0), now, "no responders");
+    mixed.refused(
+        at(10),
+        now + 10 * S,
+        "JetStream system temporarily unavailable (503, 10008)",
+    );
+    mixed.refused(at(20), now + 20 * S, "timed out");
+    assert!(mixed
+        .refused(at(30), now + 30 * S, "no responders")
+        .is_some());
+}
+
+/// Said, it stands while the broker refuses and while its answers show no
+/// write accepted, and clears at the first look finding one: the stream's
+/// last write past where the last answered look found it. A stream made
+/// again under its name, its last lower, is counted from there.
+#[tokio::test(start_paused = true)]
+async fn the_state_clears_once_a_write_is_accepted_again() {
+    let now = 1_700_000_000 * S;
+    let start = tokio::time::Instant::now();
+    let at = |s: u64| start + Duration::from_secs(s);
+    let mut refused = Refused::new(REFUSED_AFTER);
+    assert_eq!(refused.answered(at(0), 4_000), None);
+    assert!(refusals(&mut refused, start, 5, 35, now).is_some());
+    // Answered again, the stream where it was: no write accepted yet.
+    let still = refused
+        .answered(at(40), 4_000)
+        .expect("no write accepted since");
+    assert!(still.starts_with(REFUSED), "{still}");
+    assert_eq!(
+        meridian_bus::write_ahead::refused_since(&still),
+        Some(now + 5 * S)
+    );
+    assert!(
+        refused.refused(at(45), now + 45 * S, "refused").is_some(),
+        "refused again: still said"
+    );
+    assert_eq!(
+        refused.answered(at(50), 4_001),
+        None,
+        "a write accepted: cleared"
+    );
+    assert_eq!(refused.answered(at(55), 4_001), None);
+    // A later spell is its own, since its own first refusal.
+    assert_eq!(refusals(&mut refused, start, 60, 85, now), None);
+    let again = refused
+        .refused(at(90), now + 90 * S, "refused")
+        .expect("a second spell");
+    assert_eq!(
+        meridian_bus::write_ahead::refused_since(&again),
+        Some(now + 60 * S)
+    );
+    // The stream made again while refused: its last lower, counted from it.
+    assert!(refused.answered(at(95), 3).is_some());
+    assert_eq!(refused.answered(at(100), 4), None);
+}
+
+/// Both said at once -- a stream stuck full, its broker then refusing the
+/// looks -- the stuck-full words first, as the dashboard reads them, and
+/// the refusal's after them, each read back.
+#[test]
+fn stuck_full_and_refused_are_said_together_stuck_first() {
+    let stuck = meridian_bus::write_ahead::stuck_full_since(40, 0);
+    let refused = meridian_bus::write_ahead::refused_for(30, 30 * S);
+    let both = said(said(Some(stuck), Some(&refused)), None).unwrap();
+    assert_eq!(meridian_bus::write_ahead::stuck_since(&both), Some(0));
+    assert_eq!(
+        meridian_bus::write_ahead::refused_since(&both),
+        Some(30 * S)
+    );
+}
