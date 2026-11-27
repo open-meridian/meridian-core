@@ -1671,7 +1671,14 @@ test-jetstream: network runtime-image tests-image
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the lake's write-ahead test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, and the lake answers a write on its sender's inboxes alone"
+	@$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-lake --lib -- --ignored --exact tests::write_ahead::a_write_refused_at_the_writer_is_never_recorded_once_its_dataset_is_declared_or_the_writer_starts_again \
+		>>.test-jetstream.log 2>&1 \
+		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
+		     tail -40 .test-jetstream.log >&2; exit 1; }
+	@grep -q 'a_write_refused_at_the_writer_is_never_recorded_once_its_dataset_is_declared_or_the_writer_starts_again' .test-jetstream.log \
+		|| { echo "test-jetstream FAILED: the lake's refused-write test did not run (.test-jetstream.log)" >&2; exit 1; }
+	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, the lake answers a write on its sender's inboxes alone, and a write refused at the writer is never recorded later"
 
 # Signing in against a real directory. Its own target rather than part of
 # `test`, for the reason `test-broker` is: it needs a server standing up, and

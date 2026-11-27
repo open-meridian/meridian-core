@@ -177,6 +177,168 @@ async fn a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobo
     context.delete_stream(STREAM).await.unwrap();
 }
 
+/// v31a, item 7.4 (the fault runs of 2026-11-20, finding 2): a write the
+/// writer refuses for validation -- a dataset its instance's catalogue does
+/// not declare yet -- is refused for good. Its caller is answered the
+/// refusal, the lake's place passes it with the batch's commit, and neither
+/// the catalogue declaring the dataset after nor the writer starting again
+/// has it recorded: the stream still holds it, and the lake never takes it
+/// again. Its own process against a real broker, as
+/// `a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody`
+/// is run.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_write_refused_at_the_writer_is_never_recorded_once_its_dataset_is_declared_or_the_writer_starts_again(
+) {
+    use crate::write_ahead::{stream_config, write_forever, Bounds};
+    use async_nats::jetstream;
+    use futures_util::StreamExt as _;
+    use meridian_bus::write_ahead::{subject, REFUSAL_HEADER, REPLY_HEADER, STREAM, TOPIC_HEADER};
+    use std::time::Duration;
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = meridian_bus::NatsBackend::client(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let bounds = || Bounds {
+        max_age: Duration::from_secs(600),
+        max_bytes: 64 << 20,
+        replicas: 1,
+    };
+    let h = harness();
+    // coinbase-1's catalogue declares no dataset yet: kraken-1's alone.
+    let mut undeclared = configuration(true, &[]);
+    undeclared
+        .datasets
+        .retain(|dataset| dataset.dataset != "coinbase-1:daily");
+    tokio::task::block_in_place(|| h.lake.configured(&undeclared));
+    let mut recorded = h
+        .bus
+        .subscribe_every("platform.lake.coinbase-1:daily.event.prices-recorded");
+    let own = format!("_INBOX.coinbase-1.i74-{}", std::process::id());
+    let mut on_own = client.subscribe(format!("{own}.>")).await.unwrap();
+    client.flush().await.unwrap();
+    context
+        .create_stream(stream_config(&bounds()))
+        .await
+        .unwrap();
+    let put = |n: u64| {
+        let (context, own) = (context.clone(), own.clone());
+        async move {
+            let price = at_valid(
+                close("coinbase-1", &format!("I74:{n}"), BTC, "2026-10-07", "1"),
+                NOW - 100_000 + n as i64,
+            );
+            let mut write = written(n, "coinbase-1", vec![price]);
+            write.envelope.meta.as_mut().unwrap().published_at_ns = NOW;
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(TOPIC_HEADER, write.topic.as_str());
+            headers.insert(REPLY_HEADER, format!("{own}.{n}").as_str());
+            context
+                .publish_with_headers(
+                    subject("coinbase-1", "daily"),
+                    headers,
+                    write.envelope.encode_to_vec().into(),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap()
+                .sequence
+        }
+    };
+    let start = || {
+        let (lake, client) = (h.lake.clone(), client.clone());
+        tokio::spawn(async move { write_forever(lake, client, bounds(), |_| {}).await })
+    };
+    // Refused: its dataset is none its instance's catalogue declares.
+    let refused_at = put(1).await;
+    let writer = start();
+    let refused = tokio::time::timeout(Duration::from_secs(30), on_own.next())
+        .await
+        .expect("the refused write is answered")
+        .unwrap();
+    assert_eq!(refused.subject.as_str(), format!("{own}.1"));
+    let why = refused
+        .headers
+        .as_ref()
+        .and_then(|headers| headers.get(REFUSAL_HEADER))
+        .map(|said| said.to_string())
+        .expect("answered a refusal");
+    assert!(why.contains("catalogue declares"), "{why}");
+    // The lake's place passed it, committed with nothing recorded.
+    let key = crate::write_ahead::stream_key(
+        STREAM,
+        crate::write_ahead::place(&client).await.unwrap().stream,
+    );
+    let placed = |h: &Harness| {
+        h.store
+            .write_ahead_position(&key)
+            .unwrap()
+            .map(|at| at.sequence)
+    };
+    assert_eq!(placed(&h), Some(refused_at));
+    // The catalogue declares the dataset, and the writer starts again: the
+    // stream still holds the refused write.
+    writer.abort();
+    let _ = writer.await;
+    tokio::task::block_in_place(|| gap_configured(&h));
+    assert_eq!(
+        context
+            .get_stream(STREAM)
+            .await
+            .unwrap()
+            .info()
+            .await
+            .unwrap()
+            .state
+            .first_sequence,
+        refused_at,
+        "the stream still holds the refused write"
+    );
+    let writer = start();
+    // A write after it, declared now, is recorded and answered.
+    let after_at = put(2).await;
+    let answered = tokio::time::timeout(Duration::from_secs(30), on_own.next())
+        .await
+        .expect("the write after it is answered")
+        .unwrap();
+    assert_eq!(answered.subject.as_str(), format!("{own}.2"));
+    assert!(
+        answered
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get(REFUSAL_HEADER))
+            .is_none(),
+        "the write after the refused one was refused"
+    );
+    assert_eq!(placed(&h), Some(after_at));
+    // Nothing more is answered or recorded: the refused write is not taken
+    // again, so it has no second answer and no row.
+    let again = tokio::time::timeout(Duration::from_secs(3), on_own.next()).await;
+    writer.abort();
+    let _ = writer.await;
+    assert!(
+        again.is_err(),
+        "a write was answered again: {:?}",
+        again.ok().flatten().map(|message| message.subject)
+    );
+    let mut keys = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), recorded.recv()).await
+    {
+        let price = meridian_domain::v1::PricesRecordedEvent::decode(&event.envelope.payload[..])
+            .unwrap()
+            .price
+            .unwrap();
+        keys.push(price.meta.unwrap().row_key);
+    }
+    assert_eq!(
+        keys,
+        ["I74:2".to_string()],
+        "the refused write's row was recorded after its caller was answered a refusal"
+    );
+    context.delete_stream(STREAM).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_from_the_stream_are_recorded_with_its_position_and_answered_as_the_lake_answers() {
     let h = harness();

@@ -11,6 +11,7 @@
 //! sitting, which is the point of them being separate.
 
 pub mod broker;
+pub mod durable;
 pub mod launched;
 pub mod launcher;
 pub mod lease;
@@ -1236,37 +1237,53 @@ pub fn names_from(raw: Option<String>) -> Vec<String> {
 /// Generated here rather than handed in, because the private half has no reason
 /// to exist anywhere else. The platform never sees one and has nowhere to put
 /// one.
+///
+/// "None" is only a file that is not there. A key that is there and cannot be
+/// read -- damaged, not this user's to read, a failing disk -- is an error
+/// naming the path, and is left as it is: a new key in its place would be
+/// another deployment.
 pub fn key_at(path: &str) -> Result<DeploymentKey, String> {
-    if let Ok(pem) = std::fs::read_to_string(path) {
-        return DeploymentKey::from_pkcs8_pem(&pem)
-            .map_err(|failed| format!("the key at {path} could not be read: {failed}"));
+    match std::fs::read(path) {
+        Ok(pem) => return key_from(path, &pem),
+        Err(none) if none.kind() == std::io::ErrorKind::NotFound => {}
+        Err(failed) => return Err(format!("the key at {path} could not be read: {failed}")),
     }
+
+    // What a start killed part-way left beside it: each a whole private key
+    // that no deployment uses.
+    let target = std::path::Path::new(path);
+    durable::remove_stale_parts(target).map_err(|failed| {
+        format!("could not remove what an earlier start left beside {path}: {failed}")
+    })?;
 
     let key = DeploymentKey::generate();
     let pem = key.private_key_pem().map_err(|failed| failed.to_string())?;
 
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|failed| format!("could not create {}: {failed}", parent.display()))?;
+    // Whole and synced before it is used, its owner's alone (0o600): a key
+    // handed out and then lost to a power loss is a deployment that cannot
+    // start, and a new one would be another deployment. Made only if none is
+    // there: where another start wrote one first, that key is the
+    // deployment's, and the one made here is dropped.
+    let on_disk = durable::create_whole(target, pem.as_bytes())
+        .map_err(|failed| format!("could not write {path}: {failed}"))?;
+    if on_disk != pem.as_bytes() {
+        tracing::info!(
+            path,
+            "another start wrote the deployment key first; using it"
+        );
+        return key_from(path, &on_disk);
     }
-    std::fs::write(path, &pem).map_err(|failed| format!("could not write {path}: {failed}"))?;
-    restrict(path)?;
 
     tracing::info!(path, "generated a deployment key");
     Ok(key)
 }
 
-#[cfg(unix)]
-fn restrict(path: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|failed| format!("could not restrict {path}: {failed}"))
-}
-
-#[cfg(not(unix))]
-fn restrict(_path: &str) -> Result<(), String> {
-    Ok(())
+/// The key these bytes are, or an error that names the path and never them.
+fn key_from(path: &str, pem: &[u8]) -> Result<DeploymentKey, String> {
+    let unreadable =
+        |failed: &dyn std::fmt::Display| format!("the key at {path} could not be read: {failed}");
+    let pem = std::str::from_utf8(pem).map_err(|failed| unreadable(&failed))?;
+    DeploymentKey::from_pkcs8_pem(pem).map_err(|failed| unreadable(&failed))
 }
 
 /// Stop on either signal, because compose sends one and a terminal sends the
