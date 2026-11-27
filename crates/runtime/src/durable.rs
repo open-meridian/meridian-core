@@ -35,6 +35,10 @@
 //!   a panic. A killed process cannot remove its own;
 //!   [`remove_stale_parts`] removes what one left.
 //!
+//! [`create_whole`] is the same for a file made once and never replaced: it
+//! gives the synced file its name by a hard link, which fails where the name
+//! is taken, and returns what is on disk.
+//!
 //! A deployment's key was written with `std::fs::write` and nothing synced
 //! (LazyFS run 2, 2026-11-27): after a power loss the file was there and
 //! empty, and the conductor never served again.
@@ -57,6 +61,48 @@ pub fn write_whole(path: &Path, data: &[u8]) -> std::io::Result<()> {
     temporary.renamed();
     step("directory synced")?;
     sync_directory(parent)
+}
+
+/// `data` at `path` only if nothing is there: for a file made once and never
+/// replaced, such as a key. What it returns is what is on disk at `path`:
+/// `data` where this call made the file, and the file's own bytes where
+/// another writer made it first. That writer's file is left as it is, and the
+/// caller uses what is returned, never what it meant to write.
+///
+/// The steps are [`write_whole`]'s with one changed: the synced temporary
+/// file is given the target's name by a hard link, which fails where the name
+/// is taken, in place of a rename, which would replace it. The temporary name
+/// is then removed and the directory synced.
+///
+/// A filesystem without hard links (EPERM, ENOTSUP) is an error. There is no
+/// falling back to a rename, which is the replacing this is here to prevent.
+pub fn create_whole(path: &Path, data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let (parent, name) = placed(path)?;
+    let (temporary, mut file) = Temporary::beside(parent, name)?;
+    step("written")?;
+    file.write_all(data)?;
+    step("synced")?;
+    file.sync_all()?;
+    drop(file);
+    step("linked")?;
+    let on_disk = match std::fs::hard_link(&temporary.path, path) {
+        Ok(()) => data.to_vec(),
+        Err(there) if there.kind() == std::io::ErrorKind::AlreadyExists => std::fs::read(path)?,
+        Err(failed) => {
+            return Err(std::io::Error::new(
+                failed.kind(),
+                format!(
+                    "{} could not be given its name by a hard link: {failed}",
+                    path.display()
+                ),
+            ))
+        }
+    };
+    step("unlinked")?;
+    temporary.remove()?;
+    step("directory synced")?;
+    sync_directory(parent)?;
+    Ok(on_disk)
 }
 
 /// Removes the temporary files an earlier, killed call left beside `path`:
@@ -171,6 +217,13 @@ impl Temporary {
     fn renamed(mut self) {
         self.there = false;
     }
+
+    /// Removes it once the target's name is a second one on the same file,
+    /// or is another writer's.
+    fn remove(mut self) -> std::io::Result<()> {
+        self.there = false;
+        std::fs::remove_file(&self.path)
+    }
 }
 
 impl Drop for Temporary {
@@ -242,7 +295,7 @@ pub(crate) mod testing {
     use std::cell::{Cell, RefCell};
 
     thread_local! {
-        /// The steps [`super::write_whole`] went on to, on this thread.
+        /// The steps [`super::write_whole`] or [`super::create_whole`] went on to, on this thread.
         pub(crate) static STEPS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         /// The step it fails before, where a test names one.
         pub(crate) static FAIL_BEFORE: Cell<Option<&'static str>> = const { Cell::new(None) };

@@ -1,5 +1,5 @@
 use super::testing::{folder, names, AT_STEP, FAIL_BEFORE, STEPS};
-use super::write_whole;
+use super::{create_whole, write_whole};
 
 /// The brief's order, which is the whole of the helper: the data synced
 /// before any name points at it, and the rename synced before the call
@@ -80,16 +80,17 @@ fn a_folder_it_makes_holds_the_file() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The deployment's key goes through it: a start that fails before the
-/// rename leaves no key file, where `std::fs::write` left one, and one that
-/// succeeds took every step. The next start reads the key this one made.
+/// The deployment's key goes through it, made once: a start that fails
+/// before the key has its name leaves no key file, where `std::fs::write`
+/// left one, and one that succeeds took every step. The next start reads the
+/// key this one made.
 #[test]
 fn the_deployments_key_is_written_whole() {
     let dir = folder("key");
     let path = dir.join("keys").join("key.pem");
     let path_text = path.to_str().unwrap();
 
-    FAIL_BEFORE.with(|at| at.set(Some("renamed")));
+    FAIL_BEFORE.with(|at| at.set(Some("linked")));
     let failed = crate::key_at(path_text);
     FAIL_BEFORE.with(|at| at.set(None));
     assert!(
@@ -106,7 +107,13 @@ fn the_deployments_key_is_written_whole() {
     let made = crate::key_at(path_text).unwrap();
     assert_eq!(
         STEPS.with(|steps| steps.borrow().clone()),
-        ["written", "synced", "renamed", "directory synced"]
+        [
+            "written",
+            "synced",
+            "linked",
+            "unlinked",
+            "directory synced"
+        ]
     );
     assert_eq!(names(&dir.join("keys")), ["key.pem"]);
     let read = crate::key_at(path_text).unwrap();
@@ -251,5 +258,138 @@ fn a_target_that_is_a_symbolic_link_is_refused_and_left() {
         }
         std::fs::remove_file(&path).unwrap();
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Two starts that both found no key: the one that comes second uses the key
+/// the first put there, and leaves it. Renaming over it replaced a key the
+/// first was already using.
+#[test]
+fn a_start_that_finds_another_key_just_placed_uses_that_key() {
+    let dir = folder("two-writers");
+    let path = dir.join("key.pem");
+    let path_text = path.to_str().unwrap();
+    let other = crate::DeploymentKey::generate();
+    let other_pem = other.private_key_pem().unwrap();
+
+    let (target, placed) = (path.clone(), other_pem.clone());
+    AT_STEP.with(|at| {
+        *at.borrow_mut() = Some((
+            "linked",
+            Box::new(move || std::fs::write(&target, placed.as_bytes()).unwrap()),
+        ))
+    });
+    let returned = crate::key_at(path_text);
+    AT_STEP.with(|at| *at.borrow_mut() = None);
+    let Ok(returned) = returned else {
+        panic!("the key on disk is a good one");
+    };
+
+    // Compared and not printed: a failure here must not put a key in a log.
+    assert!(
+        std::fs::read(&path).unwrap() == other_pem.as_bytes(),
+        "the other writer's key is unchanged"
+    );
+    assert!(
+        returned.public_key_pem().unwrap() == other.public_key_pem().unwrap(),
+        "the key returned is the key on disk"
+    );
+    assert_eq!(names(&dir), ["key.pem"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_file_made_once_is_synced_before_it_is_linked_and_its_directory_after() {
+    let dir = folder("create-order");
+    let path = dir.join("a").join("kept");
+
+    let on_disk = create_whole(&path, b"new").unwrap();
+
+    assert_eq!(
+        STEPS.with(|steps| steps.borrow().clone()),
+        [
+            "written",
+            "synced",
+            "linked",
+            "unlinked",
+            "directory synced"
+        ]
+    );
+    assert_eq!(on_disk, b"new");
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(names(&dir.join("a")), ["kept"], "no temporary file is left");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let kept = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            kept.permissions().mode() & 0o777,
+            0o600,
+            "its owner's alone"
+        );
+        assert_eq!(kept.nlink(), 1, "under one name");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The file that is there wins, whenever it came: before the call, or between
+/// the sync and the link.
+#[test]
+fn a_file_already_there_is_returned_and_left() {
+    let dir = folder("create-there");
+    let path = dir.join("kept");
+    std::fs::write(&path, b"the first writer's").unwrap();
+
+    assert_eq!(
+        create_whole(&path, b"the second writer's").unwrap(),
+        b"the first writer's"
+    );
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"the first writer's");
+    assert_eq!(names(&dir), ["kept"], "no temporary file is left");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn making_a_file_once_that_fails_or_panics_leaves_nothing() {
+    for before in ["written", "synced", "linked"] {
+        let dir = folder("create-fails");
+        let path = dir.join("kept");
+
+        FAIL_BEFORE.with(|at| at.set(Some(before)));
+        let failed = create_whole(&path, b"new");
+        FAIL_BEFORE.with(|at| at.set(None));
+
+        assert!(failed.is_err(), "failing before {before} is an error");
+        assert_eq!(names(&dir), Vec::<String>::new(), "failing before {before}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    let dir = folder("create-panics");
+    let path = dir.join("kept");
+    AT_STEP.with(|at| *at.borrow_mut() = Some(("synced", Box::new(|| panic!("a test's panic")))));
+    let unwound = std::panic::catch_unwind(|| create_whole(&path, b"new"));
+    AT_STEP.with(|at| *at.borrow_mut() = None);
+    assert!(unwound.is_err(), "the panic came through");
+    assert_eq!(names(&dir), Vec::<String>::new());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn making_a_file_once_refuses_a_symbolic_link_and_leaves_it() {
+    let dir = folder("create-link");
+    let path = dir.join("kept");
+    let nowhere = dir.join("nowhere");
+    std::os::unix::fs::symlink(&nowhere, &path).unwrap();
+
+    let failed = create_whole(&path, b"new").unwrap_err();
+
+    assert!(
+        failed.to_string().contains(path.to_str().unwrap()),
+        "the error names the path: {failed}"
+    );
+    assert_eq!(std::fs::read_link(&path).unwrap(), nowhere, "the link");
+    assert_eq!(names(&dir), ["kept"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }

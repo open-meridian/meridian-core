@@ -1261,9 +1261,18 @@ pub fn key_at(path: &str) -> Result<DeploymentKey, String> {
 
     // Whole and synced before it is used, its owner's alone (0o600): a key
     // handed out and then lost to a power loss is a deployment that cannot
-    // start, and a new one would be another deployment.
-    durable::write_whole(target, pem.as_bytes())
+    // start, and a new one would be another deployment. Made only if none is
+    // there: where another start wrote one first, that key is the
+    // deployment's, and the one made here is dropped.
+    let on_disk = durable::create_whole(target, pem.as_bytes())
         .map_err(|failed| format!("could not write {path}: {failed}"))?;
+    if on_disk != pem.as_bytes() {
+        tracing::info!(
+            path,
+            "another start wrote the deployment key first; using it"
+        );
+        return key_from(path, &on_disk);
+    }
 
     tracing::info!(path, "generated a deployment key");
     Ok(key)
