@@ -295,7 +295,7 @@ SCALE_FIGURES = os.environ.get("E2E_WRITE_SCALE_FIGURES", ".e2e-write-scale.json
 
 # The classes that read RPO through the stores themselves, and say it in
 # their claims; after every other, the driver's rows are held all the same.
-RPO_IN_CLASS = {"db-primary", "torn-write", "zone", "broker-crash-loop"}
+RPO_IN_CLASS = {"db-primary", "torn-write", "zone", "broker-crash-loop", "broker-disk-full"}
 # The oms driver's history (Jepsen's invoke/ok/fail/info), kept for Elle.
 HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
@@ -611,6 +611,15 @@ def install(s):
         if TLS:
             values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
+        if broker_disk_asked():
+            # The JetStream servers' stores on the bounded filesystem, in
+            # volumes of the class's own (broker_disk_volumes), made once
+            # the servers' first claims are let go, below.
+            if not BROKER_DISK or not os.path.ismount(BROKER_DISK):
+                raise SystemExit(f"broker-disk-full needs a bounded filesystem mounted on this machine and on "
+                                 f"every node at E2E_BROKER_DISK ('{BROKER_DISK}'): failover-repeat's step "
+                                 "\"The broker's bounded disk\", and E2E_K3D_BROKER_DISK to e2e-cluster-k3d")
+            values += ["--set", f"broker.jetstream.storageClassName={BROKER_DISK_CLASS}"]
         values += ["--set", f"database.brought.patroniImage={POSTGRES_IMAGE}"]
     public = None
     if DRIVEN:
@@ -686,6 +695,8 @@ def install(s):
         kubectl("delete", "pvc", "--ignore-not-found", "--wait", "--timeout=120s",
                 *[f"jetstream-{broker_set()}-{i}" for i in range(servers)])
         kubectl("patch", "statefulset", broker_set(), "--type", "merge", "-p", pin)
+        if broker_disk_asked():
+            broker_disk_volumes(servers)
         kubectl("scale", "statefulset", broker_set(), f"--replicas={servers}")
         # Formed again before first run starts the stores, which make their
         # streams on it: CI run 43185314225's lake write-ahead stream, made
@@ -5794,6 +5805,93 @@ def write_ahead_bound(s):
     s.check(acks, "write-ahead-bound: the driver acknowledged by the lake again")
 
 
+# ── The broker's disk full (fault 1; ha only; ruled 2026-11-27) ─────────
+#
+# Every JetStream server's store on one bounded filesystem (BROKER_DISK):
+# a loop-mounted ext4 of 1 GiB the runner made before the cluster
+# (failover-repeat's "The broker's bounded disk"), mounted on every node at
+# the same path, the servers' volumes static ones of a class of the run's
+# own on it. The databases stay on the nodes' own disk. The class fills it
+# from this machine's side, as a disk fills, holds it, and gives the room
+# back; no person acts.
+BROKER_DISK = os.environ.get("E2E_BROKER_DISK", "")
+BROKER_DISK_CLASS = "meridian-e2e-broker-disk"
+
+
+def broker_disk_asked():
+    """Whether this run injects the broker's disk full: asked for by name
+    (in no profile's default), in ha, where JetStream runs."""
+    return PROFILE == "ha" and "broker-disk-full" in os.environ.get("FAILURE", "").split(",")
+
+
+def broker_disk_volumes(servers):
+    """The JetStream servers' volumes on the bounded filesystem: a directory
+    each, any user's to write (the broker runs with every capability
+    dropped), and a static volume each bound ahead to its server's claim
+    (`jetstream-<set>-<n>`), so the claims the install made again find
+    them. Called with the servers stopped and their first claims gone."""
+    volumes = []
+    for n in range(servers):
+        path = os.path.join(BROKER_DISK, f"jetstream-{n}")
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0o777)
+        volumes.append({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": f"{NAMESPACE}-jetstream-{n}"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                     "persistentVolumeReclaimPolicy": "Retain", "storageClassName": BROKER_DISK_CLASS,
+                     "hostPath": {"path": path, "type": "Directory"},
+                     "claimRef": {"namespace": NAMESPACE, "name": f"jetstream-{broker_set()}-{n}"}}})
+    run("kubectl", "apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "List",
+                                                          "items": volumes}).encode())
+
+
+def disk_of(pod_name):
+    """The filesystem a broker server's JetStream store is on, as `df` in
+    its pod says it: (total bytes, available bytes, its source), or None."""
+    done = kubectl("exec", pod_name, "-c", "broker", "--", "df", "-P", "-B1", "/data/jetstream", check=False)
+    lines = done.stdout.decode(errors="replace").splitlines()
+    parts = lines[-1].split() if done.returncode == 0 and len(lines) >= 2 else []
+    if len(parts) < 6 or not parts[1].isdigit() or not parts[3].isdigit():
+        return None
+    return int(parts[1]), int(parts[3]), parts[0]
+
+
+def host_disk():
+    """The bounded filesystem as this machine sees it: (total, available) bytes."""
+    held = os.statvfs(BROKER_DISK)
+    return held.f_blocks * held.f_frsize, held.f_bavail * held.f_frsize
+
+
+def broker_disk_mounted(s):
+    """Every JetStream server's store on the bounded filesystem: `df` in each
+    of the three servers' pods names a filesystem of the size this
+    machine's mount has, byte for byte."""
+    total, _ = host_disk()
+    servers = jetstream_servers()
+    said = {pod: disk_of(pod) for pod in servers}
+    for pod, disk in said.items():
+        s.note(f"broker-disk-full: {pod}'s /data/jetstream: "
+               + (f"{disk[0]} bytes, {disk[1]} free, on {disk[2]}" if disk else "df said nothing"))
+    s.note(f"broker-disk-full: this machine's {BROKER_DISK}: {total} bytes")
+    on_it = len(servers) == 3 and all(disk and disk[0] == total for disk in said.values())
+    s.check(on_it, f"broker-disk-full: each of the {len(servers)} JetStream servers' stores on the bounded "
+            f"filesystem, {total} bytes (df in each pod)")
+    return on_it
+
+
+def broker_disk_full(s):
+    """FAILURE=broker-disk-full (ha; fault 1, the fault-injection report of
+    2026-11-20, finding 1; the resilience spec's section 10 class table,
+    its bounds candidates): every JetStream server's store on one bounded
+    filesystem. This first part proves the mount alone."""
+    print("F: broker-disk-full: every JetStream server's store on one bounded filesystem", flush=True)
+    if PROFILE != "ha" or not BROKER_DISK:
+        s.check(False, "broker-disk-full: runs in ha alone, on the bounded filesystem (E2E_BROKER_DISK)")
+        return
+    broker_disk_mounted(s)
+
+
 STANDBY_LOST = {}
 
 
@@ -6843,6 +6941,7 @@ FAILURES = {
     "standing-coordinator": standing_coordinator,
     "apiserver": apiserver_lost,
     "write-ahead-bound": write_ahead_bound,
+    "broker-disk-full": broker_disk_full,
 }
 
 

@@ -16,6 +16,11 @@
 #
 #   gh workflow run failover-repeat --ref <branch> -f profiles=tolerant -f failure=broker-crash-loop -f repeat=1
 #
+# and the broker's disk full (broker-disk-full, ha only: every JetStream
+# server's store on one bounded filesystem the run fills, then gives room):
+#
+#   gh workflow run failover-repeat --ref <branch> -f profiles=ha -f failure=broker-disk-full -f repeat=1
+#
 # Not on a schedule yet. Every night it would fail by construction: the
 # kubelet's restart backoff (10, 20, 40, 80 s) puts the fifth crash at least
 # 80 s out, past the class's 60 s. Bounding the broker's restart backoff is a
@@ -199,6 +204,27 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: ${{ matrix.profile == 'reconfigure' && 'v4.2.3' || 'v3.16.2' }}
+
+      # The broker's disk full (fault 1; FAILURE=broker-disk-full, ha only;
+      # ruled 2026-11-27): every JetStream server's store on one bounded
+      # filesystem, made here before the cluster -- a 1 GiB file as ext4,
+      # no blocks reserved, loop-mounted on the runner -- which
+      # e2e-cluster-k3d mounts on every node at the same path
+      # (E2E_K3D_BROKER_DISK) and the class's volumes are on. The databases
+      # stay on the nodes' own disk. Writable by the run, which fills it.
+      - name: The broker's bounded disk
+        if: ${{ matrix.profile == 'ha' && contains(format(',{0},', needs.failover-images.outputs.failure), ',broker-disk-full,') }}
+        timeout-minutes: 2
+        run: |
+          disk=/var/lib/meridian-e2e-broker-disk
+          sudo fallocate -l 1G "$RUNNER_TEMP/broker-disk.img"
+          sudo mkfs.ext4 -q -F -m 0 "$RUNNER_TEMP/broker-disk.img"
+          sudo mkdir -p "$disk"
+          sudo mount -o loop "$RUNNER_TEMP/broker-disk.img" "$disk"
+          sudo chmod 0777 "$disk"
+          findmnt "$disk"
+          df -P "$disk"
+          echo "E2E_K3D_BROKER_DISK=$disk" >> "$GITHUB_ENV"
 
       - name: make e2e-cluster-k3d
         id: make

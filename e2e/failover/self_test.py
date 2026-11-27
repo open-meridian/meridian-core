@@ -287,10 +287,14 @@ class Checks:
 
     def __init__(self):
         self.said = []
+        self.notes = []
 
     def check(self, ok, what):
         self.said.append((bool(ok), what))
         return ok
+
+    def note(self, what):
+        self.notes.append(what)
 
     def the_same(self):
         """Whether the move's "reads the same after it" held, and its words."""
@@ -779,6 +783,66 @@ class BrokerCrashLoop(unittest.TestCase):
         failed = [what for ok, what in checks.said if not ok]
         self.assertEqual(len(failed), 5, checks.said)
         self.assertIn("book/ACC-DRIVE-1: 2", failed[0])
+
+
+class BrokerDiskFull(unittest.TestCase):
+    """Fault 1 (ruled 2026-11-27): the broker's disk full, every JetStream
+    server's store on one bounded filesystem, a NIGHT class in ha alone
+    (failover-repeat, by hand) and no profile's default."""
+
+    def test_a_night_class_in_no_profiles_default(self):
+        self.assertIn("broker-disk-full", run.FAILURES)
+        for profile, failures in run.DEFAULT_FAILURES.items():
+            self.assertNotIn("broker-disk-full", failures, profile)
+        self.assertIn("broker-disk-full", run.RPO_IN_CLASS)
+
+    def test_asked_for_by_name_in_ha_alone(self):
+        for profile, failure, asked in (("ha", "broker-disk-full", True), ("ha", "zone,broker-disk-full", True),
+                                        ("ha", "", False), ("ha", "write-ahead-bound", False),
+                                        ("tolerant", "broker-disk-full", False)):
+            with mock.patch.object(run, "PROFILE", profile), mock.patch.dict(os.environ, {"FAILURE": failure}):
+                self.assertIs(run.broker_disk_asked(), asked, (profile, failure))
+
+    def mounted(self, said, total=1_000_000):
+        checks = Checks()
+        with mock.patch.object(run, "jetstream_servers", lambda: list(said)), \
+                mock.patch.object(run, "disk_of", lambda pod: said[pod]), \
+                mock.patch.object(run, "host_disk", lambda: (total, total // 2)):
+            run.broker_disk_mounted(checks)
+        return [(ok, what) for ok, what in checks.said if "stores on the bounded filesystem" in what]
+
+    def test_every_server_s_store_on_the_bounded_filesystem_holds(self):
+        said = {f"js-{n}": (1_000_000, 400_000, "/dev/loop3") for n in range(3)}
+        self.assertEqual([ok for ok, _ in self.mounted(said)], [True])
+
+    def test_a_server_s_store_on_another_filesystem_fails(self):
+        said = {"js-0": (1_000_000, 1, "/dev/loop3"), "js-1": (1_000_000, 1, "/dev/loop3"),
+                "js-2": (72_000_000_000, 1, "overlay")}
+        self.assertEqual([ok for ok, _ in self.mounted(said)], [False])
+        said["js-2"] = None
+        self.assertEqual([ok for ok, _ in self.mounted(said)], [False])
+
+    def test_fewer_than_three_servers_fails(self):
+        said = {f"js-{n}": (1_000_000, 1, "/dev/loop3") for n in range(2)}
+        self.assertEqual([ok for ok, _ in self.mounted(said)], [False])
+
+    def test_each_server_s_volume_bound_ahead_to_its_claim_on_the_filesystem(self):
+        import json
+        import tempfile
+        applied = []
+        with tempfile.TemporaryDirectory() as disk, mock.patch.object(run, "BROKER_DISK", disk), \
+                mock.patch.object(run, "SHAPE", "ha"), \
+                mock.patch.object(run, "run", lambda *command, input=None, **_: applied.append((command, input))):
+            run.broker_disk_volumes(3)
+            for n in range(3):
+                self.assertEqual(os.stat(os.path.join(disk, f"jetstream-{n}")).st_mode & 0o777, 0o777)
+        (command, body), = applied
+        self.assertEqual(command, ("kubectl", "apply", "-f", "-"))
+        volumes = json.loads(body)["items"]
+        self.assertEqual([v["spec"]["claimRef"]["name"] for v in volumes],
+                         [f"jetstream-{run.FULL}-broker-jetstream-{n}" for n in range(3)])
+        self.assertTrue(all(v["spec"]["storageClassName"] == run.BROKER_DISK_CLASS for v in volumes))
+        self.assertTrue(all(v["spec"]["hostPath"]["path"].startswith(disk) for v in volumes))
 
 
 if __name__ == "__main__":
