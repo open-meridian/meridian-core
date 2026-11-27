@@ -1018,6 +1018,13 @@ E2E_K3D_ZONES ?=
 # e2e/failover/run.py's archive is a hostPath volume under.
 E2E_K3D_SHARED = $(if $(or $(filter e2e-cluster-reconfigure,$(E2E_CLUSTER_TARGET)),$(filter reconfigure,$(PROFILE))),$(E2E_K3D_CLUSTER)-shared)
 E2E_K3D_SHARED_PATH = /var/lib/meridian-e2e-shared
+# The broker's disk full (fault 1; FAILURE=broker-disk-full, ha only): a
+# bounded filesystem this machine already mounts at this path, which
+# failover-repeat loop-mounts before the cluster is made (its step "The
+# broker's bounded disk"). Mounted on every node at the same path; the
+# class's volumes for the JetStream servers' stores are on it, the
+# databases' are not. Empty, as by default: none.
+E2E_K3D_BROKER_DISK ?=
 # How much of each container's log .e2e-cluster.log keeps when a run fails,
 # timestamped, and e2e/failover/run.py's dump as a class fails: ten minutes
 # and more of every quiet container (a database member under Patroni says
@@ -1093,6 +1100,7 @@ e2e-cluster-k3d:
 	@: >.e2e-k3d.log; made=; nodes=; at=0; \
 	if [ "$(E2E_K3D_AGENTS)" != 0 ]; then nodes="--agents $(E2E_K3D_AGENTS)"; fi; \
 	$(if $(E2E_K3D_SHARED),nodes="$$nodes --volume $(E2E_K3D_SHARED):$(E2E_K3D_SHARED_PATH)@server:*;agent:*";) \
+	$(if $(E2E_K3D_BROKER_DISK),nodes="$$nodes --volume $(E2E_K3D_BROKER_DISK):$(E2E_K3D_BROKER_DISK)@server:*;agent:*";) \
 	for zone in $(E2E_K3D_ZONES); do \
 	  nodes="$$nodes --k3s-node-label topology.kubernetes.io/zone=$$zone@agent:$$at"; at=$$((at + 1)); \
 	done; \
@@ -1324,7 +1332,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 	 E2E_K3D_LOG_LINES=$(E2E_K3D_LOG_LINES) \
-	 E2E_SHARED_PATH=$(if $(E2E_K3D_SHARED),$(E2E_K3D_SHARED_PATH)) \
+	 E2E_SHARED_PATH=$(if $(E2E_K3D_SHARED),$(E2E_K3D_SHARED_PATH)) E2E_BROKER_DISK=$(E2E_K3D_BROKER_DISK) \
 		$(PY) e2e/failover/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
