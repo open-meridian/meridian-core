@@ -13157,6 +13157,73 @@ fn a_shard_s_fence_commits_on_the_synchronous_standby() {
     assert_eq!((epoch, through), (2, 9));
 }
 
+/// v31a, item 7.5: a batch from the write-ahead stream commits on the
+/// synchronous standby. The lake's place in the stream commits with the
+/// batch's rows, and the stream drops a write by its age: a batch committed
+/// locally alone, lost with its database's failover after the stream
+/// dropped its writes, is lost for good, each answered as recorded. Read at
+/// the commit itself, by a trigger deferred to it on the lake's place, on a
+/// store connected as a lake connects.
+#[test]
+#[ignore = "v31a item 7.5: placed in v32 lake (2)"]
+fn a_batch_from_the_stream_commits_on_the_synchronous_standby() {
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    let (url, store) = isolated("i75");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .batch_execute(
+            "CREATE TABLE i75_seen (setting text NOT NULL);
+             CREATE FUNCTION i75_see() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 INSERT INTO i75_seen VALUES (current_setting('synchronous_commit'));
+                 RETURN NEW;
+             END $$;
+             CREATE CONSTRAINT TRIGGER i75_at_commit AFTER INSERT OR UPDATE ON lake_write_ahead
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION i75_see();",
+        )
+        .unwrap();
+    let stream = unique("STREAM");
+    let dataset = unique("coinbase-1:i75");
+    let subject = unique("LCL-BTC");
+    let at = |sequence: u64| WriteAheadPosition {
+        sequence,
+        at_ns: 1_000 + sequence as i64,
+    };
+    // The stream's first batch, and one after it: the place made, then moved.
+    for (after, through, amount) in [(None, at(1), 10), (Some(at(1)), at(2), 11)] {
+        let done = store
+            .record_write_ahead(
+                WriteAheadBatch {
+                    stream: stream.clone(),
+                    after,
+                    through,
+                    parts: vec![(
+                        dataset.clone(),
+                        vec![close(&dataset, "x", &subject, "2026-10-07", amount)],
+                    )],
+                    ..Default::default()
+                },
+                5_000,
+            )
+            .unwrap();
+        assert!(done[0].is_ok(), "{done:?}");
+    }
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(2)));
+    let seen: Vec<String> = client
+        .query("SELECT setting FROM i75_seen", &[])
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(seen.len(), 2, "each batch's commit of the place: {seen:?}");
+    assert!(
+        seen.iter()
+            .all(|setting| setting == "on" || setting == "remote_apply"),
+        "a batch from the stream committed with synchronous_commit {seen:?}: never waiting on \
+         the synchronous standby, so lost with a failover, and past the stream's bound for good"
+    );
+    drop((client, store, url));
+}
 
 /// Review c5a2 N6: a take is numbered by the shard's row, which holds the
 /// highest epoch, never by reading the control journal: a record naming a
