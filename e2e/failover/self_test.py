@@ -963,6 +963,12 @@ class BrokerDiskFullAsserted(unittest.TestCase):
         self.assertGreater(seconds, bound)
         self.assertIs(extra["acknowledged_again"], False)
 
+    def test_how_long_the_lake_took_to_acknowledge_again_is_said(self):
+        world = DiskFull(back_after=211)
+        checks = world.run()
+        self.assertTrue(any("acknowledged a price again 21" in note and "after the room given back" in note
+                            for note in checks.notes), checks.notes)
+
     def test_a_lost_price_inside_a_marked_gap_holds_and_outside_fails(self):
         # Acknowledged at the start + n s; the gap marks 20 s to 30 s in.
         gap = [(int((1_000_000 + 20) * 1e9), int((1_000_000 + 30) * 1e9))]

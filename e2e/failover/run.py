@@ -6062,6 +6062,10 @@ def broker_disk_full(s):
                                  f"none within {round(until - first_s)}s") + ")")
     figure("broker-disk-full: the standing notice after the first refusal", noticed_s=noticed_s)
     back_s = (back / 1000 - room) if back else time.time() - room
+    # Said, as the claim's public line keeps no figure (dispatch 46054350057
+    # read its 211 s from the driver's log).
+    s.note(f"broker-disk-full: the lake acknowledged a price again {round(back_s, 1)}s after the room given back"
+           if back else f"broker-disk-full: the lake acknowledged no price within {round(back_s)}s of the room")
     claim(s, "broker-disk-full", "lake", back_s, DISK_FULL_BACK_S,
           {"what": "from the room given back to the lake acknowledging a price again",
            "acknowledged_again": back is not None, "held_s": round(room - first_s, 1),
