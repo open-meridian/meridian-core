@@ -5893,7 +5893,7 @@ DISK_FULL_BACK_S = 120
 DISK_FULL_REFUSED_S = 180
 DISK_FULL_WATCH_S = 600
 BROKER_DISK_FILLER = "e2e-broker-disk-filler"
-STUCK_FULL_NOTICE = "component-write-ahead-stuck-full"
+REFUSED_NOTICE = "component-write-ahead-refused"
 # What a broker server says of its store full, and of a stream it deleted
 # as orphaned (fault 1: "Detected orphaned stream '$G > LAKE_WRITE_AHEAD',
 # will cleanup").
@@ -5926,11 +5926,11 @@ def give_room():
         pass
 
 
-def stuck_notices(since_ns):
-    """When each standing stuck-full notice was filed since `since_ns`
+def refused_notices(since_ns):
+    """When each standing refused notice was filed since `since_ns`
     (dashboard_notice.changed_ns, one a deployment admin), oldest first."""
     try:
-        said = psql(f"select changed_ns from dashboard_notice where kind = '{STUCK_FULL_NOTICE}' "
+        said = psql(f"select changed_ns from dashboard_notice where kind = '{REFUSED_NOTICE}' "
                     f"and changed_ns >= {since_ns} order by changed_ns", quiet=True)
     except SystemExit:
         return []
@@ -6003,7 +6003,7 @@ def broker_disk_full(s):
     filesystem (broker_disk_mounted), filled from this machine's side
     until the broker refuses the lake's writes, held so DISK_FULL_HELD_S,
     then given its room back, by nobody's act. Held to: the standing
-    stuck-full notice within DISK_FULL_NOTICE_S of the first refusal; the
+    refused notice within DISK_FULL_NOTICE_S of the first refusal; the
     lake acknowledging the driver's prices again within DISK_FULL_BACK_S
     of the room given back; every acknowledged price recorded or inside a
     marked gap, none silently missing, and every acknowledged order kept;
@@ -6041,7 +6041,7 @@ def broker_disk_full(s):
         notices = []
         while time.time() < first_s + DISK_FULL_HELD_S:
             fill_disk()
-            notices = notices or stuck_notices(since_ns)
+            notices = notices or refused_notices(since_ns)
             time.sleep(2)
     finally:
         give_room()
@@ -6052,12 +6052,12 @@ def broker_disk_full(s):
     back = None
     until = room + DISK_FULL_WATCH_S
     while time.time() < until and not (notices and back):
-        notices = notices or stuck_notices(since_ns)
+        notices = notices or refused_notices(since_ns)
         back = back or price_acked_after(room_ms)
         time.sleep(3)
     noticed_s = round(notices[0] / 1e9 - first_s, 1) if notices else None
     s.check(noticed_s is not None and noticed_s <= DISK_FULL_NOTICE_S,
-            f"broker-disk-full: the standing notice ({STUCK_FULL_NOTICE}) within {DISK_FULL_NOTICE_S}s of the "
+            f"broker-disk-full: the standing notice ({REFUSED_NOTICE}) within {DISK_FULL_NOTICE_S}s of the "
             "first refusal (" + (f"{noticed_s}s" if noticed_s is not None else
                                  f"none within {round(until - first_s)}s") + ")")
     figure("broker-disk-full: the standing notice after the first refusal", noticed_s=noticed_s)

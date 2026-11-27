@@ -897,7 +897,7 @@ class DiskFull:
             mock.patch.object(run, "fill_disk", self.fill), mock.patch.object(run, "give_room", self.give_room),
             mock.patch.object(run, "host_disk", lambda: (1 << 30, 0)),
             mock.patch.object(run, "prices_refused", self.refused),
-            mock.patch.object(run, "stuck_notices", self.notices),
+            mock.patch.object(run, "refused_notices", self.notices),
             mock.patch.object(run, "price_acked_after", self.acked_after),
             mock.patch.object(run, "store_logs_at_first_refusal", lambda *a: None),
             mock.patch.object(run, "broker_disk_said", lambda began: self.said),
@@ -948,7 +948,7 @@ class BrokerDiskFullAsserted(unittest.TestCase):
         world = DiskFull(notice_after=None)
         failed = world.failed(world.run())
         self.assertEqual(len(failed), 1, failed)
-        self.assertIn("the standing notice (component-write-ahead-stuck-full) within 120s", failed[0])
+        self.assertIn("the standing notice (component-write-ahead-refused) within 120s", failed[0])
         self.assertIn("none within", failed[0])
 
     def test_a_late_notice_fails_and_says_how_late(self):
