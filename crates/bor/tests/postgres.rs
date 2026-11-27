@@ -1731,6 +1731,120 @@ async fn the_journal_is_a_chain_its_scrub_names_a_changed_entry_and_a_replay_ref
     );
 }
 
+/// Roadmap v31a item 7.1 (review G, 2026-11-20): three accounts opened in
+/// P0, a chain of three, and a fourth entry put there beneath the book by
+/// a plain `INSERT` -- which the append-only rule lets through -- with no
+/// digest: a copy of the last entry under its own identifier, numbered
+/// next after the head. Answers its sequence and its account.
+fn forged_without_a_digest(url: &Scratch) -> (i64, String) {
+    let mut client = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    let sequence: i64 = client
+        .query_one(
+            "SELECT sequence + 1 FROM book_partition_head WHERE partition = 'P0'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO book_entry (entry_id, account_id, partition, first_sequence, last_sequence,
+                                     kind, effective_date, actor, committed_at_ns, meta, cause,
+                                     body, reply, request)
+             SELECT 'ENT-FORGED', account_id, partition, $1, $1, kind, effective_date, actor,
+                    committed_at_ns, meta, cause, body, reply, request
+               FROM book_entry WHERE partition = 'P0' ORDER BY first_sequence DESC LIMIT 1",
+            &[&sequence],
+        )
+        .unwrap();
+    let account = client
+        .query_one(
+            "SELECT account_id FROM book_entry WHERE entry_id = 'ENT-FORGED'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    (sequence, account)
+}
+
+async fn a_chain_of_three() -> (Scratch, Arc<PostgresStore>) {
+    let (url, store) = blocking(isolated);
+    let (bus, store) = wired_with(store);
+    for n in 0..3 {
+        open(&bus, &unique(&format!("FORGE{n}")), "INS-AAPL").await;
+    }
+    let clean = blocking(|| store.scrub()).expect("scrubs");
+    assert_eq!(clean.checked, 3);
+    assert!(clean.findings.is_empty(), "{:?}", clean.findings);
+    (url, store)
+}
+
+/// Item 7.1, the lead as review G gave it: an entry with no digest inside
+/// what the partition's head commits to (the head moved on with it, as the
+/// same rights allow) is passed over by the scrub as one kept before
+/// digests, and the chain taken up again after it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "v31a item 7.1: placed in v32 scrub (18)"]
+async fn an_entry_put_in_the_chain_without_a_digest_is_named_by_the_scrub() {
+    let (url, store) = a_chain_of_three().await;
+    let sequence = blocking(|| {
+        let (sequence, _) = forged_without_a_digest(&url);
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE book_partition_head SET sequence = $1 WHERE partition = 'P0'",
+                &[&sequence],
+            )
+            .unwrap();
+        sequence
+    });
+    let found = blocking(|| store.scrub()).expect("scrubs");
+    assert_eq!(found.checked, 4);
+    assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+    assert_eq!(found.findings[0].partition, "P0");
+    assert_eq!(found.findings[0].sequence as i64, sequence);
+}
+
+/// Item 7.1, the brief's own case: the `INSERT` alone, the head left where
+/// it was. The scrub reads a partition as far as its head, so it never
+/// reads the entry; the account's replay does, and takes it as one kept
+/// before digests.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "v31a item 7.1: placed in v32 scrub (18)"]
+async fn an_entry_put_past_the_head_without_a_digest_is_named_by_the_scrub_and_not_replayed() {
+    let (url, store) = a_chain_of_three().await;
+    let (_, account) = blocking(|| forged_without_a_digest(&url));
+    let found = blocking(|| store.scrub()).expect("scrubs");
+    let replayed = blocking(|| store.journal(&account));
+    assert!(
+        found.findings.len() == 1 && replayed.is_err(),
+        "the scrub checked {} and found {:?}; the replay took {:?} entries",
+        found.checked,
+        found.findings,
+        replayed.map(|entries| entries.len())
+    );
+}
+
+/// Item 7.1, the head: its `last_digest` no longer the last entry's. The
+/// scrub follows entry to entry and never reads the head's digest, so
+/// nothing is named until a later entry is chained to the wrong one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "v31a item 7.1: placed in v32 scrub (18)"]
+async fn a_head_whose_digest_is_not_its_last_entrys_is_named_by_the_scrub() {
+    let (url, store) = a_chain_of_three().await;
+    blocking(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE book_partition_head SET last_digest = '\\xdeadbeef' WHERE partition = 'P0'",
+                &[],
+            )
+            .unwrap();
+    });
+    let found = blocking(|| store.scrub()).expect("scrubs");
+    assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+    assert_eq!(found.findings[0].partition, "P0");
+}
+
 #[test]
 fn an_entry_kept_before_digests_is_chained_by_migrate_even_one_the_book_cannot_read() {
     let (url, store) = isolated();
