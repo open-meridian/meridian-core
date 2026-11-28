@@ -1355,12 +1355,99 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
         (1..=4).collect(),
         "every write of the stream made again under the running writer taken and answered"
     );
-    assert_eq!(
-        gaps(&h, "", GapState::Unspecified),
-        old_gaps,
-        "no write of the stream made again under the running writer found to follow a gap"
-    );
+    // No write of it follows a gap; the stream the writer held a place in,
+    // gone under it, is marked once, its datasets unknown (the consensus
+    // of 2026-11-28).
+    let now_gaps = gaps(&h, "", GapState::Unspecified);
+    let lost: Vec<&DatasetGap> = now_gaps
+        .iter()
+        .filter(|gap| !old_gaps.contains(gap))
+        .collect();
+    assert_eq!(lost.len(), 1, "the lost stream's gap alone: {now_gaps:?}");
+    assert!(lost[0].dataset.is_empty() && lost[0].found_in_gap_id.is_empty());
     context.delete_stream(STREAM).await.unwrap();
+}
+
+/// The consensus of 2026-11-28 (run 46090125342), option 2: a stream gone
+/// under a writer that held a place in it is marked with the existing gap
+/// record -- one gap, no dataset (nobody can say whose writes it held),
+/// unrecovered so it is shown at once and stays shown, over the time from
+/// the last write the lake recorded from the stream to now; no sequence
+/// named. The writer's place stays where it was. A stream it had recorded
+/// nothing from is marked from when the stream was made, its identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_lost_under_its_writer_is_marked_as_one_gap_by_time_naming_no_dataset() {
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let made_at = NOW - 5_000;
+    let mut writer = Writer::start(h.lake.clone(), STREAM, made_at).unwrap();
+    let taken = (1..=3)
+        .map(|n| {
+            let price = close("coinbase-1", &format!("L:{n}"), BTC, "2026-10-07", "1");
+            written(
+                n,
+                "coinbase-1",
+                vec![at_valid(price, NOW - 100_000 + n as i64)],
+            )
+        })
+        .collect();
+    tokio::task::block_in_place(|| writer.take(taken)).unwrap();
+    assert!(gaps(&h, "", GapState::Unspecified).is_empty());
+    h.clock.set(NOW + 9_000);
+    let run = tokio::task::block_in_place(|| writer.lost()).unwrap();
+    assert!(run.first > run.last, "no sequence is named: {run:?}");
+    assert!(!(1..=10).any(|sequence| run.holds(sequence)));
+    let marked = gaps(&h, "", GapState::Unspecified);
+    assert_eq!(marked.len(), 1, "{marked:?}");
+    let gap = &marked[0];
+    assert_eq!(gap.gap_id, run.gap_id);
+    assert_eq!(gap.dataset, "");
+    assert!(gap.subjects.is_empty() && gap.found_in_gap_id.is_empty());
+    assert_eq!(gap.cause, GapCause::WriteAheadBound as i32);
+    assert_eq!(gap.state, GapState::Unrecovered as i32);
+    // From the stream's time of write 3, the last recorded, to now.
+    assert_eq!(
+        (gap.valid_from_ns, gap.valid_until_ns),
+        (NOW + 3, NOW + 9_000)
+    );
+    assert_eq!(gaps(&h, "", GapState::Unrecovered), marked);
+    // Its place is where it was, kept: a writer started in the same stream
+    // again holds it, and the run names none of its writes.
+    assert_eq!(writer.next(), 4);
+    let again = Writer::start(h.lake.clone(), STREAM, made_at).unwrap();
+    assert_eq!(again.next(), 4);
+    // A stream the lake recorded nothing from: marked from when it was made.
+    let other = NOW - 2_000;
+    let mut unplaced = Writer::start(h.lake.clone(), STREAM, other).unwrap();
+    let run = tokio::task::block_in_place(|| unplaced.lost()).unwrap();
+    assert_eq!((run.after_at_ns, run.until_at_ns), (other, NOW + 9_000));
+    assert_eq!(unplaced.placed(), None);
+    assert_eq!(gaps(&h, "", GapState::Unspecified).len(), 2);
+}
+
+/// The consensus of 2026-11-28, option 1: the stream is said gone only once
+/// the broker has said "stream not found" at every look for the whole bound,
+/// sixty seconds -- past the thirty its servers take to clean up a stream
+/// whose files they still hold. A look answered any other way, a timeout or
+/// no servers, starts the count again.
+#[test]
+fn a_stream_is_gone_only_once_the_broker_has_said_so_for_the_whole_bound() {
+    use crate::write_ahead::{Gone, GONE_AFTER};
+    use std::time::Duration;
+    assert_eq!(GONE_AFTER, Duration::from_secs(60));
+    let began = tokio::time::Instant::now();
+    let at = |s: u64| began + Duration::from_secs(s);
+    let mut gone = Gone::default();
+    assert!(!gone.not_found(at(0), GONE_AFTER));
+    assert!(!gone.not_found(at(59), GONE_AFTER));
+    assert!(gone.not_found(at(60), GONE_AFTER));
+    // A timeout between two not-founds: counted from the next not-found.
+    let mut gone = Gone::default();
+    assert!(!gone.not_found(at(0), GONE_AFTER));
+    gone.other();
+    assert!(!gone.not_found(at(59), GONE_AFTER));
+    assert!(!gone.not_found(at(118), GONE_AFTER));
+    assert!(gone.not_found(at(119), GONE_AFTER));
 }
 
 /// The consensus of 2026-11-28 (run 46090125342), options 1 and 2 as one,

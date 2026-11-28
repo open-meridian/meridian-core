@@ -765,6 +765,42 @@ impl Writer {
         &self.base
     }
 
+    /// The stream this writer follows is gone from the broker, or made
+    /// again under its name: the writes it held past the writer's place
+    /// are lost, and nobody can say which, or whether there were any. A
+    /// gap is recorded for it as one is for a run the stream dropped at
+    /// its bound (W10.14), in one commit under the writer's place, which
+    /// stays where it is: its datasets not known, and never named later --
+    /// the stream that takes its place numbers its writes anew, so no
+    /// write's chain reaches into this one (item 191 holds for the
+    /// numbering; what this stream held is unknown, and marked). By time:
+    /// from the stream's time of the last write the lake recorded from it
+    /// -- from when the stream was made, where it recorded none -- to now.
+    /// No sequence is named: the run is empty (`first` past `last`).
+    ///
+    /// INTERIM(v32): v32 takes the stream off the write path.
+    pub fn lost(&mut self) -> Result<Dropped, StoreError> {
+        let next = self.next();
+        let run = Dropped {
+            first: next,
+            last: next - 1,
+            after_at_ns: self.placed().map_or(self.identity, |at| at.at_ns),
+            until_at_ns: self.lake.now_ns(),
+            gap_id: self.lake.new_gap_id(),
+        };
+        let batch = WriteAheadBatch {
+            stream: self.stream.clone(),
+            after: self.position,
+            through: self.position.unwrap_or_default(),
+            dropped: vec![run.clone()],
+            ..Default::default()
+        };
+        self.lake.record_written(Vec::new(), batch, &self.valid)?;
+        self.position = Some(self.position.unwrap_or_default());
+        self.dropped.push(run.clone());
+        Ok(run)
+    }
+
     /// The identity of the stream the writer was started in.
     pub fn identity(&self) -> i64 {
         self.identity
@@ -1241,6 +1277,75 @@ pub async fn taken_past_a_switch(
     }
 }
 
+/// How long the broker must have said, at every look, that it holds no
+/// write-ahead stream before a writer that was following one makes it
+/// again: longer than the broker's own cleanup of a stream its servers
+/// still hold the files of (30 s after a server starts, NATS 2.10), so the
+/// stream is never made over one still on disk.
+///
+/// INTERIM(v32): v32 takes the stream off the write path, and the lake no
+/// longer makes it again (the consensus of 2026-11-28, run 46090125342).
+pub const GONE_AFTER: Duration = Duration::from_secs(60);
+
+/// For how long the broker has said, at every look, that it holds no
+/// write-ahead stream (its definite "stream not found", 10059). Anything
+/// else -- a timeout, no servers, the stream itself -- ends it: only the
+/// broker's own word that the stream is gone counts, and only while it
+/// stands.
+///
+/// INTERIM(v32): gone with the stream on the write path.
+#[derive(Debug, Default)]
+pub struct Gone {
+    since: Option<tokio::time::Instant>,
+}
+
+impl Gone {
+    /// A look the broker answered "stream not found" at `now`: whether it
+    /// has now said so for `after`.
+    pub fn not_found(&mut self, now: tokio::time::Instant, after: Duration) -> bool {
+        now.duration_since(*self.since.get_or_insert(now)) >= after
+    }
+
+    /// A look answered any other way.
+    pub fn other(&mut self) {
+        self.since = None;
+    }
+}
+
+/// The gap marked for a write-ahead stream the broker no longer holds, or
+/// holds made again under its name, while this writer followed it
+/// ([`Writer::lost`]): tried until the store keeps it, since the stream is
+/// never made again, or taken as another, with nothing marked.
+///
+/// INTERIM(v32): gone with the stream on the write path.
+async fn lost_marked(writer: &mut Writer) {
+    loop {
+        match tokio::task::block_in_place(|| writer.lost()) {
+            Ok(run) => {
+                tracing::warn!(
+                    stream = STREAM,
+                    identity = writer.identity(),
+                    gap_id = run.gap_id,
+                    after_at_ns = run.after_at_ns,
+                    until_at_ns = run.until_at_ns,
+                    "the lake's write-ahead stream is gone from the broker: a write it held \
+                     that the lake had not recorded is lost; a gap recorded over the time \
+                     since the lake's place in it, its writes unknown, possibly none"
+                );
+                return;
+            }
+            Err(failed) => {
+                tracing::warn!(%failed, "the gap for the lost write-ahead stream could not be recorded yet");
+                tokio::time::sleep(AGAIN_AFTER).await;
+                // A place a move's switch took back is read again.
+                if let Err(failed) = tokio::task::block_in_place(|| writer.reread()) {
+                    tracing::warn!(%failed, "the write-ahead position could not be read yet");
+                }
+            }
+        }
+    }
+}
+
 /// The writer started in the stream whose identity is `identity`, its
 /// place read again until the store answers; said where the lake has none
 /// in it (item 191, ruled 2026-11-19): a stream made again under its name,
@@ -1272,6 +1377,38 @@ async fn started(lake: &Arc<Lake>, identity: i64) -> Writer {
 }
 
 pub async fn write_forever(
+    lake: Arc<Lake>,
+    client: async_nats::Client,
+    bounds: Bounds,
+    waiting: impl Fn(Option<String>) + Send + Sync + 'static,
+) -> Result<(), String> {
+    let waiting = Arc::new(waiting);
+    loop {
+        let waiting = Arc::clone(&waiting);
+        written_until_gone(Arc::clone(&lake), client.clone(), bounds, move |said| {
+            waiting(said)
+        })
+        .await?;
+    }
+}
+
+/// The writer from its start until the stream it followed is gone from the
+/// broker and its gap is marked.
+///
+/// A writer following the stream that the broker then says, definitely
+/// and for the whole of [`GONE_AFTER`], it no longer holds -- its servers'
+/// JetStream state lost, the stream cleaned up as orphaned (run
+/// 46090125342) -- marks a gap ([`Writer::lost`]) and only then starts
+/// again as a writer does: the stream made, taken as another. Never the
+/// second without the first, which would turn a writer loudly stopped into
+/// writes silently lost. This is not a stream made again while it holds
+/// unrecorded writes (v31a item 5): the broker holds no such stream any
+/// more. A writer that was not running when the stream went still starts
+/// in the next one with nothing marked: it cannot tell that from `ha`
+/// left and taken again (item 191; a known gap until v32).
+///
+/// INTERIM(v32): v32 takes the stream off the write path.
+async fn written_until_gone(
     lake: Arc<Lake>,
     client: async_nats::Client,
     bounds: Bounds,
@@ -1359,10 +1496,32 @@ pub async fn write_forever(
         max_bytes = bounds.max_bytes,
         "the lake takes its writes from the write-ahead stream"
     );
+    let mut gone = Gone::default();
     loop {
         let mut stream = match context.get_stream(STREAM).await {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                gone.other();
+                stream
+            }
+            // The broker's own word that it holds no such stream, standing
+            // for the bound: the gap marked, then the start again.
+            Err(failed)
+                if not_found(&failed)
+                    && gone.not_found(tokio::time::Instant::now(), GONE_AFTER) =>
+            {
+                tracing::warn!(
+                    %failed,
+                    stood_s = GONE_AFTER.as_secs(),
+                    "the broker holds no write-ahead stream and has said so for the bound: \
+                     its gap is marked, and the stream is made again"
+                );
+                lost_marked(&mut writer).await;
+                return Ok(());
+            }
             Err(failed) => {
+                if !not_found(&failed) {
+                    gone.other();
+                }
                 tracing::warn!(%failed, "the write-ahead stream could not be read");
                 tokio::time::sleep(AGAIN_AFTER).await;
                 continue;
@@ -1382,6 +1541,11 @@ pub async fn write_forever(
                     "the write-ahead stream was made again under its name: the lake takes it \
                      as another stream"
                 );
+                // The stream this writer held a place in is gone, whoever
+                // made this one: what it held past the place is unknown,
+                // and marked before the other is taken (INTERIM(v32), the
+                // consensus of 2026-11-28).
+                lost_marked(&mut writer).await;
                 writer = started(&lake, identity).await;
                 continue;
             }
