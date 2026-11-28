@@ -538,3 +538,153 @@ async fn a_spell_is_dated_from_when_its_first_look_was_sent() {
         .refused_look(at(25), now + 25 * S, at(30), "timed out")
         .is_some_and(|said| said.contains("for 30s")));
 }
+
+/// The diagnosis of bench-0m's stuck-full stream (2026-11-28), question 2.
+/// FAILS on main (2ac4c91f): the guard says a stream *stuck full* whenever
+/// it stands at its byte bound, whatever the lake's place. bench-0m's
+/// stream stood so with the lake caught up -- 54,830 writes held in 256
+/// MiB, the lake's place past the last -- because under `Limits` retention
+/// a recorded write leaves the stream only at its age bound: nothing was
+/// stuck, and nothing the lake could do would drain it. What such a stream
+/// is said with instead is the coordinator's to decide; this holds only
+/// that it is not the stuck-full words, which the dashboard files as
+/// `component-write-ahead-stuck-full`. It contradicts
+/// `a_stream_full_of_writes_the_lake_recorded_is_stuck_full_saying_none_is_past_its_place`
+/// above, which pins today's behaviour: a fix changes one of the two.
+#[tokio::test(start_paused = true)]
+async fn a_stream_at_its_byte_bound_whose_every_write_the_lake_recorded_is_not_said_stuck_full() {
+    let now = 1_700_000_000 * S;
+    let mut full = Full::new(STUCK_AFTER, MIB);
+    let start = tokio::time::Instant::now();
+    // bench-0m at 22:53:38Z: the stream at its last write, 54,830, the
+    // lake's place the one after it; its oldest write 9 minutes old.
+    let recorded = standing(1, 54_830, 256 * MIB - 5_000, now, 540);
+    assert_eq!(recorded.past(54_831), 0, "the lake has recorded every write");
+    full.looked(start, &recorded, 54_831, &bounds(), now);
+    let said = full.looked(start + STUCK_AFTER, &recorded, 54_831, &bounds(), now);
+    assert!(
+        !said.as_deref().is_some_and(|said| said.starts_with(STUCK_FULL)),
+        "a stream whose every write the lake recorded is said stuck full: {said:?}"
+    );
+}
+
+/// The diagnosis of bench-0m's stuck-full stream (2026-11-28), question 1:
+/// the mechanism, on a real broker. PASSES on main. The stream as the lake
+/// makes it (`Limits`, `discard: new`), filled to its byte bound, every
+/// write then read and acknowledged -- the lake caught up -- still refuses
+/// a new write ("maximum bytes exceeded"), and goes on refusing until the
+/// writes it holds reach its age bound: recording a write frees no room.
+/// So above `max_bytes / max_age` bytes a second the stream stands at its
+/// byte bound for good, taking only what ages out.
+///
+/// Run by hand, with JetStream on: `docker run --rm -d -p 14333:4222
+/// nats:2.10.29-alpine -js`, then `MERIDIAN_TEST_JETSTREAM_URL=
+/// nats://localhost:14333 cargo test -p meridian-lake --lib
+/// a_stream_the_lake_recorded_whole_refuses_writes_at_its_byte_bound_until_they_age_out
+/// -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_stream_the_lake_recorded_whole_refuses_writes_at_its_byte_bound_until_they_age_out() {
+    use async_nats::jetstream::{self, consumer};
+    use futures_util::StreamExt as _;
+    use meridian_bus::write_ahead::{subject, STREAM};
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = async_nats::connect(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let made = Bounds {
+        max_age: Duration::from_secs(20),
+        max_bytes: 2 << 20,
+        replicas: 1,
+    };
+    let mut stream = context
+        .create_stream(crate::write_ahead::stream_config(&made))
+        .await
+        .unwrap();
+    let to = subject("drive-data", "scale0");
+    // bench-0m's write: 20 rows, about 5 KB in the stream.
+    let write = vec![7u8; 5_000];
+    let words = |failed: &dyn std::error::Error| {
+        let mut said = failed.to_string();
+        let mut cause = failed.source();
+        while let Some(next) = cause {
+            said.push_str(&format!(": {next}"));
+            cause = next.source();
+        }
+        said
+    };
+    let began = std::time::Instant::now();
+    let mut held = 0u64;
+    let refused = loop {
+        let sent = context.publish(to.clone(), write.clone().into()).await.unwrap();
+        match sent.await {
+            Ok(_) => held += 1,
+            Err(failed) => break words(&failed),
+        }
+        assert!(held < 10_000, "the stream never refused a write");
+    };
+    let filled_in = began.elapsed();
+    assert!(refused.contains("maximum bytes exceeded"), "{refused}");
+    // The lake records every write it holds: each read and acknowledged.
+    let reader = stream
+        .create_consumer(consumer::pull::Config {
+            ack_policy: consumer::AckPolicy::Explicit,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut messages = reader.messages().await.unwrap();
+    for _ in 0..held {
+        let message = messages.next().await.unwrap().unwrap();
+        message.double_ack().await.unwrap();
+    }
+    // Caught up, and refused all the same.
+    let still = context.publish(to.clone(), write.clone().into()).await.unwrap();
+    let still = words(&still.await.expect_err("refused though every write was recorded"));
+    assert!(still.contains("maximum bytes exceeded"), "{still}");
+    let info = stream.info().await.unwrap().clone();
+    let standing = Standing::of(&info.state);
+    let next = standing.last + 1;
+    assert_eq!((standing.messages, standing.past(next)), (held, 0));
+    // What the guard says of it today, shown, not asserted (the test above
+    // holds what it should not say).
+    let mut full = Full::new(Duration::ZERO, 1 << 20);
+    let now_ns = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
+    let held_bounds = Bounds {
+        max_age: info.config.max_age,
+        max_bytes: info.config.max_bytes,
+        replicas: info.config.num_replicas,
+    };
+    eprintln!(
+        "held {held} writes, {} bytes of {}; filled in {filled_in:?}; the guard: {:?}",
+        standing.bytes,
+        made.max_bytes,
+        full.looked(tokio::time::Instant::now(), &standing, next, &held_bounds, now_ns)
+    );
+    // Refused until the first writes reach the age bound, then taken.
+    let taken_after = loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let sent = context.publish(to.clone(), write.clone().into()).await.unwrap();
+        if sent.await.is_ok() {
+            break began.elapsed();
+        }
+        assert!(
+            began.elapsed() < made.max_age * 2,
+            "no write taken within twice the age bound"
+        );
+    };
+    eprintln!(
+        "a write was taken again {taken_after:?} after the first write, the age bound {:?}",
+        made.max_age
+    );
+    assert!(
+        taken_after >= made.max_age,
+        "a write was taken {taken_after:?} after the first, before any reached the age bound"
+    );
+}
