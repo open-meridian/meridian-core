@@ -1113,11 +1113,17 @@ pub struct Bounds {
 /// minutes), and the bound a write is held within at a low rate.
 pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
-/// `lake.writeAhead.maxBytes` where the chart says nothing: 256 MB, about
-/// 2.2 million rows at the 117 bytes a row a 100-row batch takes in the
-/// stream (measured), so ten minutes at 3,600 rows a second and 3 minutes
-/// at the lake's 12,000 -- past the zone's two -- before a plugin is
-/// refused for load. The bound a write is held within at a high rate.
+/// `lake.writeAhead.maxBytes` where the chart says nothing: 256 MB. The
+/// stream keeps a write the lake has recorded until [`MAX_AGE`] as it does
+/// one it has not, so the two bounds together are the most the lake takes
+/// in `ha`, sustained: `maxBytes / maxAge`, 447 KB/s at these defaults
+/// (268,435,456 bytes every 600 s). Stated in bytes: the rows that is
+/// depends on a batch's shape -- about 250 bytes a row in the stream at
+/// 20-row batches, 117 at 100-row batches (both measured). Above that rate
+/// the stream stands
+/// at its byte bound and a plugin is refused for load until writes it
+/// holds age out ([`guard::RATE_LIMITED`]).
+/// INTERIM(v32): the ha write rate is bounded by maxBytes / maxAge, 447 KB/s at the defaults, until v32.2 takes the stream off the lake's write path.
 pub const MAX_BYTES: i64 = 256 << 20;
 
 /// The least the stream's byte bound holds: this many of the broker's
@@ -1846,8 +1852,9 @@ impl Drop for AbortOnDrop {
 }
 
 /// The stream looked at every [`guard::LOOK_EVERY`] against the writer's
-/// place (v31a item 5): stuck full, its member says so, degraded, with its
-/// figures; drained, it says so no longer. The place is the lowest among
+/// place (v31a item 5): stuck full, or at its rate limit, its member says
+/// so, degraded, with its figures ([`guard::Full::looked`]); below its
+/// bounds, it says so no longer. The place is the lowest among
 /// the writer groups' ([`lowest_place`]). Judged at each look by the
 /// stream's own bounds, as its leader says them then, its age bound held
 /// to the oldest write the lake has not recorded ([`from_place`]) -- never
@@ -1871,7 +1878,8 @@ async fn guard_forever(
 ) {
     let mut full = guard::Full::new(guard::STUCK_AFTER, largest_write);
     let mut refused = guard::Refused::new(guard::REFUSED_AFTER);
-    // What the member says of the stream: stuck full, and refused.
+    // What the member says of the stream: stuck full or at its rate limit,
+    // and refused.
     let (mut stuck, mut refusal) = (None::<String>, None::<String>);
     if kept.is_some() {
         waiting(kept.clone());
@@ -1921,6 +1929,11 @@ async fn guard_forever(
             Ok::<_, String>((standing, held))
         };
         let was = (stuck.is_some(), refusal.is_some());
+        // Which of its two states the stream was said in: stuck full, or
+        // at its rate limit.
+        let was_said = stuck
+            .as_deref()
+            .map(|words| words.starts_with(guard::STUCK_FULL));
         // When the look was sent: a spell of refusals is dated from then,
         // not from an unanswered look's return at its timeout.
         let (sent, sent_ns) = (tokio::time::Instant::now(), lake.now_ns());
@@ -1953,13 +1966,18 @@ async fn guard_forever(
                     &bounds,
                     lake.now_ns(),
                 );
-                match (&stuck, was.0) {
+                // Logged as it is first said, as it passes from one state
+                // to the other, and as it clears.
+                let says = stuck
+                    .as_deref()
+                    .map(|words| words.starts_with(guard::STUCK_FULL));
+                match (&stuck, says == was_said) {
                     (Some(words), false) => tracing::warn!(stream = STREAM, "{words}"),
-                    (None, true) => tracing::info!(
+                    (None, false) => tracing::info!(
                         stream = STREAM,
                         bytes = standing.bytes,
                         past = standing.past(next),
-                        "the lake's write-ahead stream drained: no longer at a bound"
+                        "the lake's write-ahead stream is below its bounds: no longer at one"
                     ),
                     _ => {}
                 }

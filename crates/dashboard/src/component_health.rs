@@ -22,7 +22,12 @@
 //! write-ahead writes, or not answering them, for 30 s, as the writer says
 //! it apart from stuck full, is one too, `component-write-ahead-refused`,
 //! and its clearing once no member says so, `component-write-ahead-accepted`
-//! (INTERIM(v32), the proposal of 2026-11-27, A1).
+//! (INTERIM(v32), the proposal of 2026-11-27, A1). The stream at its rate
+//! limit -- at its byte bound with the lake keeping up, as the writer says
+//! it in place of stuck full -- is one too,
+//! `component-write-ahead-rate-limited`, and its clearing once no member
+//! says so, `component-write-ahead-within-rate` (both names candidates,
+//! adopted by consensus 2026-11-28; an interim, [`Judge::rate_limited`]).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -127,6 +132,11 @@ pub struct Judge {
     /// refusals began. One is here once its refused notice is kept, and
     /// until its accepted notice is ([`Judge::kept`]).
     refused: BTreeMap<String, i64>,
+    /// The core components whose write-ahead stream stands at its rate
+    /// limit, as one of their members said, each with its spell: the time
+    /// it began. One is here once its rate-limited notice is kept, and
+    /// until its within-rate notice is ([`Judge::kept`]).
+    rate_limited: BTreeMap<String, i64>,
 }
 
 fn mib(bytes: u64) -> u64 {
@@ -277,6 +287,7 @@ impl Judge {
         });
         opened.extend(self.stuck_full(members, now_ns));
         opened.extend(self.refused(members, now_ns));
+        opened.extend(self.rate_limited(members, now_ns));
         opened
     }
 
@@ -310,11 +321,48 @@ impl Judge {
             meridian_bus::write_ahead::stuck_since,
             (
                 "write-ahead-stuck-full",
-                "Open until the stream drains; meridian status shows what it holds.",
+                "Open until the stream is below its bounds or the lake has recorded what it \
+                 holds; meridian status shows what it holds.",
             ),
             (
                 "write-ahead-drained",
-                "the lake's write-ahead stream has drained and is below its bound.",
+                "the lake's write-ahead stream is no longer stuck full: it is below its \
+                 bounds, or the lake has recorded what it holds.",
+            ),
+        )
+    }
+
+    /// The lake's write-ahead stream at its rate limit, as a core member's
+    /// report says first in its words
+    /// ([`meridian_bus::write_ahead::RATE_LIMITED`]): at its byte bound with
+    /// the lake keeping up, writes arriving faster than its bounds hold. A
+    /// standing notice, `component-write-ahead-rate-limited`, opened once a
+    /// spell while any member of the component says so, and its clearing,
+    /// `component-write-ahead-within-rate`, once none of those reporting
+    /// does -- the shape, the windows and the offering again of
+    /// [`Judge::stuck_full`]'s, a spell windowed by the time it began as
+    /// the lake's guard says it, its own and never the stuck spell's. A
+    /// member says this or stuck full, never both, so a stream passing from
+    /// one to the other clears the one and opens the other, each once.
+    /// Both names are candidates, adopted by consensus 2026-11-28.
+    /// INTERIM(v32): both notices go when v32 takes the stream off the lake's write path.
+    fn rate_limited(&self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
+        standing(
+            members,
+            now_ns,
+            &self.rate_limited,
+            meridian_bus::write_ahead::says_rate_limited,
+            meridian_bus::write_ahead::rate_limited_since,
+            (
+                "write-ahead-rate-limited",
+                "Open while the stream stays full with the lake keeping up; meridian status \
+                 shows what it holds.",
+            ),
+            (
+                "write-ahead-within-rate",
+                "the lake's write-ahead stream is no longer at its rate limit: it has room \
+                 for writes again, or the lake has fallen behind and the stream is stuck \
+                 full, which has its own notice.",
             ),
         )
     }
@@ -392,7 +440,8 @@ impl Judge {
     /// one with nobody to tell is not, and is offered again): the
     /// conductor's silence, among them, is not offered again while it lasts,
     /// nor a stream's stuck spell while it stands, nor its draining, nor a
-    /// refused episode while it stands, nor its writes accepted again.
+    /// refused episode while it stands, nor its writes accepted again, nor
+    /// a rate-limited spell while it stands, nor its clearing.
     pub fn kept(&mut self, opened: &[Opened]) {
         for one in opened {
             match one.kind.as_str() {
@@ -413,6 +462,14 @@ impl Judge {
                 "component-write-ahead-accepted" => {
                     self.refused.remove(&one.of);
                 }
+                // A rate-limited spell stands from its notice kept to its
+                // within-rate notice kept.
+                "component-write-ahead-rate-limited" => {
+                    self.rate_limited.insert(one.of.clone(), one.window_ns);
+                }
+                "component-write-ahead-within-rate" => {
+                    self.rate_limited.remove(&one.of);
+                }
                 _ => {}
             }
         }
@@ -430,7 +487,8 @@ impl Judge {
 }
 
 /// A standing condition of a core component's write-ahead stream, as its
-/// members' reports say it ([`Judge::stuck_full`], [`Judge::refused`]):
+/// members' reports say it ([`Judge::stuck_full`], [`Judge::refused`],
+/// [`Judge::rate_limited`]):
 /// opened as `open` while a member `says` it, once (`standing` holds the
 /// components whose opening was kept, each with its window), and cleared
 /// as `clear` once none of those reporting does. The window is the
@@ -723,7 +781,8 @@ mod tests {
                     .about
                     .contains("holds 256.0 MiB of its 256.0 MiB bound")
                 && opened[0].about.ends_with(
-                    ". Open until the stream drains; meridian status shows what it holds."
+                    ". Open until the stream is below its bounds or the lake has recorded what \
+                     it holds; meridian status shows what it holds."
                 ),
             "{}",
             opened[0].about
@@ -741,7 +800,8 @@ mod tests {
         assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
         assert_eq!(
             opened[0].about,
-            "lake: the lake's write-ahead stream has drained and is below its bound."
+            "lake: the lake's write-ahead stream is no longer stuck full: it is below its \
+             bounds, or the lake has recorded what it holds."
         );
         judge.kept(&opened);
         assert!(judge
@@ -950,6 +1010,131 @@ mod tests {
         assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
         judge.kept(&opened);
         assert!(judge.stuck_full.is_empty() && judge.refused.is_empty());
+    }
+
+    /// The lake's writer's words for its stream at its rate limit since
+    /// `since`, as its guard says them.
+    fn rate_limited_since(member: &str, since: &str) -> ComponentReport {
+        ComponentReport {
+            member: member.into(),
+            detail: format!(
+                "{} for 30s, since {since}: holds 256.0 MiB of its 256.0 MiB bound, 0 write(s) \
+                 past the lake's place",
+                meridian_bus::write_ahead::RATE_LIMITED
+            ),
+            ..lake(MIB, 0, 0, 0)
+        }
+    }
+
+    /// The consensus of 2026-11-28: the lake's writer saying its stream is at
+    /// its rate limit opens a standing notice to the deployment admins
+    /// once a spell -- the writer moved, its successor saying it too --
+    /// that is not the stuck-full one, and its within-rate notice once no
+    /// member says it. Neither says the stream drains, or is stuck.
+    #[test]
+    fn a_rate_limited_write_ahead_opens_its_own_standing_notice_once_and_a_within_rate_notice() {
+        let mut judge = Judge::default();
+        let first = rate_limited_since("meridian-lake-0", "2026-10-26T07:33:50Z");
+        let opened = judge.judge(std::slice::from_ref(&first), T0 + MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-rate-limited"]);
+        assert!(!opened[0].plugin && opened[0].of == "lake");
+        let about = &opened[0].about;
+        for part in ["lake/meridian-lake-0", "is at its rate limit", "256.0 MiB"] {
+            assert!(about.contains(part), "{part} in {about}");
+        }
+        assert!(
+            !about.contains("stuck") && !about.contains("drain"),
+            "{about}"
+        );
+        assert!(
+            about.ends_with(
+                ". Open while the stream stays full with the lake keeping up; meridian status \
+                 shows what it holds."
+            ),
+            "{about}"
+        );
+        judge.kept(&opened);
+        assert!(judge.judge(&[first], T0 + 2 * MINUTE).is_empty());
+        assert!(
+            judge
+                .judge(
+                    &[rate_limited_since(
+                        "meridian-lake-1",
+                        "2026-10-26T07:35:10Z"
+                    )],
+                    T0 + 3 * MINUTE
+                )
+                .is_empty(),
+            "the writer moved, still at its rate limit: nothing new"
+        );
+        let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-within-rate"]);
+        assert!(opened[0].about.starts_with("lake: "), "{}", opened[0].about);
+        assert_eq!(opened[0].window_ns, judge.rate_limited["lake"]);
+        judge.kept(&opened);
+        assert!(judge
+            .judge(&[lake(MIB, 0, 0, 0)], T0 + 5 * MINUTE)
+            .is_empty());
+        assert!(judge.rate_limited.is_empty() && judge.stuck_full.is_empty());
+    }
+
+    /// One kind would mask the serious case: a stream at its rate limit,
+    /// its notice standing, whose lake then falls behind opens the
+    /// stuck-full notice; the lake catching up again opens a rate-limited
+    /// notice of its own. Each passing clears the one and opens the other,
+    /// every event filed once, and judged again nothing is filed twice.
+    #[test]
+    fn a_stream_passing_between_rate_limited_and_stuck_full_files_each_event_once() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let (records, store) = (records(), InMemory::default());
+        let mut judge = Judge::default();
+        let limited = rate_limited_since("meridian-lake-0", "2026-10-26T07:33:50Z");
+        let stuck = stuck_since("meridian-lake-0", "2026-10-26T07:40:00Z");
+        let limited_again = rate_limited_since("meridian-lake-0", "2026-10-26T07:45:00Z");
+        let mut events = Vec::new();
+        for (n, (report, wanted)) in [
+            (&limited, vec!["component-write-ahead-rate-limited"]),
+            (
+                &stuck,
+                vec![
+                    "component-write-ahead-stuck-full",
+                    "component-write-ahead-within-rate",
+                ],
+            ),
+            (
+                &limited_again,
+                vec![
+                    "component-write-ahead-drained",
+                    "component-write-ahead-rate-limited",
+                ],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = T0 + (2 * n as i64 + 1) * MINUTE;
+            let opened = judge.judge(std::slice::from_ref(report), at);
+            assert_eq!(kinds(&opened), wanted, "{}", report.detail);
+            store.notify(&notices_of(&records, &opened, at)).unwrap();
+            judge.kept(&opened);
+            events.extend(opened.iter().map(|one| one.event.clone()));
+            assert!(
+                judge
+                    .judge(std::slice::from_ref(report), at + MINUTE)
+                    .is_empty(),
+                "judged again, nothing filed twice: {}",
+                report.detail
+            );
+        }
+        let distinct: BTreeSet<_> = events.iter().collect();
+        assert_eq!(distinct.len(), 5, "no duplicate event: {events:#?}");
+        assert_eq!(store.notices("local|dee", 50).unwrap().len(), 5);
+        assert_eq!(
+            judge.rate_limited.keys().collect::<Vec<_>>(),
+            vec!["lake"],
+            "the second rate-limited spell stands"
+        );
+        assert!(judge.stuck_full.is_empty());
     }
 
     /// Like a stuck notice, a refused or accepted notice whose keeping

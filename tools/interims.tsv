@@ -18,6 +18,7 @@ v32	crates/bus/src/write_ahead.rs
 v32	crates/bus/src/write_ahead.rs	
 v32	crates/bus/src/write_ahead.rs	
 v32	crates/bus/src/write_ahead.rs	
+v32	crates/bus/src/write_ahead.rs	this state and its notices go when v32 takes the stream off the lake's write path.
 v32	crates/bus/tests/nats.rs	
 v32	crates/bus/tests/nats.rs	
 v32	crates/bus/tests/nats.rs	a known gap, the asker read from the reply inbox; v32.8 turns it green"]
@@ -33,6 +34,7 @@ v32	crates/dashboard/src/component_health.rs
 v32	crates/dashboard/src/component_health.rs	
 v32	crates/dashboard/src/component_health.rs	
 v32	crates/dashboard/src/component_health.rs	
+v32	crates/dashboard/src/component_health.rs	both notices go when v32 takes the stream off the lake's write path.
 v32	crates/lake/src/memory.rs	the lost stream's test's, gone with the stream on the
 v32	crates/lake/src/postgres.rs	gone when v32's ownership record says where a range is
 v32	crates/lake/src/postgres.rs	it can't tell a lowered count from a raised one
@@ -50,6 +52,7 @@ v32	crates/lake/src/write_ahead.rs
 v32	crates/lake/src/write_ahead.rs	gone with the stream on the write path.
 v32	crates/lake/src/write_ahead.rs	gone with the stream on the write path.
 v32	crates/lake/src/write_ahead.rs	gone with the stream on the write path.
+v32	crates/lake/src/write_ahead.rs	the ha write rate is bounded by maxBytes / maxAge, 447 KB/s at the defaults, until v32.2 takes the stream off the lake's write path.
 v32	crates/lake/src/write_ahead.rs	v32 takes the stream off the write path, and the lake no
 v32	crates/lake/src/write_ahead.rs	v32 takes the stream off the write path.
 v32	crates/lake/src/write_ahead.rs	v32 takes the stream off the write path.
@@ -58,6 +61,7 @@ v32	crates/lake/src/write_ahead/guard.rs
 v32	crates/lake/src/write_ahead/guard.rs	
 v32	crates/lake/src/write_ahead/guard.rs	
 v32	crates/lake/src/write_ahead/guard.rs	decision 3 removes the stream).
+v32	crates/lake/src/write_ahead/guard.rs	this state, and the bound on the ha write rate, go when v32.2 takes the stream off the lake's write path.
 v32	crates/lake/src/write_ahead/guard/tests.rs	
 v32	crates/lake/tests/postgres.rs	v32 takes the stream off the write path.
 v32	crates/runtime/src/member.rs	a heuristic for a writer-group count no record holds

@@ -1,20 +1,33 @@
 //! The write-ahead stream's guard while the stream exists (v31a item 5,
 //! 0-J; INTERIM(v32): decision 3 removes the stream).
 //!
-//! **Stuck full.** The stream refuses a new write once it holds its bound
-//! (`discard: new`), and drops a write older than its age bound. Standing
-//! at either bound for a while is no fault of a plugin's: the guard looks at
-//! the stream every [`LOOK_EVERY`], and where every look for [`STUCK_AFTER`]
-//! found it at a bound, it is *stuck full*. The writer's member says so in
-//! its report, degraded, with the figures that tell its causes apart -- the
-//! bytes it holds against its bound, the age of the oldest write the lake
-//! has not recorded against its age bound, and how many writes it holds
-//! past the lake's place -- until a
-//! look finds it below both. The dashboard files that as a standing notice
-//! and its clearing ([`STUCK_FULL`]). Why a stream stands full is not
-//! judged here. The bounds are the stream's own, as its leader says them
-//! at that look, never the chart's: a stream kept as it was made is judged
-//! as it was made.
+//! **At a bound.** The stream refuses a new write once it holds its byte
+//! bound (`discard: new`), and drops a write older than its age bound. It
+//! keeps a write the lake has recorded as long as one it has not (`Limits`
+//! retention): only age frees its room, so its byte bound is a bound on
+//! the rate it takes -- its byte bound every age bound -- whatever the
+//! lake's speed. The guard looks at the stream every [`LOOK_EVERY`], and
+//! where every look for [`STUCK_AFTER`] found it at a bound, the writer's
+//! member says so in its report, degraded, as one of two states, each with
+//! its own time since, until a look finds it below both bounds:
+//!
+//! - **Stuck full** ([`STUCK_FULL`]): the oldest write the lake has not
+//!   recorded is about to be dropped at the age bound, or the stream is at
+//!   its byte bound with the lake behind -- that write older than
+//!   [`STUCK_AFTER`]. Said with the figures that tell its causes apart: the
+//!   bytes it holds against its bound, that write's age against the age
+//!   bound, and how many writes it holds past the lake's place.
+//! - **At its rate limit** ([`RATE_LIMITED`]): at its byte bound with the
+//!   lake keeping up. Writes arrive faster than its bounds hold; nothing
+//!   is stuck, and nothing the lake does frees room. Said with the rate
+//!   its own bounds give: `maxBytes / maxAge`, 447 KB/s at the chart's
+//!   defaults.
+//!   INTERIM(v32): this state, and the bound on the ha write rate, go when v32.2 takes the stream off the lake's write path.
+//!
+//! The dashboard files each as a standing notice and its clearing. The
+//! bounds are the stream's own, as its leader says them at that look,
+//! never the chart's: a stream kept as it was made is judged as it was
+//! made.
 //!
 //! **Refused or not answered** (INTERIM(v32), the proposal of 2026-11-27,
 //! A1: v32 takes the stream off the lake's write path and this guard with
@@ -49,15 +62,23 @@ use super::Bounds;
 /// How often the guard looks at the stream.
 pub const LOOK_EVERY: Duration = Duration::from_secs(5);
 
-/// How long the stream stands at a bound, at every look, before it is said
-/// stuck full: twice the writer's stall bound ([`super::STALL_AFTER`]), so
-/// a reader made again from its place has had its chance to drain it.
+/// How long the stream stands at a bound, at every look, before its member
+/// says so; and how old the oldest write the lake has not recorded is
+/// before the lake is behind ([`Standing::lake_behind`]). Twice the
+/// writer's stall bound ([`super::STALL_AFTER`]), so a reader made again
+/// from its place has had its chance to record what the stream holds past
+/// it. Recording frees no room in the stream: only a write's age does.
 pub const STUCK_AFTER: Duration = Duration::from_secs(30);
 
 /// The words a stuck-full stream is said with, first in the writer
 /// member's report (`ComponentReport.detail`): what the dashboard's judge
 /// reads to file its standing notice, and `meridian status` shows.
 pub use meridian_bus::write_ahead::STUCK_FULL;
+
+/// The words a stream at its rate limit is said with, first in the writer
+/// member's report: what the dashboard's judge files its standing notice
+/// from.
+pub use meridian_bus::write_ahead::RATE_LIMITED;
 
 /// How long every look at the stream is refused or not answered before the
 /// writer's member says so ([`REFUSED`]): the stuck-full bound's
@@ -146,19 +167,41 @@ impl Standing {
     /// largest message as the broker says it (`broker.limits.maxPayload`),
     /// so a stream with less free is at its byte bound for some write.
     pub fn at_a_bound(&self, bounds: &Bounds, largest_write: u64, next: u64, now_ns: i64) -> bool {
-        // A bound of none (the broker's -1 bytes, 0 s) is never stood at.
+        self.at_byte_bound(bounds, largest_write) || self.at_age_bound(bounds, next, now_ns)
+    }
+
+    /// Whether it stands at its byte bound: less free than the broker's
+    /// largest message, so some write is refused. A bound of none (the
+    /// broker's -1 bytes) is never stood at.
+    pub fn at_byte_bound(&self, bounds: &Bounds, largest_write: u64) -> bool {
         let max_bytes = u64::try_from(bounds.max_bytes).unwrap_or(0);
-        let by_bytes = max_bytes > 0 && self.bytes.saturating_add(largest_write) > max_bytes;
-        let by_age = !bounds.max_age.is_zero()
+        max_bytes > 0 && self.bytes.saturating_add(largest_write) > max_bytes
+    }
+
+    /// Whether the oldest write the lake has not recorded is within
+    /// [`STUCK_AFTER`] of being dropped at its age bound. A bound of none
+    /// (the broker's 0 s) is never stood at.
+    pub fn at_age_bound(&self, bounds: &Bounds, next: u64, now_ns: i64) -> bool {
+        !bounds.max_age.is_zero()
             && self
                 .unrecorded_age(next, now_ns)
-                .is_some_and(|age| age + STUCK_AFTER >= bounds.max_age);
-        by_bytes || by_age
+                .is_some_and(|age| age + STUCK_AFTER >= bounds.max_age)
+    }
+
+    /// Whether the lake is behind the stream: the oldest write it has not
+    /// recorded is [`STUCK_AFTER`] old or older. Never by how many writes
+    /// are past its place -- under load a look finds a few in flight,
+    /// milliseconds old -- but by the age of the oldest, which a stalled
+    /// writer's reaches in that time. Taken from the lake's place first
+    /// ([`Self::from_place`]).
+    pub fn lake_behind(&self, next: u64, now_ns: i64) -> bool {
+        self.unrecorded_age(next, now_ns)
+            .is_some_and(|age| age >= STUCK_AFTER)
     }
 
     /// The words it is said with while stuck full: [`STUCK_FULL`], for how
     /// long and since when -- `since_ns`, the wall clock at the first look
-    /// that found it at a bound, which names the spell for the dashboard's
+    /// that found it stuck, which names the spell for the dashboard's
     /// judge -- then the figures that tell its causes apart.
     pub fn words(
         &self,
@@ -194,15 +237,75 @@ impl Standing {
     }
 }
 
+/// The bytes a second a stream of `bounds` takes at most, sustained: its
+/// byte bound every age bound, since a write leaves it only at that age.
+/// None where either bound is none.
+pub fn rate(bounds: &Bounds) -> Option<f64> {
+    let max_bytes = u64::try_from(bounds.max_bytes).ok().filter(|b| *b > 0)?;
+    (!bounds.max_age.is_zero()).then(|| max_bytes as f64 / bounds.max_age.as_secs_f64())
+}
+
+/// A rate said in decimal units, as the chart's values are: 447 KB/s.
+fn rate_words(bytes_a_second: f64) -> String {
+    if bytes_a_second < 1_000_000.0 {
+        format!("{:.0} KB/s", bytes_a_second / 1_000.0)
+    } else {
+        format!("{:.1} MB/s", bytes_a_second / 1_000_000.0)
+    }
+}
+
+impl Standing {
+    /// The words it is said with while at its rate limit: [`RATE_LIMITED`],
+    /// for how long and since when -- `since_ns`, the wall clock at the
+    /// first look that found it so, which names the spell for the
+    /// dashboard's judge -- then its figures, the rate its own bounds give,
+    /// and the two chart values that raise it.
+    pub fn rate_limited_words(
+        &self,
+        bounds: &Bounds,
+        next: u64,
+        limited_for: Duration,
+        since_ns: i64,
+    ) -> String {
+        let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
+        let max_mib = mib(u64::try_from(bounds.max_bytes).unwrap_or(0));
+        let max_age_s = bounds.max_age.as_secs();
+        let rate = rate(bounds).map_or_else(String::new, |rate| format!(" ({})", rate_words(rate)));
+        format!(
+            "{}: holds {:.1} MiB of its {max_mib:.1} MiB bound, {} write(s) past the lake's \
+             place (the lake at {}, the stream at {}); the lake is keeping up, and writes \
+             arrive faster than the stream's bounds hold, {max_mib:.1} MiB every \
+             {max_age_s}s{rate}; it takes a new write as the oldest it holds reach {max_age_s}s \
+             old; a write it has no room for is refused for load, none it holds is dropped; a \
+             higher lake.writeAhead.maxBytes, with broker.jetstream.size to hold it, raises \
+             that rate",
+            meridian_bus::write_ahead::rate_limited_for(limited_for.as_secs(), since_ns),
+            mib(self.bytes),
+            self.past(next),
+            next.saturating_sub(1),
+            self.last
+        )
+    }
+}
+
 /// The guard's memory of its looks.
 #[derive(Debug)]
 pub struct Full {
     after: Duration,
     /// The broker's largest message, bytes.
     largest_write: u64,
-    /// Since when every look found the stream at a bound, and the wall
-    /// clock then.
-    since: Option<(tokio::time::Instant, i64)>,
+    /// Since when every look found the stream at a bound.
+    since: Option<tokio::time::Instant>,
+    /// Since when every look found it stuck -- at its age bound, or at its
+    /// byte bound with the lake behind -- and the wall clock then.
+    stuck: Option<(tokio::time::Instant, i64)>,
+    /// Since when every look found it at its byte bound with the lake
+    /// keeping up, and the wall clock then: its own, never the stuck
+    /// spell's, so each names its own event for the dashboard's judge.
+    limited: Option<(tokio::time::Instant, i64)>,
+    /// Whether the lake was behind at the last look of this stand at a
+    /// bound that could tell; none where none could yet.
+    behind: Option<bool>,
 }
 
 impl Full {
@@ -211,12 +314,29 @@ impl Full {
             after,
             largest_write,
             since: None,
+            stuck: None,
+            limited: None,
+            behind: None,
         }
     }
 
     /// One look at `at`: the stream standing so, the lake's place `next`,
-    /// the stream's own `bounds` at that look, the wall clock `now_ns`. The words it is said with while stuck full;
-    /// none while it is not.
+    /// the stream's own `bounds` at that look, the wall clock `now_ns`.
+    /// The words it is said with once every look for the bound found it at
+    /// a bound: the stuck-full words ([`Standing::words`]) where a write
+    /// the lake has not recorded is about to be dropped, or it is at its
+    /// byte bound with the lake behind; the rate-limit words
+    /// ([`Standing::rate_limited_words`]) where it is at its byte bound
+    /// with the lake keeping up. One or the other, each for how long and
+    /// since when its own condition has held at every look. None while it
+    /// is below both bounds.
+    ///
+    /// A stream with no age bound never frees room, so at its byte bound
+    /// it is stuck full. Where its write at the lake's place was not read
+    /// at this look, the lake is taken as the last look that could tell
+    /// found it, and as behind where none could yet: the state that was
+    /// said of every stream at its byte bound, and the one that warns of a
+    /// drop.
     pub fn looked(
         &mut self,
         at: tokio::time::Instant,
@@ -225,13 +345,26 @@ impl Full {
         bounds: &Bounds,
         now_ns: i64,
     ) -> Option<String> {
-        if !standing.at_a_bound(bounds, self.largest_write, next, now_ns) {
-            self.since = None;
+        let by_age = standing.at_age_bound(bounds, next, now_ns);
+        if !by_age && !standing.at_byte_bound(bounds, self.largest_write) {
+            *self = Self::new(self.after, self.largest_write);
             return None;
         }
-        let (since, since_ns) = *self.since.get_or_insert((at, now_ns));
-        let stuck_for = at.duration_since(since);
-        (stuck_for >= self.after).then(|| standing.words(bounds, next, now_ns, stuck_for, since_ns))
+        if !standing.oldest_is_recorded(next) {
+            self.behind = Some(standing.lake_behind(next, now_ns));
+        }
+        let said = at.duration_since(*self.since.get_or_insert(at)) >= self.after;
+        if by_age || self.behind.unwrap_or(true) || bounds.max_age.is_zero() {
+            self.limited = None;
+            let (since, since_ns) = *self.stuck.get_or_insert((at, now_ns));
+            said.then(|| standing.words(bounds, next, now_ns, at.duration_since(since), since_ns))
+        } else {
+            self.stuck = None;
+            let (since, since_ns) = *self.limited.get_or_insert((at, now_ns));
+            said.then(|| {
+                standing.rate_limited_words(bounds, next, at.duration_since(since), since_ns)
+            })
+        }
     }
 }
 
@@ -400,8 +533,8 @@ pub fn bytes_kept(
     ))
 }
 
-/// What the writer's member says of its stream at a look: stuck full, in
-/// its words; and where the stream was not brought to this release's
+/// What the writer's member says of its stream at a look: stuck full, or
+/// at its rate limit, in its words; and where the stream was not brought to this release's
 /// bounds, that refusal -- after them, or alone. None where neither.
 pub fn said(stuck: Option<String>, kept: Option<&str>) -> Option<String> {
     match (stuck, kept) {

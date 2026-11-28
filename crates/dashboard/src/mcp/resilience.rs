@@ -695,6 +695,21 @@ mod tests {
         });
         assert_eq!(read["members"][0]["health"], "degraded");
         assert_eq!(read["members"][0]["detail"], words.as_str());
+        // Its stream at its rate limit, the same way: degraded, in its
+        // words.
+        let limited = format!(
+            "{} for 30s: holds 256.0 MiB of its 256.0 MiB bound",
+            meridian_bus::write_ahead::RATE_LIMITED
+        );
+        let read = resilience_json(&ReadResilienceReply {
+            members: vec![ComponentReport {
+                detail: limited.clone(),
+                ..member.clone()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(read["members"][0]["health"], "degraded");
+        assert_eq!(read["members"][0]["detail"], limited.as_str());
         let serving = resilience_json(&ReadResilienceReply {
             members: vec![ComponentReport {
                 health: meridian_domain::v1::ComponentHealth::Serving as i32,
