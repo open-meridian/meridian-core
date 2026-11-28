@@ -70,23 +70,224 @@ async fn a_stream_at_its_byte_bound_for_the_stuck_bound_is_said_stuck_full_until
 }
 
 /// Full of writes the lake recorded -- its place at the stream's last --
-/// is stuck full all the same: a plugin's write is refused whoever's the
-/// cause, and the figures say none is past the lake's place.
+/// is not stuck: nothing the lake does frees its room, which only a
+/// write's age does. It is at its rate limit, said so with the rate its
+/// own bounds give and the figures that say none is past the lake's place
+/// (the consensus of 2026-11-28; the test pinned the opposite before it).
 #[tokio::test(start_paused = true)]
-async fn a_stream_full_of_writes_the_lake_recorded_is_stuck_full_saying_none_is_past_its_place() {
+async fn a_stream_full_of_writes_the_lake_recorded_is_at_its_rate_limit_saying_none_is_past_its_place(
+) {
     let now = 1_700_000_000 * S;
     let mut full = Full::new(STUCK_AFTER, MIB);
     let start = tokio::time::Instant::now();
     let recorded = standing(1, 4_000, 256 * MIB, now, 590);
-    full.looked(start, &recorded, 4_001, &bounds(), now);
+    assert_eq!(full.looked(start, &recorded, 4_001, &bounds(), now), None);
     let said = full
         .looked(start + STUCK_AFTER, &recorded, 4_001, &bounds(), now)
+        .expect("said after 30 s at its byte bound");
+    assert!(!said.starts_with(STUCK_FULL), "{said}");
+    assert!(said.starts_with(RATE_LIMITED), "{said}");
+    for figure in [
+        "for 30s, since 2023-11-14T22:13:20Z: holds 256.0 MiB of its 256.0 MiB bound",
+        " 0 write(s) past the lake's place (the lake at 4000, the stream at 4000)",
+        "256.0 MiB every 600s (447 KB/s)",
+        "lake.writeAhead.maxBytes, with broker.jetstream.size",
+    ] {
+        assert!(said.contains(figure), "{figure} in {said}");
+    }
+    assert_eq!(
+        meridian_bus::write_ahead::rate_limited_since(&said),
+        Some(now)
+    );
+    // Below its bound again: said no longer.
+    let room = standing(3_000, 4_000, 200 * MIB, now, 60);
+    assert_eq!(
+        full.looked(start + STUCK_AFTER * 2, &room, 4_001, &bounds(), now),
+        None
+    );
+}
+
+/// The lake behind is told by the age of the oldest write it has not
+/// recorded, never by how many are past its place: under load a look
+/// finds a few writes in flight. A stream at its byte bound with a few
+/// fresh writes past the place is at its rate limit, not stuck full, at
+/// every look.
+#[tokio::test(start_paused = true)]
+async fn a_stream_at_its_byte_bound_with_a_few_fresh_writes_past_the_place_is_not_stuck_full() {
+    let now = 1_700_000_000 * S;
+    let mut full = Full::new(STUCK_AFTER, MIB);
+    let start = tokio::time::Instant::now();
+    let mut said = None;
+    for look in 0..=8u64 {
+        // The lake 0 to 3 writes behind the stream's last at each look,
+        // the write at its place a second old.
+        let (last, behind) = (50_000 + look * 400, look % 4);
+        let next = last + 1 - behind;
+        let wall = now + (look * 5) as i64 * S;
+        let stream =
+            standing(last - 49_999, last, 256 * MIB - 5_000, wall, 590).from_place(next, wall - S);
+        assert_eq!(stream.past(next), behind);
+        assert!(!stream.lake_behind(next, wall));
+        said = full.looked(
+            start + Duration::from_secs(look * 5),
+            &stream,
+            next,
+            &bounds(),
+            wall,
+        );
+        assert!(
+            !said
+                .as_deref()
+                .is_some_and(|said| said.starts_with(STUCK_FULL)),
+            "look {look}, {behind} write(s) in flight: {said:?}"
+        );
+    }
+    let said = said.expect("said after 30 s at its byte bound");
+    assert!(said.starts_with(RATE_LIMITED), "{said}");
+    assert_eq!(
+        meridian_bus::write_ahead::rate_limited_since(&said),
+        Some(now),
+        "one spell, since its first look: {said}"
+    );
+}
+
+/// One state would mask the serious case. Over its rate, said so; then the
+/// lake stalls, its place still while the stream goes on: once the oldest
+/// write it has not recorded is STUCK_AFTER old the stream is said stuck
+/// full, at that look, since that look -- its own time, not the rate
+/// limit's -- and no longer at its rate limit.
+#[tokio::test(start_paused = true)]
+async fn a_stream_over_its_rate_whose_lake_then_stalls_is_said_stuck_full_since_the_stall_showed() {
+    let now = 1_700_000_000 * S;
+    let mut full = Full::new(STUCK_AFTER, MIB);
+    let start = tokio::time::Instant::now();
+    let at = |s: u64| start + Duration::from_secs(s);
+    let wall = |s: i64| now + s * S;
+    let keeping_up = |s: i64| standing(1, 54_830, 256 * MIB - 5_000, wall(s), 540);
+    full.looked(at(0), &keeping_up(0), 54_831, &bounds(), wall(0));
+    let said = full
+        .looked(at(30), &keeping_up(30), 54_831, &bounds(), wall(30))
+        .expect("at its rate limit");
+    assert!(said.starts_with(RATE_LIMITED), "{said}");
+    // The lake's place stays at 54,831 from 60 s; the stream takes a write
+    // as one ages out. The write at the place is 10 s old at 70 s: not yet
+    // behind.
+    let stalled = |s: i64| {
+        standing(100, 54_840, 256 * MIB - 5_000, wall(s), 540).from_place(54_831, wall(60))
+    };
+    let said = full
+        .looked(at(70), &stalled(70), 54_831, &bounds(), wall(70))
+        .expect("still said");
+    assert!(said.starts_with(RATE_LIMITED), "{said}");
+    // 30 s old at 90 s: the lake is behind, and the stream stuck full.
+    let said = full
+        .looked(at(90), &stalled(90), 54_831, &bounds(), wall(90))
         .expect("stuck full");
-    assert!(said.contains(" 0 write(s) past the lake's place"), "{said}");
-    assert!(
-        said.contains("no write the lake has not recorded to age against its 600s bound"),
+    assert!(said.starts_with(STUCK_FULL), "{said}");
+    assert_eq!(
+        meridian_bus::write_ahead::stuck_since(&said),
+        Some(wall(90)),
         "{said}"
     );
+    assert!(
+        said.contains("the oldest write the lake has not recorded 30s old of its 600s bound")
+            && said.contains("10 write(s) past the lake's place"),
+        "{said}"
+    );
+    let said = full
+        .looked(at(95), &stalled(95), 54_831, &bounds(), wall(95))
+        .expect("stuck full");
+    assert!(said.starts_with(&format!("{STUCK_FULL} for 5s")), "{said}");
+    assert_eq!(
+        meridian_bus::write_ahead::stuck_since(&said),
+        Some(wall(90))
+    );
+}
+
+/// The reverse: stuck full with the lake behind, then the lake catches up
+/// while the stream stays at its byte bound. It is at its rate limit from
+/// that look, since that look, and stuck full no longer; each state is
+/// said with one time since for as long as it lasts, so the dashboard
+/// files each once.
+#[tokio::test(start_paused = true)]
+async fn a_stuck_stream_whose_lake_catches_up_at_its_byte_bound_passes_to_its_rate_limit_once() {
+    let now = 1_700_000_000 * S;
+    let mut full = Full::new(STUCK_AFTER, MIB);
+    let start = tokio::time::Instant::now();
+    let at = |s: u64| start + Duration::from_secs(s);
+    let wall = |s: i64| now + s * S;
+    let behind =
+        |s: i64| standing(1, 4_000, 256 * MIB - 5_000, wall(s), 500).from_place(901, wall(s - 120));
+    full.looked(at(0), &behind(0), 901, &bounds(), wall(0));
+    let mut times = std::collections::BTreeSet::new();
+    for s in [30, 35, 40] {
+        let said = full
+            .looked(at(s), &behind(s as i64), 901, &bounds(), wall(s as i64))
+            .expect("stuck full");
+        assert!(said.starts_with(STUCK_FULL), "{said}");
+        times.insert(("stuck", meridian_bus::write_ahead::stuck_since(&said)));
+    }
+    let caught_up = |s: i64| standing(1, 4_000, 256 * MIB - 5_000, wall(s), 500);
+    for s in [45, 50, 55] {
+        let said = full
+            .looked(
+                at(s),
+                &caught_up(s as i64),
+                4_001,
+                &bounds(),
+                wall(s as i64),
+            )
+            .expect("at its rate limit");
+        assert!(said.starts_with(RATE_LIMITED), "{said}");
+        assert_eq!(meridian_bus::write_ahead::stuck_since(&said), None);
+        times.insert((
+            "limited",
+            meridian_bus::write_ahead::rate_limited_since(&said),
+        ));
+    }
+    assert_eq!(
+        times.into_iter().collect::<Vec<_>>(),
+        vec![("limited", Some(wall(45))), ("stuck", Some(wall(0)))],
+        "each state one spell, with its own time since"
+    );
+}
+
+/// A stream with no age bound never frees room: at its byte bound it is
+/// stuck full, whatever the lake has recorded. And where the write at the
+/// lake's place could not be read at a look, the lake is taken as the
+/// last look that could tell found it, so one unread look does not pass a
+/// stuck stream to its rate limit and back.
+#[tokio::test(start_paused = true)]
+async fn a_byte_bound_with_no_age_bound_is_stuck_and_an_unread_place_keeps_the_last_verdict() {
+    let now = 1_700_000_000 * S;
+    let start = tokio::time::Instant::now();
+    let ageless = Bounds {
+        max_age: Duration::ZERO,
+        ..bounds()
+    };
+    let recorded = standing(1, 4_000, 256 * MIB, now, 590);
+    let mut full = Full::new(STUCK_AFTER, MIB);
+    full.looked(start, &recorded, 4_001, &ageless, now);
+    let said = full.looked(start + STUCK_AFTER, &recorded, 4_001, &ageless, now);
+    assert!(
+        said.as_deref()
+            .is_some_and(|said| said.starts_with(STUCK_FULL)),
+        "{said:?}"
+    );
+    let mut full = Full::new(STUCK_AFTER, MIB);
+    let behind = standing(1, 4_000, 256 * MIB, now, 500).from_place(901, now - 120 * S);
+    // Its oldest one the lake recorded, the write at the place not read.
+    let unread = standing(1, 4_000, 256 * MIB, now, 500);
+    assert!(unread.oldest_is_recorded(901));
+    full.looked(start, &behind, 901, &bounds(), now);
+    for s in [30, 35] {
+        let stream = if s == 30 { &behind } else { &unread };
+        let said = full
+            .looked(start + Duration::from_secs(s), stream, 901, &bounds(), now)
+            .expect("stuck full");
+        assert!(said.starts_with(STUCK_FULL), "{said}");
+        assert_eq!(meridian_bus::write_ahead::stuck_since(&said), Some(now));
+    }
 }
 
 /// At its age bound: its oldest write one the lake has not recorded, within
@@ -539,37 +740,39 @@ async fn a_spell_is_dated_from_when_its_first_look_was_sent() {
         .is_some_and(|said| said.contains("for 30s")));
 }
 
-/// The diagnosis of bench-0m's stuck-full stream (2026-11-28), question 2.
-/// FAILS on main (2ac4c91f): the guard says a stream *stuck full* whenever
-/// it stands at its byte bound, whatever the lake's place. bench-0m's
-/// stream stood so with the lake caught up -- 54,830 writes held in 256
-/// MiB, the lake's place past the last -- because under `Limits` retention
-/// a recorded write leaves the stream only at its age bound: nothing was
-/// stuck, and nothing the lake could do would drain it. What such a stream
-/// is said with instead is the coordinator's to decide; this holds only
-/// that it is not the stuck-full words, which the dashboard files as
-/// `component-write-ahead-stuck-full`. It contradicts
-/// `a_stream_full_of_writes_the_lake_recorded_is_stuck_full_saying_none_is_past_its_place`
-/// above, which pins today's behaviour: a fix changes one of the two.
+/// The diagnosis of a stream reported stuck full under a load test
+/// (2026-11-28): the guard said a stream *stuck full* whenever it stood at
+/// its byte bound, whatever the lake's place. That stream stood so with
+/// the lake caught up -- 54,830 writes held in 256 MiB, the lake's place
+/// past the last -- because under `Limits` retention a recorded write
+/// leaves the stream only at its age bound: nothing was stuck, and nothing
+/// the lake could do would drain it. It is not said with the stuck-full
+/// words, which the dashboard files as `component-write-ahead-stuck-full`.
 #[tokio::test(start_paused = true)]
 async fn a_stream_at_its_byte_bound_whose_every_write_the_lake_recorded_is_not_said_stuck_full() {
     let now = 1_700_000_000 * S;
     let mut full = Full::new(STUCK_AFTER, MIB);
     let start = tokio::time::Instant::now();
-    // bench-0m at 22:53:38Z: the stream at its last write, 54,830, the
-    // lake's place the one after it; its oldest write 9 minutes old.
+    // The stream at its last write, 54,830, the lake's place the one
+    // after it; its oldest write 9 minutes old.
     let recorded = standing(1, 54_830, 256 * MIB - 5_000, now, 540);
-    assert_eq!(recorded.past(54_831), 0, "the lake has recorded every write");
+    assert_eq!(
+        recorded.past(54_831),
+        0,
+        "the lake has recorded every write"
+    );
     full.looked(start, &recorded, 54_831, &bounds(), now);
     let said = full.looked(start + STUCK_AFTER, &recorded, 54_831, &bounds(), now);
     assert!(
-        !said.as_deref().is_some_and(|said| said.starts_with(STUCK_FULL)),
+        !said
+            .as_deref()
+            .is_some_and(|said| said.starts_with(STUCK_FULL)),
         "a stream whose every write the lake recorded is said stuck full: {said:?}"
     );
 }
 
-/// The diagnosis of bench-0m's stuck-full stream (2026-11-28), question 1:
-/// the mechanism, on a real broker. PASSES on main. The stream as the lake
+/// The same diagnosis (2026-11-28), the mechanism, on a real broker. The
+/// stream as the lake
 /// makes it (`Limits`, `discard: new`), filled to its byte bound, every
 /// write then read and acknowledged -- the lake caught up -- still refuses
 /// a new write ("maximum bytes exceeded"), and goes on refusing until the
@@ -602,7 +805,7 @@ async fn a_stream_the_lake_recorded_whole_refuses_writes_at_its_byte_bound_until
         .await
         .unwrap();
     let to = subject("drive-data", "scale0");
-    // bench-0m's write: 20 rows, about 5 KB in the stream.
+    // A write of 20 rows, about 5 KB in the stream.
     let write = vec![7u8; 5_000];
     let words = |failed: &dyn std::error::Error| {
         let mut said = failed.to_string();
@@ -616,7 +819,10 @@ async fn a_stream_the_lake_recorded_whole_refuses_writes_at_its_byte_bound_until
     let began = std::time::Instant::now();
     let mut held = 0u64;
     let refused = loop {
-        let sent = context.publish(to.clone(), write.clone().into()).await.unwrap();
+        let sent = context
+            .publish(to.clone(), write.clone().into())
+            .await
+            .unwrap();
         match sent.await {
             Ok(_) => held += 1,
             Err(failed) => break words(&failed),
@@ -639,8 +845,15 @@ async fn a_stream_the_lake_recorded_whole_refuses_writes_at_its_byte_bound_until
         message.double_ack().await.unwrap();
     }
     // Caught up, and refused all the same.
-    let still = context.publish(to.clone(), write.clone().into()).await.unwrap();
-    let still = words(&still.await.expect_err("refused though every write was recorded"));
+    let still = context
+        .publish(to.clone(), write.clone().into())
+        .await
+        .unwrap();
+    let still = words(
+        &still
+            .await
+            .expect_err("refused though every write was recorded"),
+    );
     assert!(still.contains("maximum bytes exceeded"), "{still}");
     let info = stream.info().await.unwrap().clone();
     let standing = Standing::of(&info.state);
@@ -665,12 +878,21 @@ async fn a_stream_the_lake_recorded_whole_refuses_writes_at_its_byte_bound_until
         "held {held} writes, {} bytes of {}; filled in {filled_in:?}; the guard: {:?}",
         standing.bytes,
         made.max_bytes,
-        full.looked(tokio::time::Instant::now(), &standing, next, &held_bounds, now_ns)
+        full.looked(
+            tokio::time::Instant::now(),
+            &standing,
+            next,
+            &held_bounds,
+            now_ns
+        )
     );
     // Refused until the first writes reach the age bound, then taken.
     let taken_after = loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let sent = context.publish(to.clone(), write.clone().into()).await.unwrap();
+        let sent = context
+            .publish(to.clone(), write.clone().into())
+            .await
+            .unwrap();
         if sent.await.is_ok() {
             break began.elapsed();
         }
