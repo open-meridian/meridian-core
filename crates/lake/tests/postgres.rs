@@ -12950,7 +12950,11 @@ fn a_member_at_the_count_before_a_raise_fences_no_writer_of_group_one_and_every_
         &mut refused,
         &mut fenced_one,
     );
-    assert_eq!(acked.len(), 2, "group 1 records before the stale member: {refused:?}");
+    assert_eq!(
+        acked.len(),
+        2,
+        "group 1 records before the stale member: {refused:?}"
+    );
     assert_eq!(
         zero.range_tip(&dataset).unwrap().unwrap().writer_group,
         Some(1)
