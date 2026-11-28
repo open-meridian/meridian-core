@@ -279,6 +279,99 @@ fn askers_of_a_count_not_held_wait_for_the_one_read_of_it() {
     assert_eq!(read(2), 1, "the quality counts, read once for all");
 }
 
+/// One read at a time of any of the listing's counts (dev, 2026-11-28:
+/// about 750 MB of the database's memory a copy, against its 3 GiB): askers
+/// of two different counts, neither held, are each answered, the second
+/// read begun once the first has ended. Each count had its own one read
+/// before, so the two ran at once.
+#[test]
+fn askers_of_different_counts_not_held_read_them_one_at_a_time() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let record = Arc::new(MemoryStore::new());
+    let hot = HotStore::new(record.clone() as Arc<dyn Store>, Bounds::DEFAULT);
+    hot.record("quotes", vec![quote_of(BTC, "a", NOW, "100")], NOW)
+        .unwrap();
+    let (reads, reading, most) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let (begun, under_way, most_at_once) = (reads.clone(), reading.clone(), most.clone());
+    record.on_counts_read(move |_| {
+        begun.fetch_add(1, Ordering::SeqCst);
+        most_at_once.fetch_max(
+            under_way.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        under_way.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    });
+
+    let together = Arc::new(std::sync::Barrier::new(2));
+    let closed_day = {
+        let (hot, together) = (hot.clone(), together.clone());
+        std::thread::spawn(move || {
+            together.wait();
+            hot.closed_day_counts().map(|_| ())
+        })
+    };
+    together.wait();
+    let quality = hot.quality_counts();
+    closed_day
+        .join()
+        .unwrap()
+        .expect("the closed-day counts are answered");
+    assert_eq!(
+        in_force(&quality.expect("the quality counts are answered")),
+        1
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "each read once");
+    assert_eq!(
+        most.load(Ordering::SeqCst),
+        1,
+        "one read of the listing's counts at a time"
+    );
+}
+
+/// The one to read a count waits its turn behind a read of another no
+/// longer than its request's wait (section 10a, overload answered): then it
+/// is refused for load with a retry-after, having read nothing, and the
+/// next to ask reads the count.
+#[test]
+fn a_count_whose_turn_does_not_come_within_its_askers_wait_is_asked_again() {
+    use std::sync::atomic::Ordering;
+    let record = Arc::new(MemoryStore::new());
+    let hot = HotStore::new(record.clone() as Arc<dyn Store>, Bounds::DEFAULT);
+    let (reads, has_begun, go_on) = gated_reads(&record);
+    let reader = {
+        let hot = hot.clone();
+        std::thread::spawn(move || hot.unconverted_counts())
+    };
+    has_begun
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the read of the unconverted counts begins");
+
+    let began = std::time::Instant::now();
+    let wait = std::time::Duration::from_millis(60);
+    let refused = hot
+        .quality_counts_within(Some(began + wait), crate::hot::COUNTS_BEHIND_AT_MOST)
+        .expect_err("its turn did not come by the end of its wait")
+        .on_the_bus();
+    assert!(began.elapsed() >= wait);
+    assert!(
+        meridian_bus::refusal_retry_after(&refused).is_some_and(|seconds| seconds >= 1),
+        "{refused}"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "it read nothing");
+
+    go_on.send(()).unwrap();
+    reader.join().unwrap().expect("the one read answers");
+    go_on.send(()).unwrap();
+    hot.quality_counts().expect("read by the next to ask");
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
 /// A read of a count that fails is not read again by each asker that
 /// waited for it: they are refused for load with a retry-after, and the
 /// one that read it says why it failed. Each read it, and failed, before.

@@ -12,10 +12,11 @@
 //! - **The catalogue's counts**, which `list-datasets` answers beside the
 //!   configuration the lake already holds: from memory while no batch has
 //!   changed a dataset since they were read. Once one has, they are read
-//!   from the record again, one read of each count at a time ([`Count`]):
-//!   whoever else asks meanwhile is answered what is held, at most
-//!   [`COUNTS_BEHIND_AT_MOST`] behind the batch, and waits for that read
-//!   where nothing is held or what is held is further behind.
+//!   from the record again, one read of each count at a time ([`Count`])
+//!   and one read of any of them at a time ([`Turn`]): whoever else asks
+//!   meanwhile is answered what is held, at most [`COUNTS_BEHIND_AT_MOST`]
+//!   behind the batch, and waits for that read where nothing is held or
+//!   what is held is further behind.
 //!
 //! **The writer holds the copy**, so it is never behind its own commit: every
 //! write passes through this store, and a batch's rows are applied to what
@@ -261,6 +262,56 @@ struct Loading {
 /// so a read under way is nearly always answered around, not waited for.
 pub const COUNTS_BEHIND_AT_MOST: Duration = Duration::from_secs(60);
 
+/// The one read there is at a time of any of the listing's counts: each
+/// count's one read ([`Count`]) waits its turn here, so a lake process has
+/// at most one counting statement at the record at any time (dev,
+/// 2026-11-28: about 750 MB of the database's memory a copy against the
+/// database's 3 GiB, and a commit left all three counts behind at once, so
+/// three askers each read a different one).
+#[derive(Default)]
+struct Turn {
+    taken: Mutex<bool>,
+    freed: Condvar,
+}
+
+/// The turn, taken: freed where it is dropped, a panic in the store too.
+struct Taken<'a>(&'a Turn);
+
+impl Turn {
+    /// The turn, waited for to `until` where the asker's request has an end
+    /// to its wait: none where it ended first.
+    fn take(&self, until: Option<Instant>) -> Option<Taken<'_>> {
+        let mut taken = self.taken.lock().expect("the counts' turn is poisoned");
+        while *taken {
+            taken = match until {
+                None => self
+                    .freed
+                    .wait(taken)
+                    .expect("the counts' turn is poisoned"),
+                Some(until) => {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    self.freed
+                        .wait_timeout(taken, left)
+                        .expect("the counts' turn is poisoned")
+                        .0
+                }
+            };
+        }
+        *taken = true;
+        Some(Taken(self))
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        *self.0.taken.lock().expect("the counts' turn is poisoned") = false;
+        self.0.freed.notify_one();
+    }
+}
+
 /// One of the listing's counts, as the record last answered it, and the one
 /// read of it there is at a time (dev, 2026-11-28: a count's statement names
 /// no month, so it opens every month table, about 750 MB of the database's
@@ -272,7 +323,9 @@ pub const COUNTS_BEHIND_AT_MOST: Duration = Duration::from_secs(60);
 /// is no further behind than it may be; and whoever finds nothing to be
 /// answered waits for that read's answer, to the end of its request's wait,
 /// then is refused for load with a retry-after, as it is where the read
-/// fails. Never a second read.
+/// fails. Never a second read. The one to read it waits its [`Turn`] behind
+/// a read of another count, to the end of its request's wait likewise: the
+/// count is being read meanwhile, to whoever else asks.
 struct Count<T> {
     what: &'static str,
     now: Mutex<Counted<T>>,
@@ -362,10 +415,12 @@ impl<T: Clone> Count<T> {
     }
 
     /// The count: what is held, or `read` from the record where this asker
-    /// is the one to read it. A wait for another's read ends at `until`,
-    /// where the asker's request has an end to its wait.
+    /// is the one to read it, in its `turn` among the counts. A wait for
+    /// another's read, or for the turn, ends at `until`, where the asker's
+    /// request has an end to its wait.
     fn asked(
         &self,
+        turn: &Turn,
         until: Option<Instant>,
         behind_at_most: Duration,
         read: impl FnOnce() -> Result<T>,
@@ -420,6 +475,16 @@ impl<T: Clone> Count<T> {
             ended: false,
         };
         drop(now);
+        let Some(_turn) = turn.take(until) else {
+            // Ended as failed where `reading` drops: the next to ask reads.
+            return Err(self.again(
+                "wait their turn behind another of its counts being read, and this request \
+                 waited its while for it",
+            ));
+        };
+        // What it reads holds every batch committed before its turn came.
+        reading.changes = self.now.lock().expect("a count is poisoned").changes;
+        reading.began = Instant::now();
         noted::record();
         let read = read();
         reading.end(read.as_ref().ok().cloned());
@@ -562,7 +627,9 @@ pub struct HotStore {
     /// (step 3d): what it held of one is let go once its ranges changed
     /// group since, as another group may have written it meanwhile.
     held_at: Mutex<HashMap<String, u64>>,
-    /// The listing's counts, each read one at a time ([`Count`]).
+    /// The listing's counts, each read one at a time ([`Count`]), and one
+    /// of them at a time ([`Turn`]).
+    counts_turn: Turn,
     unconverted: Count<BTreeMap<String, u64>>,
     closed_day: Count<BTreeMap<String, (u64, u64)>>,
     quality: Count<BTreeMap<String, (u64, u64, u64)>>,
@@ -621,6 +688,7 @@ impl HotStore {
             wake: Condvar::new(),
             groups: std::sync::RwLock::new(meridian_changes::groups::Groups::one()),
             held_at: Mutex::new(HashMap::new()),
+            counts_turn: Turn::default(),
             unconverted: Count::new("unconverted"),
             closed_day: Count::new("closed-day"),
             quality: Count::new("quality"),
@@ -655,7 +723,9 @@ impl HotStore {
         behind_at_most: Duration,
     ) -> Result<BTreeMap<String, (u64, u64, u64)>> {
         self.quality
-            .asked(until, behind_at_most, || self.inner.quality_counts())
+            .asked(&self.counts_turn, until, behind_at_most, || {
+                self.inner.quality_counts()
+            })
     }
 
     /// What each layer holds: keys and bytes, for the bench and the tests.
@@ -1218,10 +1288,12 @@ impl Store for HotStore {
     }
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
-        self.unconverted
-            .asked(waits_until(), COUNTS_BEHIND_AT_MOST, || {
-                self.inner.unconverted_counts()
-            })
+        self.unconverted.asked(
+            &self.counts_turn,
+            waits_until(),
+            COUNTS_BEHIND_AT_MOST,
+            || self.inner.unconverted_counts(),
+        )
     }
 
     fn remove_before(
@@ -1248,17 +1320,21 @@ impl Store for HotStore {
     }
 
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
-        self.closed_day
-            .asked(waits_until(), COUNTS_BEHIND_AT_MOST, || {
-                self.inner.closed_day_counts()
-            })
+        self.closed_day.asked(
+            &self.counts_turn,
+            waits_until(),
+            COUNTS_BEHIND_AT_MOST,
+            || self.inner.closed_day_counts(),
+        )
     }
 
     fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
-        self.quality
-            .asked(waits_until(), COUNTS_BEHIND_AT_MOST, || {
-                self.inner.quality_counts()
-            })
+        self.quality.asked(
+            &self.counts_turn,
+            waits_until(),
+            COUNTS_BEHIND_AT_MOST,
+            || self.inner.quality_counts(),
+        )
     }
 
     fn assess(&self, assessments: &[Assessment]) -> Result<()> {
