@@ -991,6 +991,41 @@ mod tests {
         }
     }
 
+    /// A deployment admin a user group names by login, who has not signed
+    /// in, is told a core component's notice, as a gap's is
+    /// ([`crate::dataset_gaps::told`]): found in their inbox at their first
+    /// sign-in. Failover-repeat 46090125342 judged the refused notice and
+    /// told nobody, its only deployment admin never signed in. A plugin's
+    /// admin likewise.
+    #[test]
+    fn a_deployment_admin_who_has_not_signed_in_is_told() {
+        let mut records = records();
+        records.people.clear();
+        let mut judge = Judge::default();
+        let opened = judge.judge(
+            &[refused_since("meridian-lake-0", "2026-10-26T07:33:50Z")],
+            T0,
+        );
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-refused"]);
+        assert_eq!(
+            told(&records, &opened[0]),
+            BTreeSet::from(["local|dee".to_string()])
+        );
+        let filed = notices_of(&records, &opened, T0);
+        assert_eq!(filed.len(), 1, "one notice, to the admin not signed in");
+        assert_eq!(filed[0].subject, "local|dee");
+        assert_eq!(filed[0].kind, "component-write-ahead-refused");
+        // Somebody signed in who holds nothing is still told nothing.
+        records.people.push(meridian_domain::v1::SignInRecord {
+            subject: "local|bob".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            told(&records, &opened[0]),
+            BTreeSet::from(["local|dee".to_string()])
+        );
+    }
+
     /// ha runs two dashboards, each asking the conductor on its own minute
     /// and judging (review-F headline 2): one restart, one shed and one
     /// crossing of the budget are each one notice in the one store both
