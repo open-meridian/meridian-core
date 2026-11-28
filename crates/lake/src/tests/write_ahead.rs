@@ -1721,7 +1721,7 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
     while made.is_none() && deleted.elapsed() < Duration::from_secs(120) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Ok(mut stream) = context.get_stream(STREAM).await {
-            made = stream.info().await.ok().map(|info| identity(info));
+            made = stream.info().await.ok().map(identity);
         }
     }
     let marked = gaps(&h, "", GapState::Unspecified);
