@@ -121,6 +121,9 @@ async-trait = "0.1"
 # request handlers on a blocking pool, so a store that blocks is the shape that
 # fits, and an async trait here would be boxed futures at every call site.
 postgres = "0.19"
+# The asynchronous client the blocking one is built on, named for the one
+# place that needs a connection attempt it can stop (the runtime's reach).
+tokio-postgres = "0.7"
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
 # TLS on the deployment's internal paths (ruling 1084; step 3b part 4), off
