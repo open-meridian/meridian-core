@@ -1706,10 +1706,13 @@ async fn guard_forever(
             Ok::<_, String>((standing, held))
         };
         let was = (stuck.is_some(), refusal.is_some());
+        // When the look was sent: a spell of refusals is dated from then,
+        // not from an unanswered look's return at its timeout.
+        let (sent, sent_ns) = (tokio::time::Instant::now(), lake.now_ns());
         match looked.await {
             Err(failed) => {
                 tracing::debug!(%failed, "the write-ahead stream's guard could not look at it");
-                refusal = refused.refused(tokio::time::Instant::now(), lake.now_ns(), &failed);
+                refusal = refused.refused_look(sent, sent_ns, tokio::time::Instant::now(), &failed);
                 if let (Some(words), false) = (&refusal, was.1) {
                     tracing::warn!(stream = STREAM, "{words}");
                 }
