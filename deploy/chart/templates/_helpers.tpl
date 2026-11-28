@@ -48,14 +48,14 @@ the operator the same thing far less clearly.
 {{- /* Ruling 1074: the HA profile's conductor has a standby, and a key the
        conductor generated into a volume is mounted on one node at a time. */ -}}
 {{- if and (eq (include "meridian-runtime.profile" .) "ha") (not .Values.key.existingSecret) -}}
-{{- fail "resilience.profile is ha and the deployment's key is generated into a volume, which one node mounts at a time, so the conductor's standby on another node could not start (ruling 1074). Put the key in a Kubernetes Secret and name it in key.existingSecret (from Vault or cert-manager where you keep keys there), then set resilience.profile: ha." -}}
+{{- fail "resilience.profile is ha and the deployment's key is generated into a volume, which one node mounts at a time, so the conductor's standby on another node could not start. Put the key in a Kubernetes Secret and name it in key.existingSecret (from Vault or cert-manager where you keep keys there), then set resilience.profile: ha." -}}
 {{- end -}}
 
 {{- end -}}
 
 {{/*
 The resilience profile (step 3b; spec/a-deployment-scales-out-and-fails-
-over-by-configuration section 11, question 23; ruling 1052): `tolerant`, the
+over-by-configuration section 11, question 23): `tolerant`, the
 default, today's single-instance shape with the 30 s tolerations; `ha`,
 every count the HA configuration needs turned on by one value, each still
 overridable. Anything else is refused. Takes the chart.
@@ -86,7 +86,7 @@ The counts outside the stores' standbys, each by the profile (section 11):
 the brought database's standbys (0 or 2), the broker's servers (1 or 3), its
 JetStream replicas (0 or 3, only with three servers), the dashboard's copies
 and the analytics coordinators and workers (1 or 2). A count CI does not test
-is refused (requirement 1, ruling 1047). Each takes the chart.
+is refused (requirement 1). Each takes the chart.
 */}}
 {{- define "meridian-runtime.databaseStandbys" -}}
 {{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" (index .Values.database.brought "standbys") "tolerant" 0 "ha" 2) -}}
@@ -98,13 +98,13 @@ is refused (requirement 1, ruling 1047). Each takes the chart.
 
 {{/*
 Who may connect to the brought database from past its own pod: pg_hba.conf
-lines, as a JSON list (v31a item 6). database.brought.pgHba where it is set;
+lines, as a JSON list. database.brought.pgHba where it is set;
 otherwise the chart's own, by the shape it runs in and by internal TLS, as
 they were before they became a value. Each item is one whole line, with no
 comment, line break or continuation in it, and is judged by its fields
 where pg_hba.conf has them, never by how it ends: its method is one of
-pg_hba.conf's, trust only on a local line, and under internal TLS (ruling
-1084) a line that would admit a connection in the clear is refused -- every
+pg_hba.conf's, trust only on a local line, and under internal TLS a line that
+would admit a connection in the clear is refused -- every
 remote line is hostssl, or its method is reject. A line the server would
 not start with is refused too: its address, its mask and its options are
 each checked for their shape. Under Patroni the value must hold a line
@@ -123,7 +123,7 @@ Takes (dict "top" . "patroni" bool "tls" bool).
 {{- $rules = list "hostnossl all all all reject" "hostnossl replication all all reject" "hostssl all all all scram-sha-256" -}}
 {{- else -}}
 {{- /* What postgres:16-alpine's entrypoint appended at initdb, unsynced,
-       into the data directory, where a power loss took it (LazyFS run 2). */ -}}
+       into the data directory, where a crash test's power loss took it. */ -}}
 {{- $rules = list "host all all all scram-sha-256" -}}
 {{- end -}}
 {{- end -}}
@@ -166,7 +166,7 @@ Takes (dict "top" . "patroni" bool "tls" bool).
 {{- fail (printf "database.brought.pgHba has %q, which admits a connection over the network with no credential; trust is for local lines only" .) -}}
 {{- end -}}
 {{- if and $.tls (has $type (list "host" "hostnossl" "hostgssenc" "hostnogssenc")) (ne $method "reject") -}}
-{{- fail (printf "database.brought.pgHba has %q, which admits a connection in the clear; with tls.internal.enabled every remote line is hostssl or its method is reject (ruling 1084)" .) -}}
+{{- fail (printf "database.brought.pgHba has %q, which admits a connection in the clear; with tls.internal.enabled every remote line is hostssl or its method is reject" .) -}}
 {{- end -}}
 {{- $line := . -}}
 {{- range (slice $words 1 (int (add $at 1))) -}}
@@ -223,13 +223,13 @@ host replication all ::1/128 trust
 
 {{/*
 The brought database's record-read replicas (contract v30, stage C; the
-resilience spec's sections 4, 5 and 11, approved 2026-11-11):
+resilience spec's sections 4, 5 and 11):
 database.brought.readReplicas, 0 by default, or 1, the shape CI tests
 (e2e-cluster-scaled). Asynchronous members under Patroni tagged nosync and
 nofailover: never in the synchronous quorum, so a long record read neither
 delays a commit nor is cancelled by replay, and never promoted. A store's
-reader is pointed at one by the chart itself (meridian-runtime.readers,
-approved 2026-11-11), or by its <store>.database.readExistingSecret; the
+reader is pointed at one by the chart itself (meridian-runtime.readers),
+or by its <store>.database.readExistingSecret; the
 HA standbys serve no reads. Takes the chart.
 */}}
 {{- define "meridian-runtime.databaseReadReplicas" -}}
@@ -288,7 +288,7 @@ Takes the chart.
 
 {{/*
 The lake's write-ahead stream (contract v30, stage E; the resilience spec's
-section 4; the rulings of 2026-11-08): where JetStream runs at three -- the
+section 4): where JetStream runs at three -- the
 `ha` profile -- a data plugin's sidecar puts its lake writes in the stream
 first, and the lake's writer records them from it with the stream's
 position. Nothing where it does not. Takes the chart.
@@ -377,7 +377,7 @@ Takes the chart.
 {{- end -}}
 
 {{/*
-One writer per ordering domain (ruling 1060). The lake, the book, the
+One writer per ordering domain. The lake, the book, the
 instrument store, the street store and the conductor's configuration store
 each order their changes in one sequence per partition, taken under a lock
 by the one process that writes it, and the launcher launches as one. A second
@@ -390,7 +390,7 @@ and-fails-over-by-configuration section 1), `<component>.standby`.
 {{- $count := 1 -}}
 {{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
 {{- if gt (int $count) 1 -}}
-{{- fail (printf "%s.replicaCount is %v; it takes 0 or 1. The %s writes as one member: a second replica is a second writer over the same partitions, which corrupts the order its change log keeps (ruling 1060). Add a warm standby with %s.standby: 1, which takes over when the writer's lease lapses, its epoch fencing the old writer (step 3b)." .component $count .what .component) -}}
+{{- fail (printf "%s.replicaCount is %v; it takes 0 or 1. The %s writes as one member: a second replica is a second writer over the same partitions, which corrupts the order its change log keeps. Add a warm standby with %s.standby: 1, which takes over when the writer's lease lapses, and the old writer is fenced off." .component $count .what .component) -}}
 {{- end -}}
 {{- $_ := include "meridian-runtime.standbys" . -}}
 {{- end -}}
@@ -399,7 +399,7 @@ and-fails-over-by-configuration section 1), `<component>.standby`.
 A component's standbys (step 3b; spec section 1, plan 5c): 0, the tolerant
 default, or 1, a warm standby holding no lease that takes the writer's over
 when it lapses. More are refused: a count CI does not test is not offered
-(requirement 1, ruling 1047). Takes a dict: component, values.
+(requirement 1). Takes a dict: component, values.
 */}}
 {{- define "meridian-runtime.standbys" -}}
 {{- $standby := include "meridian-runtime.byProfile" (dict "top" .top "value" (index .values "standby") "tolerant" 0 "ha" 1) -}}
@@ -416,7 +416,7 @@ default, one writer over every partition, as ever. Above it each group owns
 a share of the store's partitions by rendezvous hashing -- the lake's
 datasets, the book's partitions, `control` always group 0's -- and every
 group past the first is a writer Deployment of its own,
-`<release>-<store>-group-<g>` (approved 2026-11-12), with its own Lease and
+`<release>-<store>-group-<g>`, with its own Lease and
 standby (`<store>.standby` counts per group); every member serves the
 store's public writes and hands each to the group owning it. With the
 lake's write-ahead stream on (ha), each group's writer reads the stream
@@ -425,11 +425,11 @@ is refused, and more than 64. Takes a dict: top, component, values.
 */}}
 {{/*
 The book's partitions (step 3d; the resilience spec's section 6.3;
-`bor.partitions`, MERIDIAN_BOR_PARTITIONS ruled 2026-11-13): 1, the default,
+`bor.partitions`, MERIDIAN_BOR_PARTITIONS): 1, the default,
 P0 alone; 1 to 64.
 */}}
 {{- /* A move's bounds (step 3d; section 6.8; MERIDIAN_MOVES_HOLD_SECONDS and
-MERIDIAN_MOVES_SWITCH_SECONDS approved 2026-11-14): the lake's and the
+MERIDIAN_MOVES_SWITCH_SECONDS): the lake's and the
 book's members each told both. A switch shorter than its hold could never
 drain the writes it held, so it is refused. */ -}}
 {{- define "meridian-runtime.movesEnv" -}}
@@ -481,8 +481,8 @@ drain the writes it held, so it is refused. */ -}}
 {{- end -}}
 
 {{/*
-The most writer groups a store allows (PO items 104 and 106, 2026-11-18;
-`lake.maxWriterGroups`, `bor.maxWriterGroups`): 2 by default, 1 to 64. The
+The most writer groups a store allows (`lake.maxWriterGroups`,
+`bor.maxWriterGroups`): 2 by default, 1 to 64. The
 database's connections are counted at it (databaseConnections), so
 `<store>.writerGroups` changed within it never changes max_connections nor
 the database's pods and never restarts the database; raising it does, once.
@@ -501,8 +501,8 @@ A count above it is refused. Takes a dict: top, component, values.
 {{- end -}}
 
 {{/*
-A store's writer groups are raised in ha, not lowered yet (PO items 111,
-option B, and 112, ruled 2026-11-18): an upgrade whose <store>.writerGroups
+A store's writer groups are raised in ha, not lowered yet: an upgrade whose
+<store>.writerGroups
 is below the count the store's writers run at now is refused before
 anything changes, saying why. The book's, in the ha profile, or where the
 running book is ha: its group-0 writer and its standby take a lease
@@ -612,8 +612,8 @@ strategy:
 {{- end -}}
 
 {{/*
-The leases' timing (contract v30, stage C; the resilience spec's section 2,
-approved 2026-11-10): Patroni's rule, `loop_wait + 2 x retry_timeout <=
+The leases' timing (contract v30, stage C; the resilience spec's section 2):
+Patroni's rule, `loop_wait + 2 x retry_timeout <=
 ttl`. Each renewal gives up within leases.renewSeconds, so a lease that
 lasts three renewals outlives one slow answer and a retry; one shorter is
 refused, naming both.
@@ -662,8 +662,8 @@ under (`<component>.readyLagMs`). Takes a dict: top, component, values.
   value: {{ $groups | quote }}
 {{- end }}
 {{- end }}
-{{- /* The book's count of writer groups, to the lake (step 3d, checkpoint 5,
-       item 32): its control writer asks each to raise a plugin shard's epoch
+{{- /* The book's count of writer groups, to the lake: its control writer asks
+       each to raise a plugin shard's epoch
        before it answers a take. Said only with several. */}}
 {{- if eq .component "lake" }}
 {{- $bookGroups := int (include "meridian-runtime.writerGroups" (dict "top" .top "component" "bor" "values" .top.Values.bor)) }}
@@ -1015,8 +1015,8 @@ readinessProbe:
 
 {{/*
   The edge roles, comma-joined: the roles whose plugins keep an external
-  party's raw records and alone may own storage for them (decisions/028,
-  ruled point 1 and its amendment for `reporting`; meridian-design's
+  party's raw records and alone may own storage for them (decisions/028
+  and its amendment for `reporting`; meridian-design's
   matrix/boundaries/roles.yaml marks the same seven `edge: true`). The
   launcher is given this list, and the admission policy on plugin pods reads
   it, so the chart says it once.
@@ -1137,8 +1137,8 @@ spec:
 {{- end -}}
 
 {{/*
-  The storage an instance of several pods shares (step 3d, checkpoint 5,
-  item 30): `<fullname>-shared-storage-<instance>`, a folder per shard,
+  The storage an instance of several pods shares:
+  `<fullname>-shared-storage-<instance>`, a folder per shard,
   mounted by every pod of the instance. ReadWriteMany in
   pluginStorage.shared.storageClassName where one is named; with none, the
   conductor admits such an instance on one node alone, where a
@@ -1176,9 +1176,9 @@ spec:
 {{/*
   The pod the launcher copies an instance's own storage claim into its
   shared storage's `shard-0/` with, once, before its first launch as
-  several pods (step 3d, checkpoint 5, item 30): the instance's own plugin
+  several pods: the instance's own plugin
   image, which the launcher fills in, running the SDK's `meridian-storage
-  copy` as the plugin's own user (PO items 86 and 88), the instance's own
+  copy` as the plugin's own user, the instance's own
   claim read only and its shared claim, and nothing else -- no account's
   token, no secret. It
   writes a marker once the copy is whole, which the instance's pods wait
@@ -1187,7 +1187,7 @@ spec:
 */}}
 {{- define "meridian-runtime.storageCopy" -}}
 {{- $full := include "meridian-runtime.fullname" . -}}
-{{- /* As the plugin's own user (item 86): its image's, or the one the
+{{- /* As the plugin's own user: its image's, or the one the
        cluster assigns, as for its pods -- no uid pinned, which OpenShift
        refuses -- so the copy reads the SDK's 0600 files as their owner and
        what it writes stays theirs to write on. */ -}}
@@ -1252,7 +1252,7 @@ spec:
 
 {{/*
   Whether a backup dumps the database (backup.database; task
-  kernel/a-deployment-is-backed-up-and-restored, approved 2026-10-11): `auto`
+  kernel/a-deployment-is-backed-up-and-restored): `auto`
   when empty, which the backup's script reads as the database this chart
   brings included and one somebody else runs left to its provider; `true` or
   `false` for either. A boolean and its string spelling are one answer.
@@ -1266,7 +1266,7 @@ spec:
 
 {{/*
 The connections the deployment's own pods and jobs hold on the brought
-database at most, counted from what this chart deploys (ruled 2026-11-08):
+database at most, counted from what this chart deploys:
 each store member -- the instrument store, the conductor's configuration
 store, the street store, the book and the lake, writer and standby, and
 during a rollout the one more a standby's surge starts, the lake's and the
@@ -1278,7 +1278,7 @@ once, 6 (the preflight's 1, a migration's 2, a backup's 2 and the members'
 comparison's 1). A store whose database is its own (<store>.database.
 existingSecret) is not counted. In ha each lake member holds 2 more for the
 write-ahead stream's writer, its batch and its position (contract v30,
-stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
+stage E). Kept in step with the pools the binaries open
 (crates/runtime/src/bin). Takes the chart.
 */}}
 {{- define "meridian-runtime.databaseConnections" -}}
@@ -1292,7 +1292,7 @@ stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
 {{- $members = add1 $members -}}
 {{- end -}}
 {{- /* Each writer group's members (step 3d), counted at the most groups
-       the store allows (PO items 104 and 106), so a count changed within
+       the store allows, so a count changed within
        it never changes max_connections and never restarts the database. */ -}}
 {{- if has $component (list "lake" "bor") -}}
 {{- $members = mul $members (int (include "meridian-runtime.maxWriterGroups" (dict "top" $ "component" $component "values" $values))) -}}
@@ -1310,7 +1310,7 @@ stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
 {{- end -}}
 
 {{/*
-The brought database's max_connections (ruled 2026-11-08): what the
+The brought database's max_connections: what the
 deployment holds at most (databaseConnections), 4 kept for the superuser
 (Postgres's superuser_reserved_connections, 3) and Patroni's own, and a
 quarter over that, rounded up -- room for a lost node's connections the
@@ -1332,7 +1332,7 @@ found as connections refused while the new pods start. Takes the chart.
 {{- end -}}
 
 {{/*
-The brought database's memory limit (ruled 2026-11-08): where it runs with
+The brought database's memory limit: where it runs with
 standbys -- the ha profile -- what the preflight's memory judge counts it
 may use, shared buffers and work memory for every connection it allows
 (crates/runtime/src/preflight.rs, judge_memory), with a quarter's room as
@@ -1416,7 +1416,7 @@ loop_wait: 2
 retry_timeout: 5
 maximum_lag_on_failover: 1048576
 {{- /* The synchronous standbys are a quorum (contract v30, stage C; the
-       resilience spec's section 4, approved 2026-11-10): Patroni's
+       resilience spec's section 4): Patroni's
        `synchronous_mode: quorum` gives synchronous_standby_names = 'ANY 1
        (...)' over the two standbys, so either acknowledges and losing one
        neither stalls nor slows a commit; strict still, so a primary cut off
@@ -1667,8 +1667,8 @@ under the pod's. Each takes a dict: top, role.
 {{- end -}}
 
 {{/*
-Internal TLS (values.yaml's tls.internal; ruling 1084; templates/internal-
-tls.yaml). A client's three pieces -- the CA's certificate at
+Internal TLS (values.yaml's tls.internal; templates/internal-tls.yaml). A
+client's three pieces -- the CA's certificate at
 MERIDIAN_INTERNAL_TLS_CA, its mount, its volume -- each nothing with it off,
 so every component that reaches the database or the broker includes all
 three beside its others. A server's certificate and key are its own pods'
@@ -1774,7 +1774,7 @@ CA. */}}
 {{- end -}}
 
 {{/*
-An external database's private CA (database.caSecret; ruled 2026-11-08): the
+An external database's private CA (database.caSecret): the
 Secret it names, its `ca.crt`, mounted in every pod that connects to the
 database, and named to the runtime at MERIDIAN_DATABASE_CA. With it every
 connection is over TLS or not at all, the server verified against that CA by
@@ -1913,7 +1913,7 @@ behind the writer's change log is under `<store>.readyLagMs`. With
 `<store>.database.readExistingSecret` set, the record's past is read from
 that read replica (its URL under the store's database key); unset, with
 the brought database's database.brought.readReplicas above 0, from that
-replica, wired here (contract v30, stage C2, approved 2026-11-11): the
+replica, wired here (contract v30, stage C2): the
 store's own URL on the replica member's host (MERIDIAN_READ_DATABASE_HOST);
 otherwise from the primary. Takes a dict: top, component, values, readUrl,
 rendered.
@@ -1940,7 +1940,7 @@ rendered.
 {{- $env = printf "%s${1}  - name: %s\n${1}    valueFrom:\n${1}      secretKeyRef:\n${1}        name: %s\n${1}        key: %s\n" $env .readUrl $read $key -}}
 {{- else if and .top.Values.database.brought.enabled (not (dig "database" "existingSecret" "" .values)) (gt (int (include "meridian-runtime.databaseReadReplicas" .top)) 0) -}}
 {{- /* The brought database's record-read replica, wired by the chart
-       (contract v30, stage C2; approved 2026-11-11): the store's own URL,
+       (contract v30, stage C2): the store's own URL,
        on the replica's host, so no Secret is edited by hand. */ -}}
 {{- $member := printf "%s-database-%d" (include "meridian-runtime.fullname" .top) (add 1 (int (include "meridian-runtime.databaseStandbys" .top))) -}}
 {{- $host := printf "%s.%s.svc.cluster.local" $member .top.Release.Namespace -}}
@@ -1955,7 +1955,7 @@ rendered.
 {{/*
 The chart's values the resilience profile reads, as the release states them
 (contract v30, stage D; the resilience spec's section 12;
-`MERIDIAN_RESILIENCE_VALUES`, approved 2026-11-11): each count and setting
+`MERIDIAN_RESILIENCE_VALUES`): each count and setting
 of section 11 the profile judges, resolved as the chart resolves it -- by
 the profile where unset -- by its chart path, as JSON on the conductor
 alone. Never a secret, a credential, a Secret's name or an address: counts,
@@ -1998,7 +1998,7 @@ Takes the chart.
 
 {{/*
 A store's databases (step 3d; the resilience spec's section 6.4;
-`lake.databases`, `bor.databases`, approved 2026-11-12): 1, the default, to
+`lake.databases`, `bor.databases`): 1, the default, to
 its writer groups' count -- writer group g writes to database g mod the
 count, so one past the groups would hold nothing. With the database this
 chart brings, the chart brings each past the first; with one somebody else
@@ -2040,7 +2040,7 @@ own nor any group Secrets.
 {{/*
 Each database past the first the chart brings, every store's (step 3d;
 section 6.4): a JSON list of {component, d, name}, the name
-`<release>-<store>-database-<d>` (approved 2026-11-12).
+`<release>-<store>-database-<d>`.
 */}}
 {{- define "meridian-runtime.extraDatabases" -}}
 {{- $out := list -}}
@@ -2060,7 +2060,7 @@ section 6.4): a JSON list of {component, d, name}, the name
 
 {{/*
 A store member's databases past the first (step 3d; section 6.4; the
-variables approved 2026-11-14): MERIDIAN_<STORE>_DATABASES, and each
+variables): MERIDIAN_<STORE>_DATABASES, and each
 database d's URL as MERIDIAN_<STORE>_DATABASE_URL_<d> -- from the Secret
 the chart brings with it, or the group Secret named -- and, where the chart
 brings it read replicas, its replica's as MERIDIAN_<STORE>_READ_DATABASE_URL_<d>.

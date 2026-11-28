@@ -1,10 +1,10 @@
 {{- include "meridian-runtime.require" . -}}
 {{/*
   A plugin shard's Lease, `<instance>-shard-<n>`, is never deleted, a
-  cluster administrator's delete included (PO item 57): its leaseTransitions
+  cluster administrator's delete included: its leaseTransitions
   fence the shard's writes, so it is kept, and goes only with its namespace.
   Rendered wherever shard Leases are: a sidecars[] instance of several pods
-  (item 31), and a launcher with a shape for them; where the cluster has
+ , and a launcher with a shape for them; where the cluster has
   ValidatingAdmissionPolicy (Kubernetes 1.30 and later). Short of acting as
   one of Kubernetes' own controllers while the namespace is deleted, only
   removing this policy or its binding gets past it (review c5b2 L2, Info 1).

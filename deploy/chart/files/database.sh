@@ -10,7 +10,7 @@ set -eu
 # the image's postgres user's, as that entrypoint makes it, and Patroni run
 # as that user, never as root. A cluster that runs pods as its own user
 # (podSecurityContext) starts here as that user instead.
-# Internal TLS (tls.internal; ruling 1084): the chart's certificate copied
+# Internal TLS (tls.internal): the chart's certificate copied
 # where the server's user alone reads its key, as Postgres requires of one.
 if [ -d /etc/meridian-internal-tls-server ] && [ ! -e /run/meridian-tls/tls.key ]; then
   mkdir -p /run/meridian-tls
@@ -29,7 +29,7 @@ fi
 umask 0077
 # Patroni's REST API on this member: over TLS by the member's own name,
 # verified against the internal CA, where the chart serves it so (internal
-# TLS; ruled 2026-11-08); in the clear on 127.0.0.1 otherwise.
+# TLS); in the clear on 127.0.0.1 otherwise.
 api() {
   path=$1
   shift

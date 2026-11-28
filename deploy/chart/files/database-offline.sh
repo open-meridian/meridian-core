@@ -17,8 +17,8 @@
 #                     sections): the same, to the last commit the archive
 #                     holds, along its newest timeline -- where the
 #                     deployment was when it stopped.
-#   enable-checksums  `meridian upgrade-deployment --enable-checksums` (ruling
-#                     1058): PostgreSQL's pg_checksums --enable on the
+#   enable-checksums  `meridian upgrade-deployment --enable-checksums`:
+#                     PostgreSQL's pg_checksums --enable on the
 #                     volume, once it is shut down cleanly (started and
 #                     stopped once if it was not). Proportional to its size.
 #

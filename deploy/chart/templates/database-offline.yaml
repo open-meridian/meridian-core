@@ -89,7 +89,7 @@ spec:
 {{/*
   What is done to the brought database's volume while it is stopped (step
   3b; spec/a-deployment-scales-out-and-fails-over-by-configuration sections 4
-  and 9, ruling 1058): a restore from the WAL archive to a point in time,
+  and 9): a restore from the WAL archive to a point in time,
   for `meridian restore --to-time`, or to the archive's end, for `meridian
   restore --to-archive-end` (step 3c), each along the timeline the archive's
   history says, and page checksums turned on in an existing database, for

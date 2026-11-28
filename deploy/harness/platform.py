@@ -1,5 +1,5 @@
-"""A stand-in for the platform's master, for the harness (contract v20, W3.1;
-the 2026-10-11 ruling: a currency the master holds is pulled, never minted).
+"""A stand-in for the platform's master, for the harness (contract v20, W3.1:
+a currency the master holds is pulled, never minted).
 
 It holds a handful of currencies, each by its ISO 4217 code, and answers a
 resolve by that code with its record; anything else, that it holds nothing.
@@ -56,8 +56,8 @@ whose attestations are Sigstore bundles, as ghcr.io does. A version it
 lists with an altered layer is served altered, as a tampered registry
 would.
 
-From contract v26 (W1.30, W3.29; the v26 plan's item 7, rulings 199 and
-204) it mints binary event contracts by venue symbol: a matching request for
+From contract v26 (W1.30, W3.29) it mints binary event contracts by venue
+symbol: a matching request for
 an event contract naming the venue's symbol as `ticker`, its `source` the
 venue's MIC (Kalshi's KLSH) or, for a venue with none, its `VEN-` ID
 (Polymarket's), is answered with a record minted for it, as the binary event
@@ -71,12 +71,12 @@ template catalogue carries v26's versions with their calculation packages
 (W1.24): cash, equity, and the binary event contract with its bounds.
 See V26 below.
 
-From contract v28 (W1.32; ruling 612) it answers POST
+From contract v28 (W1.32) it answers POST
 /api/v1/reference/match-company: a company its source confirms by CIK (or
 the LEI it holds for one), minted `ENT-` on first asking and matched after,
 any other queued for its staff; its licence list carries `cik`.
 
-From contract v28 (W3.33; rulings 757, 775 and 778) it answers POST
+From contract v28 (W3.33) it answers POST
 /api/v1/reference/instrument-candidates, the instrument picker's search: the
 test equity it holds (Apple Inc., by its `INS-` ID) for a query naming it,
 then two funds it does not hold -- SPDR S&P 500 ETF Trust (SPY) on its US
@@ -308,7 +308,7 @@ CRYPTO = {
     )
 }
 
-# Polymarket's collateral, which its contracts pay out in (ruling 550): pUSD,
+# Polymarket's collateral, which its contracts pay out in: pUSD,
 # a cash record of the platform's, by its token on Polygon and by
 # Polymarket's own symbol for it, as the platform's record carries them.
 PUSD_CAIP19 = "eip155:137/erc20:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
@@ -325,7 +325,7 @@ PUSD = {
 
 # What each event venue's contracts pay out when the source offers no
 # currency (v27 stage E): the venue's own payout instrument -- Polymarket's
-# 1 pUSD (ruling 550) -- never USD by default; Kalshi and Polymarket US pay
+# 1 pUSD -- never USD by default; Kalshi and Polymarket US pay
 # dollars.
 VENUE_PAYOUTS = {
     POLYMARKET["venue_id"]: {"amount": "1", "currency_code": "",
@@ -374,7 +374,7 @@ REFERENTIAL_SEEDS = (
     ("ustreasury", "Daily Treasury Bill Rates", "rate_curve", "USD", "Daily Treasury bill rates", ""),
     ("frb", "feds200628", "rate_curve", "USD",
      "Treasury zero-coupon yield curve (Federal Reserve Board)", ""),
-    # H.15's other series (ruling 541; meridian-platform 932da80).
+    # H.15's other series (meridian-platform 932da80).
     ("frb", "Treasury bills secondary market", "rate_curve", "USD",
      "Treasury bill secondary market rates, 4-week to 1-year (H.15)", ""),
     ("frb", "AA nonfinancial commercial paper", "rate_curve", "USD",
@@ -456,7 +456,7 @@ def calendars_for(one, many):
 
 V24 = os.environ.get("HARNESS_PLATFORM_V24", "1") != "0"
 # The administrator_symbol family and the administrators it admits, as the
-# platform lists them (ruling 545): a symbol whose source is one of these.
+# platform lists them: a symbol whose source is one of these.
 LICENCE = {
     "version": 1,
     "schemes": [s for s in (os.environ.get("HARNESS_LICENCE")
@@ -534,7 +534,7 @@ TEMPLATES.append({**TEMPLATES[0], "template_id": "TPL-fund", "name": "ETF and mu
                   "asset_class": "fund",
                   "match_rule": ["share_class_figi", "composite_figi", "figi", "ticker",
                                  "sec_series", "sec_class"]})
-# Contract v29 (W1.1, W1.24; rulings 676 to 680): the bond and pool
+# Contract v29 (W1.1, W1.24): the bond and pool
 # templates with their requirement levels, and the debt records its sources
 # confirm -- a corporate by its FIGI, minted with its calls still to read
 # from the pricing supplement (the plan's risk 3), its own record saying so,
@@ -640,7 +640,7 @@ EVENT_GROUPS = {}
 
 def event_venue(source):
     """The venue a symbol sent as `ticker` names: by its MIC, or by its
-    `VEN-` ID where it has none (W3.4's spelling, ruled 2026-10-14)."""
+    `VEN-` ID where it has none (W3.4's spelling)."""
     if source in EVENT_VENUES:
         return EVENT_VENUES[source]
     return next((v for v in EVENT_VENUES.values()
@@ -785,7 +785,7 @@ def match_or_mint(asked):
     return answer
 
 
-# Contract v28 (W1.32; ruling 612): the companies its source -- EDGAR's
+# Contract v28 (W1.32): the companies its source -- EDGAR's
 # company list -- confirms, by CIK, each minted `ENT-` on first asking and
 # matched after; any other CIK or LEI its staff's queue. The CIK is on the
 # licence list among the SEC's identifiers (W1.32, W3.25).
@@ -828,7 +828,7 @@ def company(asked):
     return answer
 
 
-# ── Contract v28 (W3.33; rulings 757, 775, 778): the picker's search ──────
+# ── Contract v28 (W3.33): the picker's search ──────
 
 # Ruling 779: the platform's one venue for the "US composite" venue, with
 # no MIC, a ticker minted on a US composite held on it by its VEN- ID.
@@ -1015,7 +1015,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.answer(404, {"detail": "Not Found"})
             if url.path.endswith("/templates"):
                 # As the platform: after_version only beside a subject
-                # (template_id or asset_class; W3.24, ruled 2026-10-14).
+                # (template_id or asset_class; W3.24).
                 template_id, asset_class = one("template_id"), one("asset_class")
                 if one("after_version") and not (template_id or asset_class):
                     return self.answer(400, {"detail": "after_version needs a subject: "
@@ -1060,7 +1060,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif (url.path == "/api/v1/reference/identifiers/resolve"
                 and one("scheme") == "symbol" and one("source") in LICENCE["administrators"]
                 and (one("value"), one("source")) in REFERENTIAL_BY_SYMBOL):
-            # Contract v27 (ruling 545): a seeded referential record by its
+            # Contract v27: a seeded referential record by its
             # administrator's code, found only with that administrator named.
             body = json.dumps({"found": True,
                                "instrument": REFERENTIAL_BY_SYMBOL[(one("value"), one("source"))],
@@ -1123,12 +1123,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             HEARD.append({"method": "POST", "path": url.path, "body": asked})
             return self.answer(200, event_group(asked))
         if url.path == "/api/v1/reference/match-company":
-            # Contract v28 (W1.32; ruling 612): a company, matched or minted.
+            # Contract v28 (W1.32): a company, matched or minted.
             HEARD.append({"method": "POST", "path": url.path, "body": asked})
             return self.answer(200, company(asked))
         if url.path == "/api/v1/reference/instrument-candidates" and V24:
             # Contract v28 (W3.33): the picker's search; what was typed is
-            # neither kept nor heard (ruling 761).
+            # neither kept nor heard.
             return self.answer(200, candidates(asked))
         if url.path in ("/api/v1/reference/escalate-instrument", "/api/v1/reference/usage-reports"):
             HEARD.append({"method": "POST", "path": url.path, "body": asked})

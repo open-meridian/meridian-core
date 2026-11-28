@@ -14,7 +14,7 @@
   backup.sh), and expires those beyond backup.keep; the offline Job restores
   a stopped member's volume to a time (files/database-offline.sh, for
   `meridian restore --to-time`). The archive is encrypted with a passphrase
-  the chart keeps and every backup carries sealed (ruling 1084).
+  the chart keeps and every backup carries sealed.
 */}}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $tlsName := printf "%s-database-tls" $full }}

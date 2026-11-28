@@ -113,11 +113,12 @@ and source shown). It changes nothing: a change it names is made by meridian upg
         "read_resilience",
         "Read the deployment's members, partitions and history",
         "each member of each component as it reported last (its mode writer, standby or reader, \
-zone, lag behind its writer in ms, partitions and restarts), each partition of the lake and the \
-book with its writer and epoch, and a page of the history, newest first: each takeover of a \
-writer, integrity finding and switch of a default read's source (cursor: next_cursor from the \
-page before), the book's own among them, and each plugin shard's take with its epoch. Answers \
-`unchanged`.",
+zone, lag behind its writer in ms, partitions and restarts, its health -- serving, degraded, \
+stopping or not said -- and its detail, the words it said that health with), each partition of \
+the lake and the book with its writer and epoch, and a page of the history, newest first: each \
+takeover of a writer, integrity finding and switch of a default read's source (cursor: \
+next_cursor from the page before), the book's own among them, and each plugin shard's take with \
+its epoch. Answers `unchanged`.",
         true,
         history_schema,
     ),

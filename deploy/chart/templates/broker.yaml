@@ -43,7 +43,7 @@
   under its own set's members. Deliveries in flight across the change are
   caught up by sequence and requests not answered are asked again, as for
   a lost server (section 4). The set without JetStream has no volumes. The
-  JetStream set's volumes go with it (item 191, ruled 2026-11-19): a return
+  JetStream set's volumes go with it: a return
   to JetStream starts it afresh, its streams made again, and never on the
   state its servers kept before, which they could not agree on again (CI
   44556229125). Writes the stream still held at the switch were never
@@ -372,7 +372,7 @@ spec:
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   {{- if gt $jetstream 0 }}
   # JetStream's volumes are deleted with the set, and kept while it is
-  # scaled (item 191): `meridian upgrade-deployment` deletes any left by a
+  # scaled: `meridian upgrade-deployment` deletes any left by a
   # set that went before this.
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Delete
@@ -426,7 +426,7 @@ spec:
         # instances above and the plugins launched since, written by the same
         # binary this repository generates its committed copy with; and the
         # broker, run as that process's child so a launch reloads it without
-        # a restart (spec/the-local-plugin-registry, decision 3). The
+        # a restart (spec/the-local-plugin-registry). The
         # configuration lives and dies with the pod, and holds no password:
         # the chart's instances' are read from the environment, a launched
         # plugin's is checked against a hash. It states the broker's
@@ -479,7 +479,7 @@ spec:
             - /data/jetstream
             {{- end }}
             {{- if .Values.tls.internal.enabled }}
-            # Every client and route over TLS, or not at all (ruling 1084),
+            # Every client and route over TLS, or not at all,
             # with the chart's certificate for the broker's names.
             - --tls
             - /etc/meridian-internal-tls-server

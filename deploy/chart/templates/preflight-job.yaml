@@ -1,7 +1,7 @@
 {{- include "meridian-runtime.require" . -}}
 {{- if .Values.preflight.enabled }}
 {{/*
-  The upgrade preflight (H1, ruling 586; kernel/an-upgrade-is-checked-before-
+  The upgrade preflight (H1; kernel/an-upgrade-is-checked-before-
   it-is-applied): the release being installed checks the deployment it is
   about to change, and changes nothing.
 
@@ -52,7 +52,7 @@
 {{- end }}
 {{- $backups := and $b.recipient (or $b.path $b.existingClaim) $claimNow }}
 {{- /* The database's own volume, mounted read-only so the check reads the
-       free space of the filesystem it is on (item 211): a `local-path`
+       free space of the filesystem it is on: a `local-path`
        volume and the like is a directory of its node's disk, held to no
        size, so its declared size says nothing about what a migration has
        room for (the dev deployment's database, 23.1 GiB on a 20Gi volume

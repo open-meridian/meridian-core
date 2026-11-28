@@ -62,7 +62,7 @@ spec:
               value: {{ include "meridian-runtime.fullname" . }}-bor
             {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "bor" "values" $.Values.bor) | nindent 12 }}
             # The deployment each change of its log is made in (step 3a,
-            # the change log's origin; ruling 1049).
+            # the change log's origin).
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
             # The hot layer's bound, in MiB (step 3a).
@@ -114,7 +114,7 @@ spec:
        Deployment in a reads-only mode, `bor.readers` of them. */}}
 {{ include "meridian-runtime.readers" (dict "top" $ "component" "bor" "values" .Values.bor "readUrl" "MERIDIAN_BOR_READ_DATABASE_URL" "rendered" (include "meridian-runtime.bor.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "bor" "values" $.Values.bor) }}
-{{- /* Never lowered in ha (PO item 111). */}}
+{{- /* Never lowered in ha. */}}
 {{- include "meridian-runtime.writerGroupsNotLowered" (dict "top" $ "component" "bor" "values" .Values.bor) }}
 {{- /* Each writer group past the first (step 3d): its own writer
        Deployment, Lease and standby, `bor.writerGroups` in all. */}}

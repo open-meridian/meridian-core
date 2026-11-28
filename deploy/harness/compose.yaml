@@ -298,7 +298,7 @@ services:
       - secrets:/secrets:ro
 
   # The platform's master, a stand-in holding a handful of currencies
-  # (contract v20, W3.1; the 2026-10-11 ruling): a currency the deployment
+  # (contract v20, W3.1): a currency the deployment
   # does not hold is pulled from it, never minted. Every other record a
   # plugin names is the deployment's own (contract v10).
   platform:

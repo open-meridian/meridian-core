@@ -84,7 +84,7 @@ if [ "$key" = generated ]; then
 	say "the deployment's key, from its volume"
 fi
 
-# Each edge plugin's storage (decisions/028; ruling 828). The claims are made
+# Each edge plugin's storage (decisions/028). The claims are made
 # by the launcher as plugins are launched, which this Job, holding no RBAC,
 # cannot list: `meridian backup` lists them and mounts each, read-only, at
 # /in/storage/<claim>, naming them in MERIDIAN_BACKUP_STORAGE and describing
@@ -241,7 +241,8 @@ if [ -n "${MERIDIAN_BACKUP_HOLD:-}" ]; then
 fi
 # On disk before it carries its final name, and the name on disk before this
 # says it wrote one: a power loss otherwise leaves a backup that is there,
-# named whole, and empty (the deployment's key was, LazyFS run 2). `sync` here
+# named whole, and empty (a crash test left the deployment's key so). `sync`
+# here
 # is coreutils', which syncs the file or the folder it is given.
 sync "$partial" || { rm -f "$partial"; fail "the backup could not be synced to disk"; }
 mv "$partial" "/backups/$name"

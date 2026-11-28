@@ -469,9 +469,8 @@ fn never_syncs_always(configuration: &str) -> Result<(), String> {
     });
     if syncs {
         return Err(
-            "the broker's configuration has JetStream sync every write (sync_interval: \
-                    always), which is never set (PO 2026-11-20: its cost measured, the exposure \
-                    until v32 accepted)"
+            "the broker's configuration sets JetStream to sync every write (sync_interval: \
+                    always), which this deployment doesn't support; remove it"
                 .to_string(),
         );
     }
@@ -684,7 +683,10 @@ mod tests {
         ] {
             let refused = super::never_syncs_always(said).unwrap_err();
             assert!(refused.contains("sync_interval: always"), "{refused}");
-            assert!(refused.contains("2026-11-20"), "{refused}");
+            assert!(
+                refused.ends_with("which this deployment doesn't support; remove it"),
+                "{refused}"
+            );
         }
         let written = super::clustered("b", &[], "256MB", "/data/jetstream", "16MB", "");
         assert_eq!(super::never_syncs_always(&written), Ok(()));

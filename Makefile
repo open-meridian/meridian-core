@@ -3369,7 +3369,7 @@ chart-check:
 			|| { echo "chart-check FAILED: $$store.replicaCount=1 did not render" >&2; exit 1; }; \
 		said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set $$store.replicaCount=2 2>&1 >/dev/null)" \
 			&& { echo "chart-check FAILED: $$store.replicaCount=2 rendered; two writers over one partition corrupt its order (ruling 1060)" >&2; exit 1; }; \
-		echo "$$said" | grep -q "$$store.replicaCount is 2; it takes 0 or 1.*ruling 1060" \
+		echo "$$said" | grep -q "$$store.replicaCount is 2; it takes 0 or 1.*corrupts the order its change log keeps\. Add a warm standby" \
 			|| { echo "chart-check FAILED: $$store.replicaCount=2 was refused without saying why: $$said" >&2; exit 1; }; \
 	done
 	@# Step 3b: a warm standby is a value. With `<component>.standby: 1` a
@@ -3557,7 +3557,7 @@ chart-check:
 		|| { echo "chart-check FAILED: a database made by a fresh install has no page checksums" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: the ha profile rendered with a generated key (ruling 1074)" >&2; exit 1; }; \
-	echo "$$said" | grep -q "ruling 1074" \
+	echo "$$said" | grep -q "could not start\. Put the key in a Kubernetes Secret" \
 		|| { echo "chart-check FAILED: the ha profile with a generated key was refused without saying why: $$said" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=warm 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: resilience.profile=warm rendered" >&2; exit 1; }; true

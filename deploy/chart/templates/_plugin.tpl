@@ -41,7 +41,7 @@
 {{- fail (printf "%s is given %d shards; at most 64 (PluginDeclaration.most_shards)" .instance $shards) -}}
 {{- end -}}
 {{- /* A launched instance of several pods keeping storage shares one claim,
-       its shared storage (item 30), which the launcher makes, copying the
+       its shared storage, which the launcher makes, copying the
        instance's own claim into it first where one is kept. A sidecars[]
        instance has no launcher to copy its own claim, so its storage stays
        one pod's. */ -}}
@@ -72,7 +72,7 @@ metadata:
   {{- if .launched }}
   annotations:
     # The roles it was approved with (W8.3), which the broker\'s process reads
-    # to admit its credential with their topics (the registry spec, decision 3).
+    # to admit its credential with their topics (the registry spec).
     meridian.dev/roles: {{ .roles | quote }}
   {{- end }}
 spec:
@@ -121,7 +121,7 @@ spec:
         Named for its instance under the one Service every plugin shares
         (sidecars.yaml), so `{instance}.{release}-sidecars` resolves to this
         pod and nothing else: how the dashboard reaches its front door, with
-        no Service made per plugin (the registry spec, decision 4). An
+        no Service made per plugin (the registry spec). An
         instance of several pods (step 3d) resolves to each of its shards
         that is ready -- never its standby, whose front door is closed --
         and a page request reaches any one of them: the instance's page is
@@ -134,7 +134,7 @@ spec:
       {{- /*
         Several pods of the instance (step 3d): each sidecar takes a shard's
         Lease under its instance's own account, whose Role names that
-        instance's shards' Leases alone (checkpoint 5, item 31): made by the
+        instance's shards' Leases alone: made by the
         launcher for a launched instance, by this chart for a sidecars[]
         one (meridian-runtime.shardsAccount). Its token is mounted in the
         sidecar's container alone, below; the plugin's holds none.
@@ -233,7 +233,7 @@ spec:
               value: {{ $top.Values.logLevel | quote }}
             {{- if $several }}
             {{- /* Its instance's shard count, this pod's name and the
-                   leases' timing (step 3d; approved 2026-11-15): it serves
+                   leases' timing (step 3d): it serves
                    its plugin once a shard's Lease is its own. */}}
             {{- include "meridian-runtime.leaseTiming" $top }}
             - name: MERIDIAN_PLUGIN_SHARDS
@@ -274,7 +274,7 @@ spec:
             - name: MERIDIAN_DASHBOARD_KEYS_DIR
               value: /etc/meridian/dashboard-keys
             {{- if $top.Values.tls.internal.enabled }}
-            {{- /* Served over TLS alone (ruling 1084), under the sidecars'
+            {{- /* Served over TLS alone, under the sidecars'
                    names, the dashboard verifying it against the CA. */}}
             - name: MERIDIAN_INTERNAL_TLS_CERT
               value: /etc/meridian-internal-tls-server/tls.crt
@@ -351,7 +351,7 @@ spec:
           It is given the sidecar's address and nothing else of the sidecar's.
           No broker credential -- that seam is the boundary. And not its
           roles: a plugin that named its own roles would be
-          choosing its own privileges (decision 007), so it learns them from
+          choosing its own privileges, so it learns them from
           the sidecar's reply to registration instead.
 
           A sidecar with no plugin still renders, alone, as it did before this
@@ -381,9 +381,9 @@ spec:
             - name: MERIDIAN_SIDECAR_ADDRESS
               value: {{ $top.Values.sidecar.address | quote }}
             {{- /*
-              Where it runs and as which account, from the downward API (PO
-              item 64): what the SDK names when the archive's bucket refuses
-              the account (item 60).
+              Where it runs and as which account, from the downward API:
+              what the SDK names when the archive's bucket refuses
+              the account.
             */}}
             - name: MERIDIAN_POD_NAMESPACE
               valueFrom:
@@ -399,7 +399,7 @@ spec:
             {{- end }}
             {{- if $several }}
             {{- /* Its instance's shard count, the value and meaning its
-                   sidecar is given (PO item 73, 2026-11-17); unset, an
+                   sidecar is given; unset, an
                    instance of one pod. Which shard it serves it learns at
                    registration (RegisterReply.shard). */}}
             - name: MERIDIAN_PLUGIN_SHARDS
@@ -487,7 +487,7 @@ spec:
           persistentVolumeClaim:
             {{- if $several }}
             {{- /* Several pods of the instance share its storage, a folder
-                   per shard (step 3d, checkpoint 5, item 30). */}}
+                   per shard. */}}
             claimName: {{ include "meridian-runtime.fullname" $top }}-shared-storage-{{ .instance }}
             {{- else }}
             claimName: {{ include "meridian-runtime.fullname" $top }}-storage-{{ .instance }}
@@ -507,8 +507,8 @@ spec:
 {{- end -}}
 
 {{/*
-  A sidecars[] instance of several pods' own account (step 3d, checkpoint 5,
-  item 31), as the launcher makes a launched one's: a ServiceAccount, and a
+  A sidecars[] instance of several pods' own account, as the launcher makes a
+  launched one's: a ServiceAccount, and a
   Role and RoleBinding of its name, `<fullname>-shards-<instance>`, the Role
   granting `get` and `update` on exactly the instance's shards' Leases, by
   name -- RBAC names no prefix and cannot narrow `create` to a name -- so

@@ -130,7 +130,7 @@ spec:
             - name: MERIDIAN_INSTANCE_ID
               value: first-run
             # Its own broker credential, not the runtime's: what the wizard
-            # seals reaches this Job and nothing else (ruling 5).
+            # seals reaches this Job and nothing else.
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
