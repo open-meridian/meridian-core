@@ -5716,7 +5716,7 @@ def gap_notices():
         # first, the subject whole after them.
         parts = line.split("|", 2)
         if len(parts) == 3 and parts[0].startswith("GAP-") and parts[1].strip().isdigit():
-            found.setdefault(parts[0].split()[0], []).append((int(parts[1]), parts[2].strip()))
+            found.setdefault(parts[0].split()[0].rstrip(":"), []).append((int(parts[1]), parts[2].strip()))
     return found
 
 

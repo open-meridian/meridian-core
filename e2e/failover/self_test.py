@@ -1189,5 +1189,20 @@ class BrokerDiskFullAsserted(unittest.TestCase):
         self.assertEqual(run.outside_gaps(["a", "b"], acked, windows), ["b"])
 
 
+
+class GapNotices(unittest.TestCase):
+    """What core#160's PR CI 46136597669 (failover, ha) met: the dashboard's
+    words for a gap not yet tied to a dataset became "GAP-…: rows held …", and
+    `gap_notices` keyed that notice "GAP-…:", so the gap's notice was not found.
+    A notice is keyed by its gap's ID however its words go on."""
+
+    def test_each_notice_is_keyed_by_its_gaps_id_whatever_follows_it(self):
+        said = ("GAP-01A: rows held in the lake's write-ahead stream from x to y (stream time) were lost.|10|local|alice\n"
+                "GAP-01B in drive-data:drive, valid from x to y: unrecovered. Rows held …|20|local|alice")
+        with mock.patch.object(run, "psql", lambda *a, **k: said):
+            found = run.gap_notices()
+        self.assertEqual(sorted(found), ["GAP-01A", "GAP-01B"])
+        self.assertEqual(found["GAP-01A"], [(10, "local|alice")])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
