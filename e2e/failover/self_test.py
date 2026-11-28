@@ -589,10 +589,200 @@ class StoreLogsKept(unittest.TestCase):
     def test_each_upgrade_of_the_class_keeps_them_first(self):
         order = []
         with mock.patch.object(run, "keep_store_logs", lambda when: order.append(("kept", when))), \
+                mock.patch.object(run, "follow_store_logs", lambda when: order.append(("followed", when))), \
                 mock.patch.object(run, "upgrade", lambda *sets: order.append(("upgraded", sets))):
             run.upgrade_kept("lake.databases=2", "bor.databases=2")
-        self.assertEqual([what for what, _ in order], ["kept", "upgraded"], order)
+        self.assertEqual([what for what, _ in order], ["kept", "followed", "upgraded"], order)
         self.assertIn("lake.databases=2", order[0][1])
+
+
+class Taken:
+    """psql as `takeovers_since` calls it, per database pod: how many
+    takeovers each store's database recorded since, and each one."""
+
+    ROWS = {("book", "db-0"): "2|9 bor-0 1.5 assigned; 10 bor-group-1-0 2.0 assigned",
+            ("book", "db-1"): "1|11 bor-old-0 3.1 assigned",
+            ("lake", "db-0"): "0|",
+            ("lake", "db-1"): "1|7 lake-group-1-0 0.4 lease free"}
+
+    def __init__(self, failing=False):
+        self.failing, self.asked = failing, []
+
+    def __call__(self, sql, database="meridian", quiet=False, pod=None):
+        self.asked.append((sql, pod))
+        if self.failing:
+            raise SystemExit("psql: no answer")
+        store = "book" if "book_writer_took_over" in sql else "lake"
+        return self.ROWS[(store, pod)]
+
+
+class RaiseEvidence(unittest.TestCase):
+    """Merge-queue run 46082830508 ("rollout-ha-groups-raised (bor)", 11.9 s
+    against 10 s): the book's writers took its partitions from each other
+    through a writer-group raise, and nothing the run kept said who. The
+    record does (`book_writer_took_over`, `lake_writer_took_over`); the old
+    members' logs are gone with the rollout before `rollout_served` reads
+    (the CTO's check of 2026-11-27)."""
+
+    def served(self, bor_held=True, failing=False):
+        """`rollout_served` of one rollout, the book's claim held or not:
+        what it printed, the members' logs it kept, the figures, and the
+        databases asked."""
+        import contextlib
+        import io
+        kept, taken, printed = [], Taken(failing), io.StringIO()
+        with Driven(), \
+                mock.patch.object(run, "claim", lambda s, failure, component, *_: bor_held or component != "bor"), \
+                mock.patch.object(run, "store_databases", lambda store: [(0, "db-0"), (1, "db-1")]), \
+                mock.patch.object(run, "psql", taken), \
+                mock.patch.object(run, "keep_store_logs", kept.append), \
+                contextlib.redirect_stdout(printed):
+            run.rollout_served(Checks(), "ha-groups-raised", 1_000, 2, False)
+            figures = open(run.FIGURES).read() if os.path.exists(run.FIGURES) else ""
+        return printed.getvalue(), kept, figures, taken.asked
+
+    def test_a_failed_rollout_claim_prints_every_takeover_since_it_began_in_every_database(self):
+        said, kept, _, asked = self.served(bor_held=False)
+        for row in Taken.ROWS.values():
+            for took in row.split("|", 1)[1].split("; "):
+                if took:
+                    self.assertIn(took, said)
+        self.assertIn("the book's takeovers in database 1", said)
+        self.assertIn("the lake's takeovers in database 0 (epoch, member, seconds from the rollout's start, why): "
+                      "none", said)
+        self.assertTrue(all("at_ns >= 1000000000" in sql for sql, _ in asked), asked)
+
+    def test_a_failed_rollout_claim_keeps_the_surviving_members_logs(self):
+        _, kept, _, _ = self.served(bor_held=False)
+        self.assertEqual(kept, ["rollout-ha-groups-raised: bor past its bound"])
+
+    def test_the_takeover_count_is_printed_and_a_figure_on_every_run(self):
+        said, kept, figures, _ = self.served(bor_held=True)
+        self.assertIn("the book's takeovers since the rollout began: 3, over 2 database(s)", said)
+        self.assertIn("the lake's takeovers since the rollout began: 1, over 2 database(s)", said)
+        self.assertIn('"took_over": 3', figures)
+        self.assertNotIn("takeovers in database", said, "the rows printed only for a claim missed")
+        self.assertEqual(kept, [])
+
+    def test_a_takeover_read_that_fails_is_said_and_never_ends_the_run(self):
+        said, kept, _, _ = self.served(bor_held=False, failing=True)
+        self.assertIn("the book's takeovers since the rollout began were not read: psql: no answer", said)
+        self.assertEqual(kept, ["rollout-ha-groups-raised: bor past its bound"])
+
+
+class Following:
+    """`follow_logs_of` stood in for: each pod's follower writes its lines
+    and ends at once (its pod gone), runs past its bound, or runs until it
+    is killed."""
+
+    def __init__(self, ends="at once"):
+        self.ends, self.started, self.killed = ends, [], []
+
+    def __call__(self, name, sink):
+        sink.write(f"{name} said its last lines\n".encode())
+        sink.flush()
+        self.started.append(name)
+        return Follower(self, name)
+
+
+class Follower:
+    def __init__(self, following, name):
+        self.following, self.name, self.returncode = following, name, None
+        self.gone = threading.Event()
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        import subprocess
+        if self.gone.is_set():
+            return self.returncode
+        if self.following.ends == "at once":
+            self.returncode = 0
+            return 0
+        if self.following.ends == "past its bound":
+            raise subprocess.TimeoutExpired("kubectl", timeout)
+        self.gone.wait()
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+        self.following.killed.append(self.name)
+        self.gone.set()
+
+
+class OldMembersFollowed(unittest.TestCase):
+    """The same run: an upgrade that changes a count rolls the old members
+    out, and their logs with them, before anything reads after it. Each
+    member listed at its start is followed until its pod ends."""
+
+    def followed(self, then, ends="at once"):
+        """`then()` with kubectl and the followers stood in for: the
+        followers, and the followed logs' file once every one has ended."""
+        following = Following(ends)
+        with Driven(), mock.patch.object(run, "kubectl", Members()), \
+                mock.patch.object(run, "follow_logs_of", following), \
+                mock.patch.object(run, "FOLLOWERS", []):
+            then()
+            if ends == "never":
+                happened = run.happens(lambda: len(following.started) == len(Members.MEMBERS), 10, every=0.01)
+                self.assertTrue(happened, following.started)
+            run.stop_following()
+            said = open(run.FOLLOWED_LOGS).read() if os.path.exists(run.FOLLOWED_LOGS) else ""
+        return following, said
+
+    def test_only_an_upgrade_that_changes_a_count_is_followed(self):
+        for sets in (["lake.writerGroups=2", "bor.writerGroups=2"], ["lake.databases=2"], ["bor.partitions=4"]):
+            self.assertTrue(run.changes_a_count(sets), sets)
+        self.assertFalse(run.changes_a_count([f"lake.scrub.intervalDays={run.SCRUB_DAYS}"]))
+
+    def test_each_member_is_followed_from_before_the_upgrade_until_its_pod_ends(self):
+        order = []
+
+        def upgraded():
+            with mock.patch.object(run, "keep_store_logs", lambda when: order.append("kept")), \
+                    mock.patch.object(run, "upgrade", lambda *sets: order.append(("upgraded", len(run.FOLLOWERS)))):
+                run.upgrade_kept("lake.databases=2", "bor.databases=2")
+        following, said = self.followed(upgraded)
+        self.assertEqual([step if step == "kept" else step[0] for step in order], ["kept", "upgraded"], order)
+        self.assertGreaterEqual(order[1][1], len(Members.MEMBERS), "each followed before the upgrade began")
+        for member in Members.MEMBERS:
+            self.assertIn(f"{member} said its last lines", said)
+            self.assertIn(f"{member}, followed from", said)
+        self.assertIn("(its follower ended, status 0)", said)
+        self.assertIn("the upgrade to lake.databases=2 bor.databases=2", said)
+        self.assertTrue(run.FOLLOWED_LOGS.startswith(".e2e-"), "the job's failure upload keeps .e2e-*.log")
+
+    def test_a_writer_group_raise_is_followed_before_its_upgrade_and_a_scrub_change_is_not(self):
+        for sets, follows in ((("lake.writerGroups=2", "bor.writerGroups=2"), True),
+                              ((f"lake.scrub.intervalDays={run.SCRUB_DAYS}",), False)):
+            order = []
+            with mock.patch.object(run, "record_now", lambda: {}), \
+                    mock.patch.object(run, "follow_store_logs", lambda when: order.append("followed")), \
+                    mock.patch.object(run, "upgrade", lambda *sets: order.append("upgraded") or
+                                      __import__("subprocess").CompletedProcess(sets, 1, b"", b"refused")):
+                self.assertFalse(run.groups_upgraded(Checks(), "a raise: two groups", 2, False, *sets))
+            self.assertEqual(order, ["followed", "upgraded"] if follows else ["upgraded"], sets)
+
+    def test_a_follower_past_its_bound_is_ended_and_its_logs_kept(self):
+        following, said = self.followed(lambda: run.follow_store_logs("a raise"), ends="past its bound")
+        self.assertEqual(sorted(following.killed), sorted(Members.MEMBERS))
+        self.assertIn(f"(its bound of {run.FOLLOW_SECONDS} s)", said)
+        self.assertIn("pod/bor-group-1-0 said its last lines", said)
+
+    def test_a_follower_still_running_at_the_runs_end_is_ended_and_its_logs_kept(self):
+        following, said = self.followed(lambda: run.follow_store_logs("a raise"), ends="never")
+        self.assertEqual(sorted(following.killed), sorted(Members.MEMBERS))
+        self.assertIn("(its follower ended, status -9)", said)
+        for member in Members.MEMBERS:
+            self.assertIn(f"{member} said its last lines", said)
+
+    def test_members_not_listed_are_said_in_the_file(self):
+        with Driven():
+            self.assertEqual(run.follow_store_logs("a raise"), 0)
+            said = open(run.FOLLOWED_LOGS).read()
+        self.assertIn("a raise: the members were not listed", said)
+        self.assertIn("no cluster in the self-test", said)
 
 
 class Roll:

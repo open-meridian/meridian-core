@@ -90,6 +90,7 @@ and no job keeps. No platform: the conductor waits for an enrolment
 nobody gives. No value of a secret, a key or a password is ever printed.
 """
 
+import atexit
 import base64
 import datetime
 import http.client
@@ -527,6 +528,7 @@ def claim(s, failure, component, seconds, bound, extra=None):
         s.check(True, f"{failure}: {component} measured (no bound is set for it yet)")
     else:
         s.check(line["held"], f"{failure}: {component} answered again within {bound}s")
+    return line["held"]
 
 
 def figure(what, **measured):
@@ -4373,13 +4375,21 @@ def rollout_served(s, what, began_ms, groups, held):
     group's writer throughout."""
     every = not_answered(began_ms, int(time.time() * 1000))
     found = [refused for refused in every if UNSERVED in refused[2]]
+    missed = []
     for kind, component in SERVED_BY:
         mine = [at for at, said, _ in every if said == kind]
         span, stretches = longest_stretch(mine)
-        claim(s, f"rollout-{what}", component, span, TOLERANT_POD if SHAPE == "tolerant" else HA[component],
-              {"not_answered": len(mine), "stretches": stretches,
-               "unserved_refusals": len([at for at, said, _ in found if said == kind]),
-               "writer_groups": groups, "shape": SHAPE})
+        kept = claim(s, f"rollout-{what}", component, span, TOLERANT_POD if SHAPE == "tolerant" else HA[component],
+                     {"not_answered": len(mine), "stretches": stretches,
+                      "unserved_refusals": len([at for at, said, _ in found if said == kind]),
+                      "writer_groups": groups, "shape": SHAPE})
+        if kept is False:
+            missed.append(component)
+    rollout_takeovers(f"rollout-{what}", began_ms * 1_000_000, missed)
+    if missed:
+        # The members that survived the rollout; the old ones' were
+        # followed through it where it changed a count (follow_store_logs).
+        keep_store_logs(f"rollout-{what}: {', '.join(missed)} past its bound")
     if held:
         for at, kind, words in found[:10]:
             print(f"      unserved: {kind} at {at}: {words}", flush=True)
@@ -4394,6 +4404,44 @@ def store_databases(store):
     and each the chart brings past it."""
     component = {"book": "bor"}.get(store, store)
     return [(0, primary())] + [(d, database_pod(component, d)) for c, d, _, _ in extra_databases() if c == component]
+
+
+def takeovers_since(store, since_ns):
+    """Each of `store`'s databases' takeovers recorded since `since_ns`:
+    (the database, how many, each as `epoch member seconds-since why`)."""
+    said = []
+    for d, pod in store_databases(store):
+        row = psql(f"select count(*) || '|' || coalesce(string_agg(epoch || ' ' || member || ' ' || "
+                   f"round((at_ns - {since_ns}) / 1e9, 1) || ' ' || why, '; ' order by epoch), '') "
+                   f"from {store}_writer_took_over where at_ns >= {since_ns}", pod=pod)
+        count, _, rows = row.partition("|")
+        said.append((d, int(count or 0), rows))
+    return said
+
+
+def rollout_takeovers(what, since_ns, missed):
+    """How many takeovers each store recorded since a rollout began, over
+    its databases, printed and kept as a figure on every run (merge-queue
+    run 46082830508: the book fenced 8 times through "ha groups raised",
+    the passing runs before it twice). Where a store's claim `missed` its
+    bound, every one of them, in every database of each store, printed:
+    the record is durable and names each taker, where the members that
+    took them are gone with the rollout (the CTO's check of 2026-11-27).
+    A read that fails is said, never the run's end."""
+    for store in ("book", "lake"):
+        try:
+            took = takeovers_since(store, since_ns)
+        except (Exception, SystemExit) as failed:
+            print(f"      {what}: the {store}'s takeovers since the rollout began were not read: {failed}", flush=True)
+            continue
+        count = sum(n for _, n, _ in took)
+        print(f"      {what}: the {store}'s takeovers since the rollout began: {count}, over {len(took)} "
+              "database(s)", flush=True)
+        figure(f"{what}: the {store}'s takeovers since the rollout began", took_over=count, databases=len(took))
+        if missed:
+            for d, _, rows in took:
+                print(f"      {what}: the {store}'s takeovers in database {d} (epoch, member, seconds from the "
+                      f"rollout's start, why): {rows or 'none'}", flush=True)
 
 
 def no_lease_lapsed(s, what, since_ns, groups=1):
@@ -4495,6 +4543,8 @@ def groups_upgraded(s, what, groups, held, *sets):
     print(f"T: {what}", flush=True)
     before = record_now()
     began = time.time()
+    if changes_a_count(sets):
+        follow_store_logs(f"{what}: the upgrade to {' '.join(sets)}")
     upgraded = upgrade(*sets)
     s.check(upgraded.returncode == 0, f"{what}: the upgrade applied"
             + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
@@ -6587,14 +6637,21 @@ STORE_LOGS_TIMEOUT = "20s"
 STORE_LOGS_KEPT = set()
 
 
+def store_members():
+    """The lake's and the book's members' pods, listed (`kubectl get pods
+    -o name`), the call bounded by STORE_LOGS_TIMEOUT."""
+    selector = f"app.kubernetes.io/instance={RELEASE},meridian.dev/component in ({','.join(STORE_MEMBERS)})"
+    return kubectl("get", "pods", "-l", selector, "-o", "name", f"--request-timeout={STORE_LOGS_TIMEOUT}",
+                   check=False)
+
+
 def keep_store_logs(when):
     """Every lake and book member's logs (`STORE_MEMBERS`, all containers,
     timestamped, the last SAID_LINES of each), appended to STORE_LOGS under
     `when`. Each call bounded by STORE_LOGS_TIMEOUT; what is not answered is
     said in the file."""
     bound = f"--request-timeout={STORE_LOGS_TIMEOUT}"
-    selector = f"app.kubernetes.io/instance={RELEASE},meridian.dev/component in ({','.join(STORE_MEMBERS)})"
-    listed = kubectl("get", "pods", "-l", selector, "-o", "name", bound, check=False)
+    listed = store_members()
     parts = [f"== {when}, at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
     if listed.returncode != 0:
         parts.append(f"(the members were not listed: {listed.stderr.decode(errors='replace').strip()})")
@@ -6615,9 +6672,101 @@ def store_logs_at_first_refusal(failure, what):
         keep_store_logs(f"{failure}: the first refused write, {what}")
 
 
+# The settings whose change rolls a store's members out at a new count
+# while the old ones still run: its writer groups, databases or partitions.
+COUNT_SETTINGS = ("writerGroups", "databases", "partitions")
+# Through such an upgrade, each member listed at its start is followed
+# (`kubectl logs -f`) until its pod ends -- the old members', which the
+# rollout deletes before any read after it (the CTO's check of 2026-11-27:
+# merge-queue run 46082830508 kept nothing of the members that took the
+# book's partitions from group 1) -- or this bound, a member the rollout
+# left. Each kept, whole, in FOLLOWED_LOGS as its follower ends.
+FOLLOW_SECONDS = 1200
+FOLLOWED_LOGS = ".e2e-said-followed.log"
+FOLLOWED_LOCK = threading.Lock()
+# Each follower's thread and its kubectl, while it runs: ended at the run's
+# end (`stop_following`), whatever ended the run.
+FOLLOWERS = []
+
+
+def changes_a_count(sets):
+    """Whether an upgrade's `--set`s change a store's count of writer
+    groups, databases or partitions."""
+    return any(value.split("=", 1)[0].rsplit(".", 1)[-1] in COUNT_SETTINGS for value in sets)
+
+
+def follow_logs_of(name, sink):
+    """`kubectl logs -f` of pod `name`, every container, timestamped, from
+    its last SAID_LINES on, into the file `sink`: its own process, which
+    ends when the pod's containers do."""
+    return subprocess.Popen(["kubectl", "--namespace", NAMESPACE, "logs", "-f", name, "--all-containers",
+                             "--prefix", "--timestamps", f"--tail={SAID_LINES}"],
+                            stdout=sink, stderr=subprocess.STDOUT)
+
+
+def followed(when, name, began):
+    """One member's logs followed: until its follower ends -- its pod gone
+    -- or FOLLOW_SECONDS, then kept in FOLLOWED_LOGS under `when`."""
+    with tempfile.TemporaryFile() as sink:
+        try:
+            process = follow_logs_of(name, sink)
+        except OSError as failed:
+            ended, process = f"not followed: {failed}", None
+        if process is not None:
+            FOLLOWERS.append(process)
+            try:
+                ended = f"its follower ended, status {process.wait(timeout=FOLLOW_SECONDS)}"
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                ended = f"its bound of {FOLLOW_SECONDS} s"
+        sink.seek(0)
+        said = sink.read().decode(errors="replace")
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with FOLLOWED_LOCK, open(FOLLOWED_LOGS, "a", encoding="utf-8") as kept:
+        kept.write(f"== {when}: {name}, followed from {began} until {stamp} ({ended})\n{said}\n")
+
+
+def follow_store_logs(when):
+    """Every lake and book member listed now, its logs followed through the
+    rollout (`followed`), each in a thread of its own. Says how many."""
+    listed = store_members()
+    began = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if listed.returncode != 0:
+        with FOLLOWED_LOCK, open(FOLLOWED_LOGS, "a", encoding="utf-8") as kept:
+            kept.write(f"== {when}: the members were not listed, at {began}: "
+                       f"{listed.stderr.decode(errors='replace').strip()}\n")
+        return 0
+    names = listed.stdout.decode(errors="replace").split()
+    for name in names:
+        thread = threading.Thread(target=followed, args=(when, name, began), daemon=True)
+        FOLLOWERS.append(thread)
+        thread.start()
+    print(f"R: {when}: {len(names)} store member(s)' logs followed through the rollout, kept in {FOLLOWED_LOGS}",
+          flush=True)
+    return len(names)
+
+
+def stop_following():
+    """Every follower still running ended, and its member's logs kept."""
+    for follower in list(FOLLOWERS):
+        if not isinstance(follower, threading.Thread) and follower.poll() is None:
+            follower.kill()
+    for follower in list(FOLLOWERS):
+        if isinstance(follower, threading.Thread):
+            follower.join(timeout=30)
+    FOLLOWERS.clear()
+
+
+atexit.register(stop_following)
+
+
 def upgrade_kept(*sets):
-    """An upgrade (`upgrade`), the members' logs kept before it rolls them."""
+    """An upgrade (`upgrade`), the members' logs kept before it rolls them,
+    and followed through its rollout where it changes a count."""
     keep_store_logs(f"before the upgrade to {' '.join(sets)}")
+    if changes_a_count(sets):
+        follow_store_logs(f"the upgrade to {' '.join(sets)}")
     return upgrade(*sets)
 
 
