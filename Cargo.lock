@@ -2050,6 +2050,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "tokio-postgres",
  "tokio-rustls",
  "tokio-stream",
  "tonic",

@@ -284,11 +284,10 @@ fn gaps_tab(open: &[DatasetGap]) -> String {
             let (from_day, from_time) = when(gap.valid_from_ns);
             let (until_day, until_time) = when(gap.valid_until_ns);
             let (day, time) = when(gap.recorded_at_ns);
-            let range = if gap.dataset.is_empty() {
-                "not yet known".to_string()
-            } else {
-                format!("{from_day} {from_time} to {until_day} {until_time}")
-            };
+            // A gap that names no dataset has its window too, by the
+            // stream's time (the review of the lost stream's gap, finding
+            // 1): it was drawn as not yet known.
+            let range = format!("{from_day} {from_time} to {until_day} {until_time}");
             format!(
                 "<tr data-gap=\"{id}\"><td title=\"{dataset}\">{dataset}</td>\
                  <td title=\"{state}\"><span class=\"badge warn\">{state}</span></td><td class=\"wide\" title=\"{range}\">{range}</td>\
@@ -1238,6 +1237,8 @@ mod tests {
                 gap_id: "GAP-01".into(),
                 state: GapState::Unrecovered as i32,
                 cause: GapCause::WriteAheadBound as i32,
+                valid_from_ns: 1_795_834_034_000_000_000,
+                valid_until_ns: 1_795_834_099_000_000_000,
                 ..Default::default()
             },
         ];
@@ -1261,6 +1262,18 @@ mod tests {
         );
         assert!(body.contains("data-gaps=\"2\""), "{body}");
         assert!(body.contains(&format!(">{NOT_YET_KNOWN}</td>")));
+        // The gap that names no dataset shows its window, both times (the
+        // review of the lost stream's gap, finding 1).
+        let (from, until) = (
+            when(1_795_834_034_000_000_000),
+            when(1_795_834_099_000_000_000),
+        );
+        assert_ne!(from, until);
+        let window = format!("{} {} to {} {}", from.0, from.1, until.0, until.1);
+        assert!(
+            body.contains(&format!(">{window}</td>")),
+            "{window}: {body}"
+        );
         assert!(body.contains(">drive-data:drive</td>"));
         assert!(body.contains("write-ahead bound"));
         assert!(

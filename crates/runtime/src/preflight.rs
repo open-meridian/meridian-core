@@ -810,10 +810,6 @@ impl Inputs {
 /// there still blocks, after it, saying why.
 pub const DATABASE_WAITS_AT_MOST: Duration = Duration::from_secs(180);
 
-/// One attempt's limit: a connection the network drops rather than refuses
-/// fails in this, not in the minutes the system's own retries take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// An error and its causes. The Postgres client's own words name only the
 /// kind -- "error connecting to server" -- and keep why (refused, timed out,
 /// no such host) as its source, which is what an operator reading a blocked
@@ -876,22 +872,17 @@ pub fn answering<T>(
 /// passes. Only the connection is waited for: a session that connects and
 /// then fails fails at once.
 fn read_only(store: &str, url: &str, deadline: Instant) -> Result<postgres::Client, String> {
-    let mut config: postgres::Config = url
+    let _: postgres::Config = url
         .parse()
         .map_err(|failed| format!("its URL is unreadable: {}", with_causes(&failed)))?;
-    config.connect_timeout(CONNECT_TIMEOUT);
-    let (config, tls) =
-        meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
-            .map_err(|failed| format!("the database's TLS: {failed}"))?;
+    // Each attempt bounded start to finish, so a server that accepts and
+    // says nothing does not hold this past its deadline.
+    let attempt = crate::reach::Attempt::at(url).map_err(|unusable| unusable.to_string())?;
     let mut client = answering(
         &format!("the {store}'s database"),
         deadline,
         crate::WAIT_AGAIN_AFTER,
-        || {
-            config
-                .connect(tls.clone())
-                .map_err(|failed| with_causes(&failed))
-        },
+        || attempt.blocking(|failed| with_causes(failed)),
     )?;
     client
         .batch_execute("SET default_transaction_read_only = on")

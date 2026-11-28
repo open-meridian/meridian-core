@@ -9,6 +9,26 @@
 //! it is missing rather than skipping. The database is shared by every run, so
 //! nothing here assumes a partition's numbers start anywhere: each test uses
 //! accounts of its own and reads its numbers relative to the head.
+//!
+//! One test a process: `make test-store` runs these under cargo-nextest
+//! (tools/run-tests.sh), this binary's tests one at a time
+//! (.config/nextest.toml). Two things hold only that way (roadmap v31a item
+//! 11; both shown on 2026-11-27, neither ended here):
+//!
+//! - In one libtest process the suite runs out of the database's
+//!   connections. `serve` gives each handler the bus it is served on, so a
+//!   served store is never dropped while its process lives and its pool's
+//!   connections stay open: one test at a time, 82 were open after eleven
+//!   tests, and the twelfth met "too many clients already". Under nextest
+//!   the whole suite, counted each second, never held more than 42. Ending
+//!   it needs a way to stop serving on a `Bus`, which the bus does not have.
+//! - A failed async test that drops a sync client, or a store no bus holds,
+//!   as it unwinds ends its process ("panic in a destructor during
+//!   cleanup": the client closes by a runtime of its own) before its
+//!   `Scratch` drops its schema. The lake's tests hold theirs in
+//!   `scratch::OffRuntime` and prove it
+//!   (`what_a_failed_async_test_made_is_dropped_as_it_unwinds`); these do
+//!   not yet, test by test.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -5393,6 +5413,95 @@ async fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline(
             migrated,
         ))
     });
+}
+
+/// The writer-group raise, a known gap until v32 item 1 (merge-queue run
+/// 46082830508, "rollout-ha-groups-raised (bor)"; ruled 2026-11-27): the
+/// count raised from one group to two, group 1's writer has taken its
+/// partitions and writes them. A member still at one group then starts --
+/// an old pod restarted, or its standby taking group 0's lease before the
+/// rollout has removed it -- and, at one group, takes over every partition
+/// held at an epoch not the control partition's (`held_apart`, ruled
+/// 2026-11-18 for a lowered count). Group 1's next write is refused
+/// "fenced", and its writer takes them back: back and forth until the old
+/// pods are gone. The store reads the same rows here as after a lowering
+/// (the test above), so nothing it holds today tells a stale member from
+/// the one writer left; v32's ownership record, the count recorded and
+/// ordered in it, answers a member at another count "not the owner". It
+/// turns this green, and the ignore is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "known gap until v32 item 1: writer-group raise"]
+async fn a_member_at_the_count_before_a_raise_started_after_it_fences_no_writer_of_group_one() {
+    use meridian_bor::partition_moves::rebalance;
+    use meridian_bor::store::placement_of;
+    let (url, migrated) = blocking(isolated);
+    let (broker, zero, zero_store, mover) = blocking(|| raised_to_two(&url, 15));
+    // Group 1's writer takes its partitions at two groups and writes P4.
+    let (one, one_store) = blocking(|| group_member(&url, &broker, 1, 2, 8));
+    let held = blocking(|| Store::adopt(one_store.as_ref())).unwrap();
+    blocking(|| rebalance(&zero, zero_store.as_ref(), &mover));
+    let in_p4 = |tag: &str| {
+        (0..)
+            .map(|n| unique(&format!("ACC-RAISED-{tag}-{n}")))
+            .find(|a| placement_of(a, 8) == "P4")
+            .unwrap()
+    };
+    let (first, next) = (in_p4("first"), in_p4("next"));
+    blocking(|| one_store.place_first(&first, &first)).unwrap();
+    blocking(|| one_store.place_first(&next, &next)).unwrap();
+    open(&one, &first, "INS-AAPL").await;
+    blocking(|| {
+        assert_eq!(zero_store.tip("P4").unwrap().unwrap().writer_group, Some(1));
+    });
+    // A member at the count before the raise starts: one group, its own
+    // broker (it answers no hand-off of the raised count's).
+    let before = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let (stale, stale_store) = blocking(|| group_member(&url, &before, 0, 1, 8));
+    let adopted = blocking(|| Store::adopt(stale_store.as_ref()));
+    // Group 1's next write.
+    let written = send(
+        &one,
+        RECORD_OPENING_BALANCE,
+        &opening(&next, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await;
+    let took_over: Vec<(i64, String, String)> = blocking(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .query(
+                "SELECT epoch, member, why FROM book_writer_took_over ORDER BY epoch",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect()
+    });
+    // Let go before the check: a store dropped as a failed check unwinds
+    // would be dropped on the runtime's thread.
+    blocking(move || {
+        drop((
+            zero,
+            one,
+            stale,
+            zero_store,
+            one_store,
+            stale_store,
+            mover,
+            migrated,
+        ))
+    });
+    assert!(
+        written.is_ok(),
+        "group 1's writer, at epoch {held}, was refused its next write once a member at one \
+         group started after the raise (its adopt: {adopted:?}): {written:?}; takeovers \
+         recorded: {took_over:?}"
+    );
 }
 
 /// The book at `url` started at one writer group -- every head pinned to

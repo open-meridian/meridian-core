@@ -233,6 +233,23 @@ pub fn access_of(records: &AccessRecords, subject: &str) -> Access {
     meridian_access::person_access(records, subject, &groups)
 }
 
+/// Every subject the records name: each person who has signed in, and each
+/// login a user group names -- so one who has not signed in since is found,
+/// and a notice is in their inbox at their first sign-in.
+pub fn subjects_named(records: &AccessRecords) -> BTreeSet<String> {
+    records
+        .people
+        .iter()
+        .map(|person| person.subject.clone())
+        .chain(
+            records
+                .user_groups
+                .iter()
+                .flat_map(|group| group.logins.iter().cloned()),
+        )
+        .collect()
+}
+
 /// The values a JSON object names at each path (`account_id`,
 /// `positions[].account_id`): the accounts an act's input touches.
 pub fn values_at(arguments: &Value, paths: &[String]) -> Vec<String> {
