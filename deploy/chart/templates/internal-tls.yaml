@@ -1,7 +1,7 @@
 {{- include "meridian-runtime.require" . -}}
 {{- if .Values.tls.internal.enabled }}
 {{/*
-  Internal TLS (values.yaml's tls.internal; ruling 1084): a CA made here for
+  Internal TLS (values.yaml's tls.internal): a CA made here for
   this deployment's own paths, and each server's certificate from it -- the
   brought database's, the broker's, and the plugins' front doors' -- each
   under the names its clients reach it by. Kept across upgrades (read back,
@@ -57,7 +57,7 @@ data:
 {{- $names := index $servers $server }}
 {{- /* The names a certificate was made under, kept on its Secret: one made
        under others -- the database's before its members were named by
-       their own Services (Patroni's REST API over TLS, ruled 2026-11-08) --
+       their own Services (Patroni's REST API over TLS) --
        is made again, from the same CA, which every client still trusts. */}}
 {{- $namesHeld := dig "metadata" "annotations" "meridian.dev/names" "" (default (dict) $held) }}
 {{- if and $held $held.data (index $held.data "tls.key") (eq (index $held.data "ca.crt") ($ca.Cert | b64enc)) (eq $namesHeld (join "," $names)) }}

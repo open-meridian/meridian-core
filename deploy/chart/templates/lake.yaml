@@ -77,7 +77,7 @@ spec:
               value: {{ include "meridian-runtime.fullname" . }}-lake
             {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "lake" "values" $.Values.lake) | nindent 12 }}
             # The deployment each change of its log is made in (step 3a,
-            # the change log's origin; ruling 1049).
+            # the change log's origin).
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
             # The hot layer's bounds, in MiB (step 3a).
@@ -93,9 +93,9 @@ spec:
               value: {{ .Values.logLevel | quote }}
             # Its working memory (stage M), less the hot layer's bounds and
             # the held answers' 64 MiB; glibc's arenas, and its mmap
-            # threshold (ruling 972), as every component's.
+            # threshold, as every component's.
             {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "lake" "values" .Values.lake "resources" .Values.resources "heldMiB" (add 64 .Values.lake.hotLayer.latestMiB .Values.lake.hotLayer.listingsMiB) "name" "lake") | nindent 12 }}
-            # How many whole answers it builds at once (rulings 957, 958).
+            # How many whole answers it builds at once.
             - name: MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS
               value: {{ .Values.lake.maxConcurrentAnswers | int | quote }}
             # A move's hold and its switch's bound (step 3d; section 6.8).
@@ -136,7 +136,7 @@ spec:
        Deployment in a reads-only mode, `lake.readers` of them. */}}
 {{ include "meridian-runtime.readers" (dict "top" $ "component" "lake" "values" .Values.lake "readUrl" "MERIDIAN_LAKE_READ_DATABASE_URL" "rendered" (include "meridian-runtime.lake.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "lake" "values" $.Values.lake) }}
-{{- /* Never lowered in ha (PO item 111). */}}
+{{- /* Never lowered in ha. */}}
 {{- include "meridian-runtime.writerGroupsNotLowered" (dict "top" $ "component" "lake" "values" .Values.lake) }}
 {{- /* Each writer group past the first (step 3d): its own writer
        Deployment, Lease and standby, `lake.writerGroups` in all. */}}

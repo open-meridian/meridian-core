@@ -2,8 +2,7 @@
 {{- if .Values.dashboard.enabled }}
 {{/*
   What reaches and fences every plugin, made once, whether the chart runs the
-  plugin (sidecars[]) or the launcher does (spec/the-local-plugin-registry,
-  decision 4, ruled 2026-09-26).
+  plugin (sidecars[]) or the launcher does (spec/the-local-plugin-registry).
 
   Made per plugin, a Service and a NetworkPolicy would be two more kinds the
   launcher could create, and one able to create NetworkPolicies can open a

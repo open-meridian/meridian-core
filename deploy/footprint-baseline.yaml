@@ -1,4 +1,4 @@
-# The desktop footprint's baseline (ruling 1058; spec/a-deployment-scales-
+# The desktop footprint's baseline (spec/a-deployment-scales-
 # out-and-fails-over-by-configuration section 13; plan Track 7): v29's
 # default profile -- core 3f99222, the chart dev runs as 0.1.339,
 # `resilience.profile: tolerant` as it will be named, one node, no plugin --
@@ -25,8 +25,8 @@
 # e2e-cluster jobs, the pinned k3s and 1.33 to 1.37: peak 160 to 162 MiB,
 # disk 34.9 MiB each; the highest is kept.
 #
-# The peak's ceiling: the product owner ruled 2026-11-20 that the cluster
-# jobs' median peak is held to 200 MiB, not 15% over 162 (186.3). Measured
+# The peak's ceiling: the cluster jobs' median peak is held to 200 MiB, not 15%
+# over 162 (186.3). Measured
 # on c30d the median moved 182 to 190 MiB run to run with no growth in what
 # the pods hold (the swing is file pages counted in the working set), and
 # 186.3 left no room for it. The ceiling replaces the percentage for the

@@ -2,7 +2,7 @@
 {{- if .Values.dashboard.enabled }}
 {{/*
   The dashboard's own signing key (decisions/014; plans/a-person-reaches-a-
-  plugin, ruling 4). The dashboard signs, per request, who a person is and
+  plugin). The dashboard signs, per request, who a person is and
   what they hold on a plugin; the plugin's sidecar verifies it before anything
   reaches the plugin. The key is the dashboard's alone -- never the
   deployment's, which only the conductor holds.

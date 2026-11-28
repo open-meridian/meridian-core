@@ -68,7 +68,7 @@
   Role naming that instance's shards' Leases alone, and the Leases (item
   31). Rendered for one shard; the launcher sets the pods and the count the
   launch asked. Only where a store runs a standby: shards and standby pods
-  are configuration, as every standby is (ruling 1052). Elsewhere the
+  are configuration, as every standby is. Elsewhere the
   launcher has no shape for them, and refuses such a launch saying so.
 */}}
 {{- $leased := false -}}
@@ -96,8 +96,7 @@
   And where edge plugins keep storage, the same shape mounting the
   instance's shared storage, a folder per shard; the claim it mounts,
   `shared-claim.json`; and the pod that copies an instance's own claim
-  into its `shard-0/` once, before its first launch as several pods (step
-  3d, checkpoint 5, item 30).
+  into its `shard-0/` once, before its first launch as several pods.
 */}}
 {{- $shardsStorage := "" -}}
 {{- $sharedClaim := "" -}}
@@ -191,7 +190,7 @@ metadata:
 # Deployments in this namespace, and an edge plugin's storage claim, made and
 # read but never deleted (decisions/028); and where the launcher has a shape
 # for shards and standby pods, an instance's own account, Role and binding
-# and its shards' Leases (item 31) -- the Leases made, never deleted -- and
+# and its shards' Leases -- the Leases made, never deleted -- and
 # nothing else: no Secret, no Service, no NetworkPolicy. It holds no
 # `escalate` and no `bind`: a Role it makes grants only what it holds itself,
 # its Lease right. RBAC cannot narrow `create` to a name, so the launcher
@@ -211,7 +210,7 @@ rules:
     # the broker reads (contract v18, W10.1).
     verbs: ["create", "get", "list", "delete", "patch"]
   {{- if .Values.pluginStorage.enabled }}
-  # update: an instance's shared claim marked as holding its copy (item 89),
+  # update: an instance's shared claim marked as holding its copy,
   # which its admission policy holds it to; never delete (decisions/028).
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
@@ -219,7 +218,7 @@ rules:
   {{- end }}
   {{- if $shards }}
   # An instance of several pods' own account, its Role naming its shards'
-  # Leases alone, and their binding (item 31).
+  # Leases alone, and their binding.
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["create", "get", "update", "delete"]
@@ -230,7 +229,7 @@ rules:
   # removed, so each sidecar releases its shard's Lease with a live token
   # (review c5b L5, c5b2 H1).
   # And where edge plugins keep storage, the one pod it makes, which copies
-  # an instance's own storage claim into its shared storage once (item 30):
+  # an instance's own storage claim into its shared storage once:
   # made, read and removed, held by its policy below to exactly the chart's
   # shape.
   - apiGroups: [""]
@@ -240,7 +239,7 @@ rules:
   {{- if or $shards (include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher)) }}
   # One launcher launches (step 3b): with a standby, its lease says which.
   # And an instance of several pods' Leases, made before its pods and never
-  # deleted (item 31); held, so the Role it makes grants nothing it lacks.
+  # deleted; held, so the Role it makes grants nothing it lacks.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
@@ -318,7 +317,7 @@ spec:
             {{- end }}
             {{- if $shardsStorage }}
             # Its shape keeping storage, the shared claim it mounts and the
-            # pod that copies an instance's own claim into it (item 30).
+            # pod that copies an instance's own claim into it.
             - name: MERIDIAN_LAUNCHER_SHARDS_STORAGE_TEMPLATE
               value: /etc/meridian/launcher/plugin-shards-storage.json
             - name: MERIDIAN_LAUNCHER_SHARED_CLAIM_TEMPLATE
@@ -396,7 +395,7 @@ spec:
 ---
 # Where the cluster can say so itself (Kubernetes 1.30 and later): whatever
 # the launcher's account does to a Deployment, a claim, or an instance's own
-# account, Role or binding (item 31), it is one the launcher made, and of
+# account, Role or binding, it is one the launcher made, and of
 # exactly the shape it makes. Its shards' Leases are held by a policy of
 # their own (shard-leases.yaml).
 apiVersion: admissionregistration.k8s.io/v1
@@ -422,7 +421,7 @@ spec:
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["roles", "rolebindings"]
       # The pod that copies an instance's own storage into its shared
-      # storage (item 30), the one pod it makes.
+      # storage, the one pod it makes.
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
@@ -435,7 +434,7 @@ spec:
   variables:
     # The instance an object is made for, by its label -- an instance's name
     # alone, a host label, else none (review c5b L3: it is read into a
-    # pattern) -- and that instance's own account (item 31):
+    # pattern) -- and that instance's own account:
     # `<fullname>-shards-<instance>`.
     - name: labelled
       expression: >-
@@ -465,7 +464,7 @@ spec:
     # 95d68904, S2): Kubernetes asks nobody whether a pod may use an
     # account, so the launcher's Deployments are held to the ones the chart
     # gives it -- none (the namespace's default, which holds no right), its
-    # instance's own account for an instance of several pods (item 31: the
+    # instance's own account for an instance of several pods (the
     # members' is the stores' alone), and the archive's where one is set.
     - expression: >-
         request.operation == "DELETE" ||
@@ -504,11 +503,11 @@ spec:
                 v.projected.sources.exists(s, has(s.serviceAccountToken)))))
         )
       message: under its instance's shards account the token is mounted in the sidecar's container alone
-    # The one pod the launcher makes (item 30): its instance's copy of its
+    # The one pod the launcher makes: its instance's copy of its
     # own storage claim, read only, into its shared storage, exactly as the
     # chart's storage-copy shape -- a plugin image from the deployment's own
     # registry by digest, as the launcher launches, running the SDK's
-    # `meridian-storage copy` alone (PO items 86 and 88), no account's
+    # `meridian-storage copy` alone, no account's
     # token, no secret, no host's namespace, and those two claims of the
     # instance its label names; run once, its user the plugin's own or the
     # cluster's (no uid pinned), nothing added to its container and nothing
@@ -621,7 +620,7 @@ spec:
              (m.name == "to" && m.mountPath == "/var/lib/meridian/copy/to")))
         )
       message: the launcher's one pod copies its instance's own storage into its shared storage, as the chart's shape
-    # The one change it makes to a claim (item 89): its instance's shared
+    # The one change it makes to a claim: its instance's shared
     # claim marked as holding the copy of its own claim, once a copy pod
     # said so -- that annotation alone added, nothing else of the claim
     # changed: no owner given it and no finalizer changed, so it is never
@@ -646,7 +645,7 @@ spec:
             k in object.metadata.annotations))
         )
       message: the launcher changes a claim it made only to mark its instance's shared claim as holding its copy
-    # An instance's own account (item 31), of exactly the shape the launcher
+    # An instance's own account, of exactly the shape the launcher
     # makes: the Role's one rule, `get` and `update` on Leases named
     # `<instance>-shard-<n>` alone, the instance read from its label; the
     # binding of that Role to the account of the same name alone; and the

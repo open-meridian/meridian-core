@@ -310,11 +310,11 @@ impl Judge {
             meridian_bus::write_ahead::stuck_since,
             (
                 "write-ahead-stuck-full",
-                "Standing until it drains; its cause goes to a diagnosis",
+                "Open until the stream drains; meridian status shows what it holds.",
             ),
             (
                 "write-ahead-drained",
-                "the lake's write-ahead stream drained, no longer at a bound",
+                "the lake's write-ahead stream has drained and is below its bound.",
             ),
         )
     }
@@ -338,7 +338,7 @@ impl Judge {
             meridian_bus::write_ahead::refused_since,
             (
                 "write-ahead-refused",
-                "Standing until a write is accepted again",
+                "Open until the broker accepts a write again.",
             ),
             (
                 "write-ahead-accepted",
@@ -721,7 +721,10 @@ mod tests {
             opened[0].about.contains("meridian-lake-0")
                 && opened[0]
                     .about
-                    .contains("holds 256.0 MiB of its 256.0 MiB bound"),
+                    .contains("holds 256.0 MiB of its 256.0 MiB bound")
+                && opened[0].about.ends_with(
+                    ". Open until the stream drains; meridian status shows what it holds."
+                ),
             "{}",
             opened[0].about
         );
@@ -736,6 +739,10 @@ mod tests {
         );
         let opened = judge.judge(&[lake(MIB, 0, 0, 0)], T0 + 4 * MINUTE);
         assert_eq!(kinds(&opened), vec!["component-write-ahead-drained"]);
+        assert_eq!(
+            opened[0].about,
+            "lake: the lake's write-ahead stream has drained and is below its bound."
+        );
         judge.kept(&opened);
         assert!(judge
             .judge(&[lake(MIB, 0, 0, 0)], T0 + 5 * MINUTE)
@@ -883,6 +890,10 @@ mod tests {
             assert!(about.contains(part), "{part} in {about}");
         }
         assert!(!about.contains("disk"), "nothing inferred: {about}");
+        assert!(
+            about.ends_with(". Open until the broker accepts a write again."),
+            "{about}"
+        );
         let event = opened[0].event.clone();
         judge.kept(&opened);
         assert!(judge.judge(&[first], T0 + 2 * MINUTE).is_empty());

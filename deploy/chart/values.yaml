@@ -52,7 +52,7 @@ database:
   existingSecret: ""
   key: url
   # A Secret holding the private CA of a database somebody else runs, at
-  # its `ca.crt` (ruled 2026-11-08): every connection to the database is
+  # its `ca.crt`: every connection to the database is
   # then over TLS or not at all, its server verified against that CA by the
   # name in the URL (sslmode verify-full). Empty, a database somebody else
   # runs is verified against the public roots, or the internal CA where
@@ -91,7 +91,7 @@ database:
     # under Patroni, each on its own volume and node, a quorum of either
     # (ANY 1, strict; contract v30, stage C), so the book's, the street store's, the instrument store's and
     # the configuration's commits survive the primary (RPO 0) and a primary
-    # lost is answered for within 30 s (ruling 1048). By the profile: 0
+    # lost is answered for within 30 s. By the profile: 0
     # tolerant, 2 ha. Patroni keeps its state in this namespace's ConfigMaps.
     # A firm running Postgres for production names an external managed one
     # with its provider's synchronous standby instead (database.existingSecret).
@@ -100,18 +100,18 @@ database:
     # an asynchronous member under Patroni tagged nosync and nofailover --
     # never in the synchronous quorum, never promoted -- from which each
     # store's readers read the record's past. The chart wires them itself
-    # (stage C2, approved 2026-11-11): the store's own URL on the replica's
+    # (stage C2): the store's own URL on the replica's
     # host, `<release>-database-<n>`, a Service of its own; nothing to edit
     # by hand. A store's <store>.database.readExistingSecret, where set,
     # names its own instead. A record read there is stamped from its own
     # snapshot. The HA standbys serve no reads. Each member is given the
     # same memory and max_connections as the primary.
     # readReplicas: 0
-    # Its max_connections, counted from what this chart deploys (ruled
-    # 2026-11-08): each store member's pool of 8 and 2 beside it, writer,
+    # Its max_connections, counted from what this chart deploys:
+    # each store member's pool of 8 and 2 beside it, writer,
     # standby and a rollout's surge, the lake's and the book's for each of
     # the most writer groups they allow (lake.maxWriterGroups,
-    # bor.maxWriterGroups: PO items 104 and 106, so a writerGroups change
+    # bor.maxWriterGroups, so a writerGroups change
     # within it never restarts the database), and in ha 2 more for each lake
     # member's write-ahead writer (stage E); each dashboard copy's 4 and 1;
     # 6 for jobs; 4 kept for the superuser and Patroni; a quarter over that.
@@ -137,7 +137,7 @@ database:
     replicaScrub:
       schedule: "40 3 * * *"
       reclone: true
-    # Who may connect to it from past its own pod (v31a item 6): pg_hba.conf
+    # Who may connect to it from past its own pod: pg_hba.conf
     # lines, in order, the first that matches deciding; its own pod's
     # connections are admitted before them. Empty takes the chart's own:
     # every role by password from anywhere, and with tls.internal.enabled
@@ -266,7 +266,7 @@ revisionHistoryLimit: 3
 # names one version.
 # Step 3b (spec/a-deployment-scales-out-and-fails-over-by-configuration
 # sections 1 to 3, 11; plan Track 5): every count is a value, small by
-# default (ruling 1047). With a component's `standby` at 1, it runs a warm
+# default. With a component's `standby` at 1, it runs a warm
 # standby beside its writer: the same image, holding no lease and serving
 # nothing, following the writer's change log, which takes the writer's
 # lease when it lapses and fences the old writer by its partitions' epoch.
@@ -276,12 +276,12 @@ revisionHistoryLimit: 3
 #
 # `resilience.profile` turns every count on at once (section 11, question
 # 23): `tolerant`, the default, one member of everything, healed by
-# Kubernetes restarting it within the tolerant bounds (ruling 1056); `ha`, a
+# Kubernetes restarting it within the tolerant bounds; `ha`, a
 # standby per writer, the brought database with two standbys under Patroni,
 # the broker at three with JetStream at three, the dashboard and analytics at
 # two. Each count below that says "by the profile" is left unset here so the
 # profile decides it; set it to override the profile either way. `ha` needs
-# the key in key.existingSecret (ruling 1074). The profile is what is
+# the key in key.existingSecret. The profile is what is
 # configured, never a claim: `meridian status --profile` reads what runs.
 resilience:
   profile: tolerant
@@ -393,7 +393,7 @@ bor:
   # with its own Lease and standby (standby counts per group). Every member
   # serves the public writes and hands each to the group owning it.
   writerGroups: 1
-  # The most writer groups the book allows (PO items 104 and 106): 2, as by
+  # The most writer groups the book allows: 2, as by
   # default, 1 to 64; a writerGroups above it is refused. The database's
   # connections are counted at it, so writerGroups changed within it never
   # changes the database's max_connections and never restarts it; raising
@@ -487,7 +487,7 @@ lake:
   # with its own Lease and standby (standby counts per group). Every member
   # serves the public writes and hands each to the group owning it.
   writerGroups: 1
-  # The most writer groups the lake allows (PO items 104 and 106): 2, as by
+  # The most writer groups the lake allows: 2, as by
   # default, 1 to 64; a writerGroups above it is refused. The database's
   # connections are counted at it, so writerGroups changed within it never
   # changes the database's max_connections and never restarts it; raising
@@ -523,13 +523,13 @@ lake:
     tag: ""
   # glibc's allocator arenas, at most this many, as the book's: a chain
   # page's reads answered on many threads otherwise kept an arena's memory
-  # per thread resident (ruling 808; found on dev at 690 to 830 MiB of the
+  # per thread resident (found on dev at 690 to 830 MiB of the
   # lake's 1 GiB). The capacity bench's chain page at eight at once held
   # 441 MiB resident with the default and 121 MiB with 2, the same live
   # heap (~62 MiB at its peak).
   mallocArenaMax: 2
   # glibc maps an allocation of this many bytes or more of its own, and
-  # unmaps it when it is freed (ruling 972). Left to glibc, the threshold
+  # unmaps it when it is freed. Left to glibc, the threshold
   # rises with the first large allocation freed, up to 32 MiB, and a whole
   # answer's vectors are then carved from the arenas, where freeing them
   # keeps them resident: on dev the lake reached 825 MB to 1 GiB in a
@@ -537,8 +537,8 @@ lake:
   # 128 KiB, the probe's burst of eight chain readers peaked at 381 to 393
   # MiB resident, not 848, in the same time.
   mallocMmapThreshold: 131072
-  # How many reads' whole answers the lake builds at once, 1 to 8 (rulings
-  # 957, 958). A read answered in pages builds its whole answer once, at
+  # How many reads' whole answers the lake builds at once, 1 to 8. A read
+  # answered in pages builds its whole answer once, at
   # its first page, copying its rows several times on the way: a chain's
   # statistics, about 25,000 rows, peaked near 80 MiB each, and eight
   # readers at once took dev's lake past its 1 GiB (2026-10-31). A read
@@ -549,7 +549,7 @@ lake:
   # The hot layer (step 3a; spec/one-data-access-model section 3): what the
   # lake answers from its own memory, Postgres the record, each layer
   # bounded in MiB, the least recently read evicted first, within the
-  # lake's 1 GiB (ruling 808). latestMiB: each dataset's latest rows per
+  # lake's 1 GiB. latestMiB: each dataset's latest rows per
   # subject, what a live page reads. listingsMiB: a chain's series per
   # underlying and dataset. Raising the lake's memory limit is not the fix
   # for a layer that does not fit; a smaller bound is (808).
@@ -641,7 +641,7 @@ analytics:
     leaseSeconds: 30
     most: 256
 
-# Installed for development (spec/live-plugin-development, ruling 2): it may
+# Installed for development (spec/live-plugin-development): it may
 # run plugin code as it is being written, which nobody has reviewed, and every
 # dashboard page says so. Set at install -- `meridian up --development`, or a
 # sandbox's own values -- never by a customer's listing, and never switched on
@@ -664,8 +664,8 @@ ingress:
   annotations: {}
   # Plain HTTP, on the controller's port 80. Off: the Ingress serves HTTPS
   # alone, and renders only with tls.secretName set, since an MCP client signs
-  # in over nothing else (task kernel/a-development-deployment-serves-https,
-  # ruling 3). On only for testing: the cluster tests reach Traefik on :80.
+  # in over nothing else (task kernel/a-development-deployment-serves-https).
+  # On only for testing: the cluster tests reach Traefik on :80.
   #
   # Off, each controller is kept to HTTPS its own way. Traefik, Rancher
   # Desktop's and k3s's, by the router.entrypoints annotation naming
@@ -682,7 +682,7 @@ ingress:
     # then has to cover both.
     pluginsSecretName: ""
 
-# TLS on the deployment's own paths inside the cluster (ruling 1084): every
+# TLS on the deployment's own paths inside the cluster: every
 # store's, the dashboard's and the Jobs' connections to the database this
 # chart brings, every component's and sidecar's to the broker, the brokers'
 # routes to each other, Patroni's standbys streaming from their primary, and
@@ -699,7 +699,7 @@ ingress:
 # reached over TLS too, verified against the public roots and this CA: one
 # that offers no TLS is refused. Patroni's REST API is served over TLS
 # alone, and its members and the members' comparison Job reach it by each
-# member's own name, verified against this CA (ruled 2026-11-08).
+# member's own name, verified against this CA.
 tls:
   internal:
     enabled: false
@@ -756,7 +756,7 @@ broker:
   # anybody to write by hand.
   existingSecret: ""
 
-  # The bundled broker's own image, pinned exactly (item 191): the release
+  # The bundled broker's own image, pinned exactly: the release
   # CI runs, never another a pull brings. Its version is yours.
   image: nats:2.10.29-alpine
   instrumentKey: instrument
@@ -774,7 +774,7 @@ broker:
     storageClassName: ""
     # What JetStream holds in memory on each server (stage M; section 10a).
     maxMemory: 16MB
-  # The broker's bounds (stage M; section 10a; approved 2026-11-09): a
+  # The broker's bounds (stage M; section 10a): a
   # client that stops reading is cut off alone, as a slow consumer, once
   # maxPending bytes wait for it, and every other keeps its deliveries; the
   # largest message is maxPayload, the 1 MiB every paged answer is budgeted
@@ -850,7 +850,7 @@ registry:
 # registry's signing key at open-meridian.com.
 registries:
   # The registries this deployment takes, any of `community` and `verified`
-  # (spec/starter-packs, requirement 26; ruling 616). Empty takes both. A
+  # (spec/starter-packs, requirement 26). Empty takes both. A
   # version from a registry not taken is refused at install, and a starter
   # pack's member from one reads "Not permitted here" and cannot be ticked.
   # Changed, like every value, with `meridian upgrade-deployment -f`.
@@ -1023,7 +1023,7 @@ backup:
   # first; each backup the schedule or `meridian backup` takes adds a full
   # base backup beside its sealed file, and the newest backup.keep of those
   # are kept with the WAL they need. Restored by `meridian restore
-  # --to-time`. Off by default, so a desktop keeps no archive (ruling 1058).
+  # --to-time`. Off by default, so a desktop keeps no archive.
   # It needs backup.recipient and a place for the backups: its base backups
   # are taken with them, and its passphrase travels sealed in them.
   walArchive:
@@ -1044,7 +1044,7 @@ backup:
     # s3 or gcs: the pod's own identity (an IAM role or workload identity).
     existingSecret: ""
     # The archive is always encrypted, AES-256-CBC, with a passphrase this
-    # Secret holds as `pass` (ruling 1084). Empty: the chart makes one and
+    # Secret holds as `pass`. Empty: the chart makes one and
     # keeps it beside the database's passwords, and every backup carries it
     # sealed, so a restore into a new cluster reads the archive.
     cipherSecret: ""
@@ -1068,7 +1068,7 @@ resources:
 logLevel: info
 
 # Each component's working memory (stage M; the resilience spec's section
-# 10a; approved 2026-11-09): a component's budget is its container's memory
+# 10a): a component's budget is its container's memory
 # limit times budgetPercent, less its hot layer's and held answers' bounds,
 # and every request reserves its working memory against it before it runs;
 # with the budget full a request waits briefly, then is refused
@@ -1103,13 +1103,13 @@ sidecar:
   # RESOURCE_EXHAUSTED with REFUSAL_REASON_RATE_LIMITED and a retry-after; a
   # bulk act counts as one request. A sidecars[] entry's own `limits`
   # overrides these for that plugin, as does a launch's. Set from the
-  # throughput bench (ruled 2026-11-11): the book takes the most proposals
+  # throughput bench: the book takes the most proposals
   # with about 8 in flight, past which its rate falls and its latency
   # climbs, and takes more a second than 200 across many accounts; a page
   # is at most 1 MiB, so 32 MiB holds every request in flight's answer
   # twice over.
   #
-  # writeMiBPerSecond (step 3d; section 6.9; approved 2026-11-12) is a data
+  # writeMiBPerSecond (step 3d; section 6.9) is a data
   # plugin's lake write share, in MiB a second with a burst of a second's
   # worth. Past it the sidecar holds the write's acknowledgement until the
   # share covers it, and refuses RATE_LIMITED with a retry-after a write

@@ -16,10 +16,10 @@
 
   Its own account, whose rights of its own are to read the pods and the
   Leases in this namespace -- `get` and `list`, nothing written, no other
-  resource: the pods (approved 2026-11-10) so each member's health names its
+  resource: the pods so each member's health names its
   restarts and why, an OOM kill named a defect (W6.40; stage M); the Leases
-  (contract v30, stage D; ruled 2026-11-11, decisions/016's namespaced
-  grant) so the resilience profile and the Resilience page read who writes
+  (contract v30, stage D; a namespaced grant) so the resilience profile and the
+  Resilience page read who writes
   each store from the Leases themselves (W6.39). No node is read: a
   member's node is its pod's, its zone its own report's. With a standby,
   the members' Lease right is bound to it too, as to every member.
@@ -202,7 +202,7 @@ spec:
               value: /etc/meridian/platform-keys
             {{- end }}
             {{- with .Values.registries.taken }}
-            # The registries this deployment takes (ruling 616): a version
+            # The registries this deployment takes: a version
             # from another is refused, a pack's member from one "Not
             # permitted here".
             - name: MERIDIAN_REGISTRIES_TAKEN

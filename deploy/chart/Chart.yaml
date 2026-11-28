@@ -8,7 +8,7 @@ type: application
 version: 0.1.0
 appVersion: "0.1.0"
 
-# The Kubernetes it runs on (rulings 935, 936): 1.33 and newer, every minor a
+# The Kubernetes it runs on: 1.33 and newer, every minor a
 # major managed cloud still supports, extended support included. CI runs
 # every scenario on the k3s release dev runs (the Makefile's
 # KUBERNETES_VERSION) and the base install on each other minor in that

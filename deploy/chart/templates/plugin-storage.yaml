@@ -16,7 +16,7 @@
   a cluster's own admission (a service account's token, a mesh's proxy) may
   add -- or the claim `<fullname>-storage-<its instance>`, or, for an
   instance of several pods, `<fullname>-shared-storage-<its instance>`, the
-  storage its pods share (step 3d, checkpoint 5, item 30). A claim of any
+  storage its pods share. A claim of any
   other name, a host path, an ephemeral claim or any other volume source is
   refused, and so is its own claim on a pod whose sidecar holds no edge role.
 

@@ -49,7 +49,7 @@ spec:
               value: {{ include "meridian-runtime.fullname" . }}-instrument
             {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "instrument" "values" $.Values.instrument) | nindent 12 }}
             # The deployment each change of its log is made in (step 3a,
-            # the change log's origin; ruling 1049).
+            # the change log's origin).
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
             # The hot layer's bound, in MiB (step 3a).

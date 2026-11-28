@@ -63,21 +63,26 @@ fn at(ns: i64) -> String {
 /// no dataset says its window, by the stream's time, as a dataset's says
 /// its valid range.
 pub fn about(gap: &DatasetGap) -> String {
-    let cause = match GapCause::try_from(gap.cause).unwrap_or(GapCause::Unspecified) {
-        GapCause::WriteAheadBound => {
-            "rows the lake's write-ahead stream held were lost before the lake took them; \
-             which rows is not known, possibly none"
-        }
-        GapCause::Unspecified => "its cause was not said",
-    };
+    let cause = GapCause::try_from(gap.cause).unwrap_or(GapCause::Unspecified);
     if gap.dataset.is_empty() {
-        format!(
-            "{} in the lake's write-ahead stream, from {} to {} by the stream's time, \
-             dataset not yet known: a dataset whose next write follows it is named then ({cause})",
-            gap.gap_id,
-            at(gap.valid_from_ns),
-            at(gap.valid_until_ns)
-        )
+        match cause {
+            GapCause::WriteAheadBound => format!(
+                "{}: rows held in the lake's write-ahead stream from {} to {} (stream time) \
+                 were lost before the lake recorded them. Which datasets is not yet known, \
+                 possibly none; each is named when it next writes.",
+                gap.gap_id,
+                at(gap.valid_from_ns),
+                at(gap.valid_until_ns)
+            ),
+            GapCause::Unspecified => format!(
+                "{} in the lake's write-ahead stream, from {} to {} by the stream's time, \
+                 dataset not yet known: a dataset whose next write follows it is named then \
+                 (its cause was not said)",
+                gap.gap_id,
+                at(gap.valid_from_ns),
+                at(gap.valid_until_ns)
+            ),
+        }
     } else {
         let state = match GapState::try_from(gap.state).unwrap_or(GapState::Unspecified) {
             GapState::Refetching => "asked again of its source",
@@ -85,8 +90,15 @@ pub fn about(gap: &DatasetGap) -> String {
             GapState::Unrecovered => "unrecovered: its source is not asked again",
             GapState::Unspecified => "its state not said",
         };
+        let said = match cause {
+            GapCause::WriteAheadBound => {
+                ". Rows held in the lake's write-ahead stream were lost \
+                 before the lake recorded them; which rows is not known, possibly none."
+            }
+            GapCause::Unspecified => " (its cause was not said)",
+        };
         format!(
-            "{} in {}, valid from {} to {}: {state} ({cause})",
+            "{} in {}, valid from {} to {}: {state}{said}",
             gap.gap_id,
             gap.dataset,
             at(gap.valid_from_ns),
@@ -243,7 +255,8 @@ mod tests {
             at(lost.valid_from_ns),
             at(lost.valid_until_ns),
             "possibly none".to_string(),
-            "dataset not yet known".to_string(),
+            "Which datasets is not yet known".to_string(),
+            "GAP-01L: rows held in the lake's write-ahead stream from".to_string(),
         ] {
             assert!(words.contains(&said), "{said}: {words}");
         }
@@ -257,6 +270,14 @@ mod tests {
             words.contains("possibly none") && !words.contains("away past"),
             "{words}"
         );
+        assert!(
+            words.ends_with(
+                "unrecovered: its source is not asked again. Rows held in the lake's \
+                 write-ahead stream were lost before the lake recorded them; which rows \
+                 is not known, possibly none."
+            ),
+            "{words}"
+        );
     }
 
     /// Once per gap, oldest first: the unattributed one, then the dataset's;
@@ -268,7 +289,7 @@ mod tests {
         let new = unfiled(&first, &mut filed);
         assert_eq!(new.len(), 1);
         assert!(
-            about(&new[0]).contains("dataset not yet known"),
+            about(&new[0]).contains("Which datasets is not yet known"),
             "{}",
             about(&new[0])
         );

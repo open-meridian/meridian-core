@@ -85,7 +85,7 @@ set up: the wizard is what a fresh install serves. The address your staff
 reach it at is one of the things the wizard asks for, so it is not a value you
 set.
 
-This deployment runs no identity server (decision 018). It signs people in one
+This deployment runs no identity server. It signs people in one
 of three ways, chosen in the wizard rather than here:
 
 - **Your OpenID Connect provider.** The dashboard federates to it, and nothing

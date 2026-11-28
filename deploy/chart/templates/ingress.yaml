@@ -1,6 +1,6 @@
 {{- /*
   How a browser and the CLI reach this deployment from outside the cluster
-  (spec/live-plugin-development, ruling 1; first-run ruling 7 as amended).
+  (spec/live-plugin-development; the first-run wizard's spec).
   Off by default, because the chart knows neither the name people will use
   nor whether the cluster has a controller to read this: the listing turns it
   on from the buyer's domain, and `meridian up` as `meridian.localhost` where
@@ -16,7 +16,7 @@
 
   HTTPS only, unless ingress.plainHttp turns plain HTTP on, which the cluster
   tests do and nothing else does (task kernel/a-development-deployment-serves-
-  https, ruling 3, amending spec/live-plugin-development requirement 2). So
+  https, amending spec/live-plugin-development requirement 2). So
   an Ingress with no certificate renders only with it on.
 */}}
 {{- if .Values.ingress.enabled }}

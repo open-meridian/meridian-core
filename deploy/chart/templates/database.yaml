@@ -34,7 +34,7 @@
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- /* A database past the first a store's writer groups write to (step
        3d; the resilience spec's section 6.4, `<store>.databases`): the
-       same, as `<release>-<store>-database-<d>` (approved 2026-11-12), its
+       same, as `<release>-<store>-database-<d>`, its
        pods labelled with that name, its WAL in its own stanza of the same
        archive, and a Secret of its URLs beside its passwords. */}}
 {{- $extra := dig "brought" "name" "" . }}
@@ -96,7 +96,7 @@
 {{- $synchronous := ternary 0 $standbys $converting }}
 {{- $scope := $name | trunc 63 | trimSuffix "-" }}
 {{- $archive := include "meridian-runtime.walArchive" . }}
-{{- /* Internal TLS (tls.internal; ruling 1084): served from the chart's
+{{- /* Internal TLS (tls.internal): served from the chart's
        certificate, copied where the server's user alone reads its key, and
        every remote connection held to TLS. */}}
 {{- $tls := .Values.tls.internal.enabled }}
@@ -138,7 +138,7 @@ data:
   # and the chart's start-up asks to hold the dynamic settings to the
   # chart's. Made beside the others on any install, used under Patroni.
   patroni: {{ $passwords.patroni }}
-  # The WAL archive's passphrase (backup.walArchive, ruling 1084), unless
+  # The WAL archive's passphrase (backup.walArchive), unless
   # backup.walArchive.cipherSecret names the administrator's own. Made on
   # any install, used where the archive is on, and carried sealed in every
   # backup with the rest of this Secret.
@@ -206,7 +206,7 @@ spec:
 ---
 # Member {{ $i }} by a name of its own (`<name>-{{ $i }}.<namespace>.svc`), which its
 # certificate carries: Patroni's members reach each other's REST API by it
-# over TLS, each verified by that name (ruled 2026-11-08); and a record-read
+# over TLS, each verified by that name; and a record-read
 # replica's Postgres, which the chart points the stores' readers at
 # (MERIDIAN_READ_DATABASE_HOST; contract v30, stage C2, approved
 # 2026-11-11). A Service per member, because a StatefulSet's pods have DNS
@@ -278,7 +278,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ---
 # How Patroni runs this database: the static half. Its timing is set for
-# the database tier, a primary lost answered for within 30 s (ruling 1048):
+# the database tier, a primary lost answered for within 30 s:
 # its leader key lasts `ttl` (Patroni's least, 20 s) unrenewed, renewed every
 # `loop_wait` (2 s). The dynamic half -- synchronous, strict, the timings --
 # lives in Patroni's ConfigMap once it has started, and is held to these
@@ -350,7 +350,7 @@ data:
         archive_timeout: {{ .Values.backup.walArchive.timeoutSeconds | default 60 | int }}
         {{- end }}
         {{- if $tls }}
-        # Internal TLS (ruling 1084): the chart's certificate, copied by
+        # Internal TLS: the chart's certificate, copied by
         # database.sh where the server's user alone reads its key.
         ssl: "on"
         ssl_cert_file: /run/meridian-tls/tls.crt
@@ -389,12 +389,12 @@ data:
 {{- end }}
 {{- if not $patroni }}
 ---
-# Who may connect (v31a item 6): the server's own pod, as the image's initdb
+# Who may connect: the server's own pod, as the image's initdb
 # admits it, then database.brought.pgHba's lines, or the chart's own -- under
-# internal TLS (ruling 1084) everyone else over TLS or not at all. Read from
+# internal TLS everyone else over TLS or not at all. Read from
 # here, never from the data directory, where the image's entrypoint wrote
-# its line unsynced and a power loss took it (LazyFS run 2: every
-# connection refused). A change restarts the server with it.
+# its line unsynced and a power loss took it (in a crash test, every
+# connection was refused). A change restarts the server with it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -527,7 +527,7 @@ spec:
             # from it by its pod's address, and Patroni asks its REST API
             # there too -- or, with internal TLS, by its own Service's name,
             # over TLS, its certificate verified by that name against the
-            # internal CA (ruled 2026-11-08). Patroni asks the other members
+            # internal CA. Patroni asks the other members
             # with the same CA (its ctl cacert).
             - name: PATRONI_POSTGRESQL_CONNECT_ADDRESS
               value: "$(POD_IP):5432"
@@ -617,7 +617,7 @@ spec:
             {{- include "meridian-runtime.databaseResources" . | nindent 12 }}
           {{- else }}
           {{- if $tls }}
-          # Internal TLS (ruling 1084): the chart's certificate copied where
+          # Internal TLS: the chart's certificate copied where
           # the server's user alone reads its key, as Postgres requires of
           # one, then the image's own entrypoint.
           command:
@@ -632,7 +632,7 @@ spec:
             - --
           {{- end }}
           # Its connections counted from what this chart deploys
-          # (databaseMaxConnections, ruled 2026-11-08), not Postgres's 100.
+          # (databaseMaxConnections), not Postgres's 100.
           args:
             - postgres
             - -c
@@ -657,7 +657,7 @@ spec:
             - -c
             - ssl_ca_file=/run/meridian-tls/ca.crt
             {{- end }}
-            # Who may connect, from the ConfigMap beside it (v31a item 6).
+            # Who may connect, from the ConfigMap beside it.
             - -c
             - hba_file=/etc/meridian-hba/pg_hba.conf
           env:
@@ -688,7 +688,7 @@ spec:
             # Page checksums on a database made here (step 3b, 5j), read
             # only by initdb on an empty volume: one made before keeps what
             # it had, and `meridian upgrade-deployment --enable-checksums`
-            # turns them on (ruling 1058).
+            # turns them on.
             - name: POSTGRES_INITDB_ARGS
               value: --data-checksums
             {{- end }}
