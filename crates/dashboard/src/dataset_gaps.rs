@@ -56,23 +56,33 @@ fn at(ns: i64) -> String {
     crate::custody::utc(ns)
 }
 
-/// The dashboard's words for a gap.
+/// The dashboard's words for a gap: true of a run the stream dropped at
+/// its bound and of a stream lost whole under its writer alike (the
+/// consensus of 2026-11-28; its review's finding 1) -- rows lost before the
+/// lake took them, which rows not known, possibly none. A gap that names
+/// no dataset says its window, by the stream's time, as a dataset's says
+/// its valid range.
 pub fn about(gap: &DatasetGap) -> String {
     let cause = match GapCause::try_from(gap.cause).unwrap_or(GapCause::Unspecified) {
-        GapCause::WriteAheadBound => "the lake's writer was away past its write-ahead bound",
+        GapCause::WriteAheadBound => {
+            "rows the lake's write-ahead stream held were lost before the lake took them; \
+             which rows is not known, possibly none"
+        }
         GapCause::Unspecified => "its cause was not said",
     };
     if gap.dataset.is_empty() {
         format!(
-            "{} in the lake's write-ahead stream: rows the stream dropped before the lake took them, \
-             dataset not yet known; each dataset is named as it writes next ({cause})",
-            gap.gap_id
+            "{} in the lake's write-ahead stream, from {} to {} by the stream's time, \
+             dataset not yet known: a dataset whose next write follows it is named then ({cause})",
+            gap.gap_id,
+            at(gap.valid_from_ns),
+            at(gap.valid_until_ns)
         )
     } else {
         let state = match GapState::try_from(gap.state).unwrap_or(GapState::Unspecified) {
             GapState::Refetching => "asked again of its source",
             GapState::Recovered => "recovered",
-            GapState::Unrecovered => "unrecovered: its source cannot be asked again",
+            GapState::Unrecovered => "unrecovered: its source is not asked again",
             GapState::Unspecified => "its state not said",
         };
         format!(
@@ -225,6 +235,36 @@ mod tests {
             recorded_at_ns: at,
             ..Default::default()
         }
+    }
+
+    /// The review of the lost stream's gap, finding 1: a gap that names no
+    /// dataset says its window, both times, and its words are true of a
+    /// stream lost whole too -- which rows not known, possibly none --
+    /// never that a writer was away past a bound.
+    #[test]
+    fn a_gap_naming_no_dataset_says_its_window_and_that_its_rows_are_not_known() {
+        let mut lost = gap("GAP-01L", "", 5, GapState::Unrecovered);
+        lost.valid_from_ns = 1_795_834_034_000_000_000;
+        lost.valid_until_ns = 1_795_834_099_000_000_000;
+        let words = about(&lost);
+        for said in [
+            at(lost.valid_from_ns),
+            at(lost.valid_until_ns),
+            "possibly none".to_string(),
+            "dataset not yet known".to_string(),
+        ] {
+            assert!(words.contains(&said), "{said}: {words}");
+        }
+        assert_ne!(at(lost.valid_from_ns), at(lost.valid_until_ns));
+        assert!(!words.contains("away past"), "{words}");
+        // A dataset's own, of a lost stream: the same cause's words.
+        let mut named = lost.clone();
+        named.dataset = "drive-data:drive".into();
+        let words = about(&named);
+        assert!(
+            words.contains("possibly none") && !words.contains("away past"),
+            "{words}"
+        );
     }
 
     /// Once per gap, oldest first: the unattributed one, then the dataset's;

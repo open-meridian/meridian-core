@@ -767,38 +767,56 @@ impl Writer {
 
     /// The stream this writer follows is gone from the broker, or made
     /// again under its name: the writes it held past the writer's place
-    /// are lost, and nobody can say which, or whether there were any. A
-    /// gap is recorded for it as one is for a run the stream dropped at
-    /// its bound (W10.14), in one commit under the writer's place, which
-    /// stays where it is: its datasets not known, and never named later --
-    /// the stream that takes its place numbers its writes anew, so no
-    /// write's chain reaches into this one (item 191 holds for the
-    /// numbering; what this stream held is unknown, and marked). By time:
-    /// from the stream's time of the last write the lake recorded from it
-    /// -- from when the stream was made, where it recorded none -- to now.
-    /// No sequence is named: the run is empty (`first` past `last`).
+    /// are lost, and nobody can say which, or whether there were any. It
+    /// is marked with the existing gap record (W10.14), in one commit
+    /// under the writer's place, which stays where it is: a gap for each
+    /// dataset the lake keeps as written through this stream under this
+    /// place's key (the safe reading: any of them may have had a write in
+    /// it), or, where it keeps none, the one gap that names no dataset.
+    /// None is named later -- the stream that takes its place numbers its
+    /// writes anew, so no write's chain reaches into this one (item 191
+    /// holds for the numbering; what this stream held is unknown, and
+    /// marked).
+    ///
+    /// The window is by time: from the stream's time of the last write the
+    /// lake recorded from it -- from when the stream was made, where it
+    /// recorded none -- to the lake's time now. Two clocks: the start is
+    /// the broker's, the end the lake's (the review's finding 9). A write
+    /// the stream held is inside the window only where the lake's clock,
+    /// when the loss is marked, is past the broker's when it took the
+    /// write. On the gone path the broker has by then said so for
+    /// [`GONE_AFTER`], so the two may differ by that much; where the stream
+    /// was made again, `made_again_ns` is the new stream's making on the
+    /// broker's own clock, which every write of the old one precedes, and
+    /// the window never ends before it. It never ends before it starts:
+    /// a lake's clock behind the broker's leaves a window of the start
+    /// alone, not one moved back before it.
+    ///
+    /// A writer that had no place in the stream commits none with the
+    /// mark (the review's finding 7): a place before the stream's first
+    /// write would stop group 0 counting the stream's own sequences from
+    /// 1 if the stream were then found still there (item 203).
+    ///
+    /// No run of sequences is kept for it: it names none.
     ///
     /// INTERIM(v32): v32 takes the stream off the write path.
-    pub fn lost(&mut self) -> Result<Dropped, StoreError> {
-        let next = self.next();
-        let run = Dropped {
-            first: next,
-            last: next - 1,
-            after_at_ns: self.placed().map_or(self.identity, |at| at.at_ns),
-            until_at_ns: self.lake.now_ns(),
-            gap_id: self.lake.new_gap_id(),
-        };
-        let batch = WriteAheadBatch {
-            stream: self.stream.clone(),
-            after: self.position,
-            through: self.position.unwrap_or_default(),
-            dropped: vec![run.clone()],
-            ..Default::default()
-        };
-        self.lake.record_written(Vec::new(), batch, &self.valid)?;
-        self.position = Some(self.position.unwrap_or_default());
-        self.dropped.push(run.clone());
-        Ok(run)
+    pub fn lost(
+        &mut self,
+        made_again_ns: Option<i64>,
+    ) -> Result<Vec<meridian_domain::v1::DatasetGap>, StoreError> {
+        let after_at_ns = self.placed().map_or(self.identity, |at| at.at_ns);
+        let until_at_ns = self
+            .lake
+            .now_ns()
+            .max(made_again_ns.unwrap_or(0))
+            .max(after_at_ns);
+        self.lake.record_lost(
+            &self.stream,
+            self.position,
+            after_at_ns,
+            until_at_ns,
+            &self.valid,
+        )
     }
 
     /// The identity of the stream the writer was started in.
@@ -1280,8 +1298,19 @@ pub async fn taken_past_a_switch(
 /// How long the broker must have said, at every look, that it holds no
 /// write-ahead stream before a writer that was following one makes it
 /// again: longer than the broker's own cleanup of a stream its servers
-/// still hold the files of (30 s after a server starts, NATS 2.10), so the
-/// stream is never made over one still on disk.
+/// still hold the files of (30 s after a server starts, NATS 2.10).
+///
+/// A margin, not a guarantee (the review's finding 4): it is counted from
+/// the broker's first "stream not found", which its metadata leader can
+/// say once two servers are up. A third server that starts more than
+/// about 30 s after that still holds the old stream's files when the
+/// lake makes the stream. What NATS 2.10.29 then does is not shown: the
+/// three-server test that restarts them with such a stagger is not built
+/// yet. Counting from when every peer of the metadata group is current
+/// is not built either: no JetStream request the lake already makes says
+/// it while the broker holds no stream. Whatever the broker does there,
+/// the gap is marked first, and a write taken again is recorded once, by
+/// its row key.
 ///
 /// INTERIM(v32): v32 takes the stream off the write path, and the lake no
 /// longer makes it again (the consensus of 2026-11-28, run 46090125342).
@@ -1313,26 +1342,37 @@ impl Gone {
 }
 
 /// The gap marked for a write-ahead stream the broker no longer holds, or
-/// holds made again under its name, while this writer followed it
-/// ([`Writer::lost`]): tried until the store keeps it, since the stream is
-/// never made again, or taken as another, with nothing marked.
+/// holds made again under its name (`made_again_ns`, the new one's making),
+/// while this writer followed it ([`Writer::lost`]): tried until the store
+/// keeps it, since the stream is never made again, or taken as another,
+/// with nothing marked. A fenced writer's is not tried again: it is no
+/// longer the lake's writer, and says so (the review's finding 6).
 ///
 /// INTERIM(v32): gone with the stream on the write path.
-async fn lost_marked(writer: &mut Writer) {
+pub(crate) async fn lost_marked(
+    writer: &mut Writer,
+    made_again_ns: Option<i64>,
+) -> Result<(), String> {
     loop {
-        match tokio::task::block_in_place(|| writer.lost()) {
-            Ok(run) => {
-                tracing::warn!(
-                    stream = STREAM,
-                    identity = writer.identity(),
-                    gap_id = run.gap_id,
-                    after_at_ns = run.after_at_ns,
-                    until_at_ns = run.until_at_ns,
-                    "the lake's write-ahead stream is gone from the broker: a write it held \
-                     that the lake had not recorded is lost; a gap recorded over the time \
-                     since the lake's place in it, its writes unknown, possibly none"
-                );
-                return;
+        match tokio::task::block_in_place(|| writer.lost(made_again_ns)) {
+            Ok(gaps) => {
+                for gap in &gaps {
+                    tracing::warn!(
+                        stream = STREAM,
+                        identity = writer.identity(),
+                        gap_id = gap.gap_id,
+                        dataset = gap.dataset,
+                        valid_from_ns = gap.valid_from_ns,
+                        valid_until_ns = gap.valid_until_ns,
+                        "the lake's write-ahead stream is gone from the broker: a write it held \
+                         that the lake had not recorded is lost; a gap recorded over the time \
+                         since the lake's place in it, its writes unknown, possibly none"
+                    );
+                }
+                return Ok(());
+            }
+            Err(StoreError::Fenced(fenced)) => {
+                return Err(format!("the lake's writer was fenced: {fenced}"));
             }
             Err(failed) => {
                 tracing::warn!(%failed, "the gap for the lost write-ahead stream could not be recorded yet");
@@ -1383,11 +1423,16 @@ pub async fn write_forever(
     waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) -> Result<(), String> {
     let waiting = Arc::new(waiting);
+    let mut first = true;
     loop {
         let waiting = Arc::clone(&waiting);
-        written_until_gone(Arc::clone(&lake), client.clone(), bounds, move |said| {
-            waiting(said)
-        })
+        written_until_gone(
+            Arc::clone(&lake),
+            client.clone(),
+            bounds,
+            std::mem::take(&mut first),
+            move |said| waiting(said),
+        )
         .await?;
     }
 }
@@ -1412,6 +1457,7 @@ async fn written_until_gone(
     lake: Arc<Lake>,
     client: async_nats::Client,
     bounds: Bounds,
+    first: bool,
     waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) -> Result<(), String> {
     let context = jetstream::new(client.clone());
@@ -1478,9 +1524,11 @@ async fn written_until_gone(
     ));
     let _guarding = AbortOnDrop(guarding);
     // The gaps the last writer was asking for again, asked again by this
-    // one (W10.14): their wants were in its memory.
+    // one (W10.14): their wants were in its memory. At the process's first start alone
+    // (`first`), not at each start in a stream made again, where the wants
+    // it asked are still in its memory (the review's finding 5).
     // Group 0's, which holds the lake's wants (step 3d).
-    let resumed = if lake.groups().holds_control() {
+    let resumed = if first && lake.groups().holds_control() {
         tokio::task::block_in_place(|| lake.resume_gaps())
     } else {
         Ok(0)
@@ -1515,7 +1563,7 @@ async fn written_until_gone(
                     "the broker holds no write-ahead stream and has said so for the bound: \
                      its gap is marked, and the stream is made again"
                 );
-                lost_marked(&mut writer).await;
+                lost_marked(&mut writer, None).await?;
                 return Ok(());
             }
             Err(failed) => {
@@ -1545,9 +1593,11 @@ async fn written_until_gone(
                 // made this one: what it held past the place is unknown,
                 // and marked before the other is taken (INTERIM(v32), the
                 // consensus of 2026-11-28).
-                lost_marked(&mut writer).await;
-                writer = started(&lake, identity).await;
-                continue;
+                // Then the start again, as on the gone path: the guard and
+                // this release's bounds are the new stream's (the review's
+                // finding 8).
+                lost_marked(&mut writer, Some(identity)).await?;
+                return Ok(());
             }
             Ok((messages, _, identity)) => {
                 lake.with_stream(identity);

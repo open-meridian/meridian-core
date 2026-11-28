@@ -67,6 +67,10 @@ pub struct MemoryStore {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     owners_read: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Whether every write-ahead batch is refused, as a store that cannot
+    /// be reached refuses it.
+    #[cfg(test)]
+    write_ahead_refused: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryStore {
@@ -91,6 +95,14 @@ impl MemoryStore {
     #[cfg(test)]
     pub(crate) fn on_owners_read(&self, read: impl Fn() + Send + 'static) {
         *self.owners_read.lock().unwrap() = Some(Box::new(read));
+    }
+
+    /// Refuse every write-ahead batch from now (`refused`), or take them
+    /// again: what a store that cannot be reached does, and then can.
+    #[cfg(test)]
+    pub(crate) fn refuse_write_ahead_for_test(&self, refused: bool) {
+        self.write_ahead_refused
+            .store(refused, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Hold this store's writer at `epoch`, as a deposed writer holds the
@@ -533,6 +545,15 @@ impl Store for MemoryStore {
         batch: WriteAheadBatch,
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
+        #[cfg(test)]
+        if self
+            .write_ahead_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::Unavailable(
+                "a test's store, refusing every write-ahead batch".into(),
+            ));
+        }
         let mut held = self.lock();
         let epoch = self.fenced(&mut held)?;
         let at = held.write_ahead.get(&batch.stream).copied();

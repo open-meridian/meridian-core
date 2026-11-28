@@ -1356,29 +1356,36 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
         "every write of the stream made again under the running writer taken and answered"
     );
     // No write of it follows a gap; the stream the writer held a place in,
-    // gone under it, is marked once, its datasets unknown (the consensus
-    // of 2026-11-28).
+    // gone under it, is marked once, for the dataset the lake keeps as
+    // written through it, found from no run (the consensus of 2026-11-28).
     let now_gaps = gaps(&h, "", GapState::Unspecified);
     let lost: Vec<&DatasetGap> = now_gaps
         .iter()
         .filter(|gap| !old_gaps.contains(gap))
         .collect();
     assert_eq!(lost.len(), 1, "the lost stream's gap alone: {now_gaps:?}");
-    assert!(lost[0].dataset.is_empty() && lost[0].found_in_gap_id.is_empty());
+    assert_eq!(lost[0].dataset, "coinbase-1:daily");
+    assert!(lost[0].found_in_gap_id.is_empty());
+    assert_eq!(lost[0].state, GapState::Unrecovered as i32);
     context.delete_stream(STREAM).await.unwrap();
 }
 
-/// The consensus of 2026-11-28 (run 46090125342), option 2: a stream gone
-/// under a writer that held a place in it is marked with the existing gap
-/// record -- one gap, no dataset (nobody can say whose writes it held),
-/// unrecovered so it is shown at once and stays shown, over the time from
-/// the last write the lake recorded from the stream to now; no sequence
-/// named. The writer's place stays where it was. A stream it had recorded
-/// nothing from is marked from when the stream was made, its identity.
+/// The consensus of 2026-11-28 (run 46090125342), option 2, and the review
+/// of it (findings 2, 7 and 9): a stream gone under a writer that held a
+/// place in it is marked with the existing gap record -- a gap for each
+/// dataset the lake keeps as written through it, unrecovered so it is shown
+/// at once and stays shown, and asked of nobody though the dataset declares
+/// `backfill` (no subject is known to ask for); from the earlier of the
+/// stream's time of the last write recorded and the dataset's latest valid
+/// time, to now. The writer's place stays where it was. A stream it had
+/// recorded nothing from is marked by the one gap that names no dataset,
+/// from when the stream was made, its identity, and no place is committed
+/// in it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stream_lost_under_its_writer_is_marked_as_one_gap_by_time_naming_no_dataset() {
+async fn a_stream_lost_under_its_writer_is_marked_for_each_dataset_it_kept_by_time() {
     let h = harness();
     tokio::task::block_in_place(|| gap_configured(&h));
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
     let made_at = NOW - 5_000;
     let mut writer = Writer::start(h.lake.clone(), STREAM, made_at).unwrap();
     let taken = (1..=3)
@@ -1394,35 +1401,117 @@ async fn a_stream_lost_under_its_writer_is_marked_as_one_gap_by_time_naming_no_d
     tokio::task::block_in_place(|| writer.take(taken)).unwrap();
     assert!(gaps(&h, "", GapState::Unspecified).is_empty());
     h.clock.set(NOW + 9_000);
-    let run = tokio::task::block_in_place(|| writer.lost()).unwrap();
-    assert!(run.first > run.last, "no sequence is named: {run:?}");
-    assert!(!(1..=10).any(|sequence| run.holds(sequence)));
+    let lost = tokio::task::block_in_place(|| writer.lost(None)).unwrap();
     let marked = gaps(&h, "", GapState::Unspecified);
+    assert_eq!(marked, lost, "what was recorded is what was marked");
     assert_eq!(marked.len(), 1, "{marked:?}");
     let gap = &marked[0];
-    assert_eq!(gap.gap_id, run.gap_id);
-    assert_eq!(gap.dataset, "");
+    assert_eq!(gap.dataset, "coinbase-1:daily");
     assert!(gap.subjects.is_empty() && gap.found_in_gap_id.is_empty());
     assert_eq!(gap.cause, GapCause::WriteAheadBound as i32);
     assert_eq!(gap.state, GapState::Unrecovered as i32);
-    // From the stream's time of write 3, the last recorded, to now.
+    // From the dataset's latest valid time recorded, earlier here than the
+    // stream's time of write 3, the last recorded, to now.
     assert_eq!(
         (gap.valid_from_ns, gap.valid_until_ns),
-        (NOW + 3, NOW + 9_000)
+        (NOW - 100_000 + 3, NOW + 9_000)
     );
-    assert_eq!(gaps(&h, "", GapState::Unrecovered), marked);
+    assert_eq!(gaps(&h, "coinbase-1:daily", GapState::Unrecovered), marked);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), wanted.recv())
+            .await
+            .is_err(),
+        "nothing is asked again: no subject is known to ask for"
+    );
     // Its place is where it was, kept: a writer started in the same stream
-    // again holds it, and the run names none of its writes.
+    // again holds it.
     assert_eq!(writer.next(), 4);
     let again = Writer::start(h.lake.clone(), STREAM, made_at).unwrap();
     assert_eq!(again.next(), 4);
-    // A stream the lake recorded nothing from: marked from when it was made.
+    // A stream the lake recorded nothing from: marked from when it was
+    // made, naming no dataset, and no place committed in it (finding 7) --
+    // found still there, its own sequences are counted from 1.
     let other = NOW - 2_000;
     let mut unplaced = Writer::start(h.lake.clone(), STREAM, other).unwrap();
-    let run = tokio::task::block_in_place(|| unplaced.lost()).unwrap();
-    assert_eq!((run.after_at_ns, run.until_at_ns), (other, NOW + 9_000));
-    assert_eq!(unplaced.placed(), None);
+    let lost = tokio::task::block_in_place(|| unplaced.lost(None)).unwrap();
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0].dataset, "");
+    assert_eq!(
+        (lost[0].valid_from_ns, lost[0].valid_until_ns),
+        (other, NOW + 9_000)
+    );
+    assert_eq!(unplaced.position(), None);
+    let unplaced = Writer::start(h.lake.clone(), STREAM, other).unwrap();
+    assert_eq!(unplaced.position(), None, "no place was committed");
     assert_eq!(gaps(&h, "", GapState::Unspecified).len(), 2);
+}
+
+/// The silent loss of 2026-11-28 (`make test-jetstream` at 7f80a4d3: a
+/// write the deleted stream held was neither recorded nor inside the gap,
+/// whose window was empty and ended before it): the window's end was the
+/// lake's clock alone, and a lake's clock behind the stream's time of the
+/// last write recorded moved the whole window back before that write. The
+/// window never ends before it starts, and where the stream was made again
+/// never before the new one's making, by the broker's clock, which every
+/// write of the old one precedes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_streams_gap_never_ends_before_its_start_or_before_the_stream_made_again() {
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let made_at = NOW - 5_000;
+    // A place, and no dataset kept under it: the stream's own window.
+    let place = |writer: &mut Writer| {
+        let mut write = written(1, "coinbase-1", Vec::new());
+        write.envelope.payload_type = "meridian.v1.Nothing".into();
+        tokio::task::block_in_place(|| writer.take(vec![write])).unwrap();
+        assert_eq!(writer.next(), 2);
+    };
+    // The lake's clock behind the stream's: write 1 was taken at NOW + 1.
+    h.clock.set(NOW - 50_000);
+    let mut writer = Writer::start(h.lake.clone(), STREAM, made_at).unwrap();
+    place(&mut writer);
+    let lost = tokio::task::block_in_place(|| writer.lost(None)).unwrap();
+    assert_eq!(
+        (lost[0].valid_from_ns, lost[0].valid_until_ns),
+        (NOW + 1, NOW + 1),
+        "from the last write recorded, never moved back before it"
+    );
+    // Made again at NOW + 77 by the broker's clock: a write the old stream
+    // took at NOW + 40 is inside the window, whatever the lake's clock says.
+    let mut writer = Writer::start(h.lake.clone(), STREAM, made_at + 1).unwrap();
+    place(&mut writer);
+    let lost = tokio::task::block_in_place(|| writer.lost(Some(NOW + 77))).unwrap();
+    assert_eq!(
+        (lost[0].valid_from_ns, lost[0].valid_until_ns),
+        (NOW + 1, NOW + 77)
+    );
+    assert!(lost[0].valid_from_ns <= NOW + 40 && NOW + 40 <= lost[0].valid_until_ns);
+}
+
+/// The review's finding 6: a fenced writer's mark of a lost stream is not
+/// tried again for ever; it ends as a fenced batch ends the writer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_writer_marking_a_lost_stream_ends_saying_so() {
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let mut writer = Writer::start(h.lake.clone(), STREAM, NOW - 5_000).unwrap();
+    let price = close("coinbase-1", "F:1", BTC, "2026-10-07", "1");
+    let taken = vec![written(1, "coinbase-1", vec![price])];
+    tokio::task::block_in_place(|| writer.take(taken)).unwrap();
+    // Taken over by another writer: this store acts as the deposed one,
+    // at the epoch it had.
+    h.store
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap();
+    h.store.fence_for_test(1);
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::write_ahead::lost_marked(&mut writer, None),
+    )
+    .await
+    .expect("a fenced writer's mark was tried again and again");
+    assert!(ended.unwrap_err().contains("fenced"));
+    assert!(gaps(&h, "", GapState::Unspecified).is_empty());
 }
 
 /// The consensus of 2026-11-28, option 1: the stream is said gone only once
@@ -1454,13 +1543,23 @@ fn a_stream_is_gone_only_once_the_broker_has_said_so_for_the_whole_bound() {
 /// against a real JetStream: the stream is deleted under a writer following
 /// it, as the broker's orphan cleanup deleted it in that run. The writer
 /// makes none for as long as the bound -- still none 45 s on -- then makes
-/// it again and takes and answers its writes. Each of the two writes the
-/// deleted stream took last is either answered, so recorded, or inside the
-/// one gap marked for the lost stream, which names no dataset: none is
-/// silently missing.
+/// it again and takes and answers its writes.
 ///
-/// Run by `make test-jetstream`; by hand as
-/// `a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody`.
+/// A write inside the gap, each time (the review's finding 3): the lake's
+/// store refuses every batch while the stream takes and acknowledges
+/// writes 4 and 5, and takes batches again only once the stream is
+/// deleted, so the lake never records them. Their times at the broker are
+/// read from the stream before it goes. The lake's place is still write 3;
+/// the gap -- its dataset's, the one the lake keeps as written through the
+/// stream -- is there when the stream made again is first seen; and both
+/// writes' times are inside its window: neither is silently missing. The
+/// lake's clock is the system's, as a deployment's is: at 7f80a4d3 this
+/// test's clock stood still from before the stream was made, and the gap's
+/// window ended before the writes it was to hold.
+///
+/// Run by `make test-jetstream`; by hand with `MERIDIAN_TEST_JETSTREAM_URL`
+/// set and `--ignored --exact
+/// tests::write_ahead::a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
 async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked(
@@ -1479,23 +1578,33 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
         max_bytes: 64 << 20,
         replicas: 1,
     };
-    let h = harness();
-    tokio::task::block_in_place(|| gap_configured(&h));
-    // The lake's clock is the broker's day: the gap is over the stream's times.
-    let real = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64
+    // The lake on the system's clock, as a deployment's is: the gap's
+    // window ends at the lake's time when the loss is marked.
+    let h = {
+        let clock = Arc::new(meridian_clock::SystemClock);
+        let bus = Arc::new(Bus::single(
+            "lake-1",
+            Arc::new(MemoryBackend::new()),
+            clock.clone(),
+        ));
+        stand_ins(&bus);
+        let store = Arc::new(MemoryStore::new());
+        let lake = service::serve(bus.clone(), store.clone(), clock);
+        lake.configured(&configuration(true, &[]));
+        Harness {
+            bus,
+            store,
+            clock: Arc::new(ManualClock::at(NOW)),
+            lake,
+        }
     };
-    h.clock.set(real());
+    tokio::task::block_in_place(|| gap_configured(&h));
     let tag = std::process::id();
     let mut answered = client
         .subscribe(format!("_INBOX.coinbase-1.sls-{tag}.>"))
         .await
         .unwrap();
     client.flush().await.unwrap();
-    // Each write's time at the broker lies between the two times returned.
     let put = |round: &'static str, n: u64| {
         let context = context.clone();
         async move {
@@ -1517,7 +1626,7 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
                 format!("_INBOX.coinbase-1.sls-{tag}.{round}.{n}").as_str(),
             );
             write.envelope.meta.as_mut().unwrap().published_at_ns = NOW;
-            let before = real();
+            // Acknowledged by the stream: its sequence there.
             context
                 .publish_with_headers(
                     subject("coinbase-1", "daily"),
@@ -1527,8 +1636,8 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
                 .await
                 .unwrap()
                 .await
-                .unwrap();
-            (before, real())
+                .unwrap()
+                .sequence
         }
     };
     async fn heard(
@@ -1553,8 +1662,8 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
         }
         seen
     }
-    let mut old = context.create_stream(stream_config(&bounds)).await.unwrap();
-    let old = identity(old.info().await.unwrap());
+    let mut stream = context.create_stream(stream_config(&bounds)).await.unwrap();
+    let old = identity(stream.info().await.unwrap());
     let writer = {
         let (lake, client) = (h.lake.clone(), client.clone());
         tokio::spawn(async move { write_forever(lake, client, bounds, |_| {}).await })
@@ -1564,11 +1673,30 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
     }
     let first = heard(&mut answered, "old", 3, Duration::from_secs(30)).await;
     assert_eq!(first, [1, 2, 3].into(), "the stream's first three");
-    // Two more, and the stream deleted under the writer at once.
-    let last_two = [(4, put("old", 4).await), (5, put("old", 5).await)];
+    let key = crate::write_ahead::stream_key(STREAM, old);
+    let place = || h.lake.write_ahead_position(&key).unwrap().unwrap().sequence;
+    assert_eq!(place(), 3);
+    // The store refuses every batch; the stream takes and acknowledges two
+    // more, whose times at the broker are read from it; then it is deleted
+    // under the writer, and only then does the store take batches again.
+    h.store.refuse_write_ahead_for_test(true);
+    let mut held = Vec::new();
+    for n in 4..=5 {
+        let sequence = put("old", n).await;
+        assert_eq!(sequence, n, "acknowledged by the stream");
+        let at = stream.direct_get(sequence).await.unwrap().time;
+        held.push((n, at.unix_timestamp_nanos() as i64));
+    }
     context.delete_stream(STREAM).await.unwrap();
     let deleted = tokio::time::Instant::now();
+    // Nothing the stream sent before it went is still on its way.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    h.store.refuse_write_ahead_for_test(false);
     let taken = heard(&mut answered, "old", 2, Duration::from_secs(5)).await;
+    assert!(
+        taken.is_empty(),
+        "never recorded, never answered: {taken:?}"
+    );
     // Not made again before the bound: 45 s on, the broker holds none.
     tokio::time::sleep_until(deleted + Duration::from_secs(45)).await;
     assert!(
@@ -1579,20 +1707,28 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
         gaps(&h, "", GapState::Unspecified).is_empty(),
         "a gap marked before the broker's word had stood for the bound"
     );
-    // Made again once it has, by the writer, as another stream.
+    // Made again once it has, by the writer, as another stream; its gap is
+    // there when the stream made again is first seen.
     let mut made = None;
     while made.is_none() && deleted.elapsed() < Duration::from_secs(120) {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         if let Ok(mut stream) = context.get_stream(STREAM).await {
             made = stream.info().await.ok().map(|info| identity(info));
         }
     }
+    let marked = gaps(&h, "", GapState::Unspecified);
     let made = made.expect(
         "the stream deleted under the following writer was never made again: the lake takes \
          no write until its writer is restarted",
     );
     assert_ne!(made, old, "another stream");
     assert!(deleted.elapsed() >= Duration::from_secs(60));
+    assert_eq!(marked.len(), 1, "the lost stream's gap alone: {marked:?}");
+    assert_eq!(
+        place(),
+        3,
+        "the lake's place in the lost stream is where it was"
+    );
     // It records again.
     for n in 1..=2 {
         put("new", n).await;
@@ -1605,26 +1741,25 @@ async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound
         [1, 2].into(),
         "the stream made again is taken and answered"
     );
-    // One gap, no dataset, unrecovered; and each of the last two writes
-    // answered or inside it.
-    let marked = gaps(&h, "", GapState::Unspecified);
-    assert_eq!(marked.len(), 1, "the lost stream's gap alone: {marked:?}");
+    // One gap, its dataset's, unrecovered; writes 4 and 5, never recorded,
+    // each inside its window.
+    assert_eq!(gaps(&h, "", GapState::Unspecified), marked, "and no other");
     let gap = &marked[0];
-    assert!(gap.dataset.is_empty() && gap.found_in_gap_id.is_empty());
+    assert_eq!(gap.dataset, "coinbase-1:daily");
+    assert!(gap.found_in_gap_id.is_empty());
     assert_eq!(gap.state, GapState::Unrecovered as i32);
     assert_eq!(gap.cause, GapCause::WriteAheadBound as i32);
-    for (n, (before, after)) in last_two {
+    for (n, at_ns) in held {
         assert!(
-            taken.contains(&n) || (gap.valid_from_ns <= after && before <= gap.valid_until_ns),
-            "write {n}, held by the deleted stream between {before} and {after}, was neither \
-             recorded nor inside the gap marked ({} to {})",
+            gap.valid_from_ns <= at_ns && at_ns <= gap.valid_until_ns,
+            "write {n}, acknowledged by the deleted stream at {at_ns} and never recorded, is \
+             outside the gap marked ({} to {})",
             gap.valid_from_ns,
             gap.valid_until_ns
         );
     }
-    println!(
-        "of the deleted stream's last two writes, recorded: {taken:?}; the rest inside the gap"
-    );
+    let rows = tokio::task::block_in_place(|| h.store.dataset_gaps()).unwrap();
+    assert_eq!(rows.len(), 1, "marked once");
     context.delete_stream(STREAM).await.unwrap();
 }
 

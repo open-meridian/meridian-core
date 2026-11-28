@@ -5124,6 +5124,110 @@ async fn a_write_refused_and_answered_is_not_recorded_when_the_lakes_place_is_ta
     );
 }
 
+/// The consensus of 2026-11-28 and its review (findings 2 and 7), on
+/// Postgres: a write-ahead stream lost under its writer is marked in one
+/// commit under the writer's place, which does not move -- a gap for the
+/// dataset the store keeps as written through the stream, unrecovered --
+/// and a writer with no place in its stream marks the one gap that names
+/// no dataset and commits no place.
+///
+/// INTERIM(v32): v32 takes the stream off the write path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_write_ahead_stream_is_marked_under_the_writers_place_which_does_not_move() {
+    use meridian_domain::v1::{GapState, RecordTradesRequest};
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{
+        position_key, stream_key, taken_past_a_switch, Taken, Writer,
+    };
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    // Each dropped off the runtime, a failed run's too, its schema with it.
+    let (_url, store) = tokio::task::block_in_place(|| isolated("sl2"));
+    let store = OffRuntime::new(Arc::new(store));
+    let kept = unique("coinbase-1:sl2-kept");
+    let subject = unique("LCL-BTC");
+    let lake = OffRuntime::new(tokio::task::block_in_place(|| {
+        ha_lake(&store, "lake-1", &kept)
+    }));
+    let write = |n: u64| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.sl2.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("sl2-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(&kept, &format!("p{n}"), &subject, 7_000 + n as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: kept.clone(),
+        timeout_ms: None,
+    };
+    let made = 500;
+    let mut writer = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake.clone(), STREAM, made)).unwrap(),
+    );
+    let answered = taken_past_a_switch(&mut writer, vec![write(1)])
+        .await
+        .unwrap();
+    assert!(answered[0].1.is_ok(), "{answered:?}");
+    let key = position_key(&stream_key(STREAM, made), lake.groups());
+    let place = tokio::task::block_in_place(|| store.write_ahead_position(&key)).unwrap();
+    assert_eq!(place.map(|at| at.sequence), Some(1));
+    // Lost: one gap, the dataset's, from its latest valid time recorded to
+    // the lake's time; the place where it was.
+    let lost = tokio::task::block_in_place(|| writer.lost(None)).unwrap();
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert_eq!(lost[0].dataset, kept);
+    assert_eq!(lost[0].state, GapState::Unrecovered as i32);
+    assert!(lost[0].valid_from_ns <= 1_001 && lost[0].valid_until_ns > 1_001);
+    let kept_gaps = tokio::task::block_in_place(|| store.dataset_gaps()).unwrap();
+    assert_eq!(kept_gaps, lost, "recorded as marked, once");
+    assert_eq!(
+        tokio::task::block_in_place(|| store.write_ahead_position(&key)).unwrap(),
+        place,
+        "the place does not move"
+    );
+    assert_eq!(writer.next(), 2);
+    // A writer with no place in its stream: the gap that names no dataset,
+    // from the stream's making, and no place committed.
+    let other = 900;
+    let mut unplaced = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake.clone(), STREAM, other)).unwrap(),
+    );
+    let lost = tokio::task::block_in_place(|| unplaced.lost(None)).unwrap();
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert!(lost[0].dataset.is_empty());
+    assert_eq!(lost[0].valid_from_ns, other);
+    let other_key = position_key(&stream_key(STREAM, other), lake.groups());
+    assert_eq!(
+        tokio::task::block_in_place(|| store.write_ahead_position(&other_key)).unwrap(),
+        None,
+        "no place committed where there was none"
+    );
+    assert_eq!(
+        tokio::task::block_in_place(|| store.dataset_gaps())
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 /// Contract v30, stage E (W10.14): what a batch from the write-ahead stream
 /// found -- the runs the stream dropped, each dataset's latest valid time,
 /// each gap -- commits with it, and each gap's next state is its own
