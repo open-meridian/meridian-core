@@ -2,7 +2,7 @@
 //! M; spec/a-deployment-is-observable-by-open-standards, ruled item 2 and
 //! section 7; the notice kinds approved 2026-11-09).
 //!
-//! Each minute the dashboard asks the conductor for every member's latest
+//! Every 20 seconds the dashboard asks the conductor for every member's latest
 //! report (`ReadComponentHealth`), keeps the last 24 hours of it, and files a
 //! notice, once, when one of these opens: the member restarted; it reserved,
 //! or holds resident, more than its working budget; it shed a request; it
@@ -11,8 +11,9 @@
 //! notices go to the deployment admins, on the latency judge's path (the
 //! Inbox and `dashboard__read_inbox`); a plugin's, the same five kinds, to
 //! its admins, from its sidecar's report as it carries them. The conductor
-//! not answering three asks in a row is a notice too, `component-unheard`
-//! about the conductor, to the deployment admins (approved 2026-11-20):
+//! not answering nine asks in a row, three minutes, is a notice too,
+//! `component-unheard` about the conductor, to the deployment admins
+//! (approved 2026-11-20):
 //! nobody's health is judged while it is silent. The lake's write-ahead
 //! stream stuck full, as the lake's writer says first in its report's words
 //! (v31a item 5, 0-J), is a standing notice to the deployment admins,
@@ -36,8 +37,12 @@ use crate::web::App;
 /// The conductor's read of every member's health (W6.40).
 pub const READ_COMPONENT_HEALTH: &str = "platform.deployment.query.read-component-health";
 
-/// How often the dashboard asks.
-pub const ASK_EVERY: Duration = Duration::from_secs(60);
+/// How often the dashboard asks: 20 s, a member's report interval
+/// (`meridian_runtime::REPORT_INWARD_EVERY`), so a member's words are judged
+/// within 40 s of its saying them -- the refused notice within its 120 s
+/// (the consensus of 2026-11-28, part 2 (B)). No bound of the judge's but
+/// [`UNHEARD_ASKS`] is counted in asks: the others are hours by the clock.
+pub const ASK_EVERY: Duration = Duration::from_secs(20);
 
 /// How long a member's samples are kept: what `status` and `doctor` show.
 pub const KEPT_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
@@ -51,8 +56,9 @@ pub const REPEATEDLY: u32 = 3;
 pub const CLIMBING_HOURS: usize = 6;
 
 /// Asks in a row the conductor leaves unanswered before its silence is a
-/// notice (`component-unheard`, approved 2026-11-20): three minutes.
-pub const UNHEARD_ASKS: u32 = 3;
+/// notice (`component-unheard`, approved 2026-11-20): three minutes, nine
+/// asks [`ASK_EVERY`] apart.
+pub const UNHEARD_ASKS: u32 = 9;
 
 /// One sample of a member's health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,7 +388,8 @@ impl Judge {
         self.unheard = Unheard::default();
     }
 
-    /// What one judging opened is kept, or there was nobody to tell: the
+    /// What one judging opened is kept, its notices filed ([`heard_by`]:
+    /// one with nobody to tell is not, and is offered again): the
     /// conductor's silence, among them, is not offered again while it lasts,
     /// nor a stream's stuck spell while it stands, nor its draining, nor a
     /// refused episode while it stands, nor its writes accepted again.
@@ -505,20 +512,34 @@ fn climbing(samples: &VecDeque<Sample>, now_ns: i64, limit: u64) -> bool {
         && hours.last().is_some_and(|last| *last > limit / 2)
 }
 
-/// Who is told: a core component's deployment admins, a plugin's admins.
+/// Who is told: a core component's deployment admins, a plugin's admins,
+/// of every subject the records name -- each person who has signed in, and
+/// each login a user group names, as a gap's notice is told
+/// ([`crate::dataset_gaps::told`]) -- so an admin who has not signed in
+/// since finds it in their inbox.
 pub fn told(records: &AccessRecords, opened: &Opened) -> BTreeSet<String> {
-    records
-        .people
-        .iter()
-        .filter(|person| {
-            let access = crate::prepared::access_of(records, &person.subject);
+    crate::prepared::subjects_named(records)
+        .into_iter()
+        .filter(|subject| {
+            let access = crate::prepared::access_of(records, subject);
             if opened.plugin {
                 access.administers(&opened.of)
             } else {
                 access.deployment_admin
             }
         })
-        .map(|person| person.subject.clone())
+        .collect()
+}
+
+/// The openings with somebody to tell ([`told`]): what one judging files
+/// and marks kept ([`Judge::kept`]). One with nobody to tell yet stays
+/// unfiled, as a gap's does: a standing condition, or the conductor's
+/// silence, is offered at the next judging, and told once an admin is
+/// named.
+pub fn heard_by(records: &AccessRecords, opened: Vec<Opened>) -> Vec<Opened> {
+    opened
+        .into_iter()
+        .filter(|one| !told(records, one).is_empty())
         .collect()
 }
 
@@ -574,7 +595,7 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                     }
                 },
                 Err(failed) => {
-                    tracing::debug!(%failed, "the conductor did not answer ReadComponentHealth; asked again in a minute");
+                    tracing::debug!(%failed, "the conductor did not answer ReadComponentHealth; asked again in 20 s");
                     None
                 }
             };
@@ -596,15 +617,17 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
             for one in &opened {
                 tracing::warn!(of = one.of, kind = one.kind, "{}", one.about);
             }
+            // Nobody to tell yet: left unfiled and unmarked, offered again.
+            let opened = heard_by(&records, opened);
+            if opened.is_empty() {
+                continue;
+            }
             let notices = notices_of(&records, &opened, now);
-            if !notices.is_empty() {
-                let kept =
-                    tokio::task::spawn_blocking(move || crate::latency::notices::keep(&notices))
-                        .await;
-                if !matches!(kept, Ok(Ok(()))) {
-                    tracing::error!("a component's notices were not kept");
-                    continue;
-                }
+            let kept =
+                tokio::task::spawn_blocking(move || crate::latency::notices::keep(&notices)).await;
+            if !matches!(kept, Ok(Ok(()))) {
+                tracing::error!("a component's notices were not kept");
+                continue;
             }
             if let Ok(mut judge) = judge.lock() {
                 judge.kept(&opened);
@@ -620,6 +643,9 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const T0: i64 = 1_793_000_000_000_000_000;
     const MINUTE: i64 = 60_000_000_000;
+    /// One ask's interval, and the asks unanswered that are a silence.
+    const ASK: i64 = ASK_EVERY.as_nanos() as i64;
+    const ASKS: i64 = UNHEARD_ASKS as i64;
 
     fn lake(memory: u64, reserved: u64, sheds: u64, restarts: u32) -> ComponentReport {
         ComponentReport {
@@ -1026,6 +1052,69 @@ mod tests {
         );
     }
 
+    /// With nobody to tell, an episode stays unfiled and is not marked
+    /// kept, as a gap's is ([`crate::dataset_gaps::judge_forever`]): it is
+    /// offered at every judging, and a deployment admin named later is told
+    /// it, once. The conductor's silence likewise.
+    #[test]
+    fn with_nobody_to_tell_an_episode_stays_unfiled_and_an_admin_named_later_is_told() {
+        let nobody = AccessRecords::default();
+        let named = records();
+        let ask = ASK_EVERY.as_nanos() as i64;
+        let said = [refused_since("meridian-lake-0", "2026-10-26T07:33:50Z")];
+        let mut judge = Judge::default();
+        let opened = judge.judge(&said, T0);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-refused"]);
+        let heard = heard_by(&nobody, opened);
+        assert!(heard.is_empty(), "nobody to tell: {heard:#?}");
+        judge.kept(&heard);
+        // Offered again, and told to the admin the records now name.
+        let opened = judge.judge(&said, T0 + ask);
+        assert_eq!(kinds(&opened), vec!["component-write-ahead-refused"]);
+        let heard = heard_by(&named, opened);
+        let filed = notices_of(&named, &heard, T0 + ask);
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+        assert_eq!(filed[0].subject, "local|dee");
+        judge.kept(&heard);
+        assert!(judge.judge(&said, T0 + 2 * ask).is_empty(), "told once");
+
+        let mut judge = Judge::default();
+        let mut opened = Vec::new();
+        for n in 1..=i64::from(UNHEARD_ASKS) {
+            opened = judge.unanswered(T0 + n * ask);
+        }
+        assert_eq!(kinds(&opened), vec!["component-unheard"]);
+        let heard = heard_by(&nobody, opened);
+        assert!(heard.is_empty());
+        judge.kept(&heard);
+        let opened = judge.unanswered(T0 + (i64::from(UNHEARD_ASKS) + 1) * ask);
+        assert_eq!(heard_by(&named, opened).len(), 1, "offered again");
+    }
+
+    /// The conductor is asked every 20 s, so a member's words reach the
+    /// judge within 20 s of the conductor hearing them (the consensus of
+    /// 2026-11-28, part 2 (B): the refused notice within its 120 s), and
+    /// its silence is a notice at the ninth ask in a row, not the eighth:
+    /// three minutes, as it was at three asks a minute apart.
+    #[test]
+    fn the_conductor_is_asked_every_twenty_seconds_and_its_silence_is_a_notice_at_three_minutes() {
+        assert_eq!(ASK_EVERY, Duration::from_secs(20));
+        assert_eq!(ASK_EVERY * UNHEARD_ASKS, Duration::from_secs(180));
+        let ask = ASK_EVERY.as_nanos() as i64;
+        let mut judge = Judge::default();
+        for n in 1..=8 {
+            assert!(judge.unanswered(T0 + n * ask).is_empty(), "ask {n}");
+        }
+        let opened = judge.unanswered(T0 + 9 * ask);
+        assert_eq!(kinds(&opened), vec!["component-unheard"]);
+        assert!(
+            opened[0].about.contains("for 9 asks in a row")
+                && opened[0].about.contains(&crate::custody::utc(T0 + ask)),
+            "{}",
+            opened[0].about
+        );
+    }
+
     /// ha runs two dashboards, each asking the conductor on its own minute
     /// and judging (review-F headline 2): one restart, one shed and one
     /// crossing of the budget are each one notice in the one store both
@@ -1059,7 +1148,7 @@ mod tests {
     }
 
     /// The conductor silent (`component-unheard`, approved 2026-11-20):
-    /// three asks unanswered in a row are a notice about the conductor to
+    /// nine asks unanswered in a row are a notice about the conductor to
     /// the deployment admins, its window the hour of the ask that opens it,
     /// as the other conditions' is (decision 40). Every copy judges, and
     /// the keyed ID makes their notices one: within one hour a silence, an
@@ -1074,8 +1163,8 @@ mod tests {
         // Two copies, asking 40 seconds apart.
         for offset in [0, 40_000_000_000] {
             let mut judge = Judge::default();
-            let mut ask = |answered: bool, minute: i64| {
-                let at = hour + minute * MINUTE + offset;
+            let mut ask = |answered: bool, n: i64| {
+                let at = hour + n * ASK + offset;
                 let opened = if answered {
                     judge.judge(&heard, at)
                 } else {
@@ -1084,12 +1173,12 @@ mod tests {
                 store.notify(&notices_of(&records, &opened, at)).unwrap();
             };
             ask(true, 0);
-            for minute in 1..=3 {
-                ask(false, minute);
+            for n in 1..=ASKS {
+                ask(false, n);
             }
-            ask(true, 6);
-            for minute in 7..=9 {
-                ask(false, minute);
+            ask(true, ASKS + 3);
+            for n in ASKS + 4..=2 * ASKS + 3 {
+                ask(false, n);
             }
         }
         let filed = store.notices("local|dee", 50).unwrap();
@@ -1112,8 +1201,8 @@ mod tests {
         let eleven = T0.div_euclid(HOUR_NS) * HOUR_NS + HOUR_NS;
         let heard = [lake(MIB, 0, 0, 0)];
         let mut judge = Judge::default();
-        let mut ask = |answered: bool, minute: i64| {
-            let at = eleven + minute * MINUTE;
+        let mut ask = |answered: bool, n: i64| {
+            let at = eleven + n * ASK;
             let opened = if answered {
                 judge.judge(&heard, at)
             } else {
@@ -1121,14 +1210,14 @@ mod tests {
             };
             store.notify(&notices_of(&records, &opened, at)).unwrap();
         };
-        // Unheard at 10:58, 10:59 and 11:00; answered at 11:01; unheard at
-        // 11:02 to 11:04.
-        for minute in -2..=0 {
-            ask(false, minute);
+        // Unheard for nine asks, from 10:57:20 to 11:00:00; answered at
+        // 11:00:20; unheard for nine more, 11:00:40 to 11:03:20.
+        for n in 1 - ASKS..=0 {
+            ask(false, n);
         }
         ask(true, 1);
-        for minute in 2..=4 {
-            ask(false, minute);
+        for n in 2..=ASKS + 1 {
+            ask(false, n);
         }
         let filed = store.notices("local|dee", 50).unwrap();
         assert_eq!(filed.len(), 1, "{filed:#?}");
@@ -1141,13 +1230,13 @@ mod tests {
     #[test]
     fn a_silence_whose_notice_was_not_kept_is_offered_again() {
         let mut judge = Judge::default();
-        for minute in 1..=3 {
-            let _dropped = judge.unanswered(T0 + minute * MINUTE);
+        for n in 1..=ASKS {
+            let _dropped = judge.unanswered(T0 + n * ASK);
         }
-        let opened = judge.unanswered(T0 + 4 * MINUTE);
+        let opened = judge.unanswered(T0 + (ASKS + 1) * ASK);
         assert_eq!(kinds(&opened), vec!["component-unheard"]);
         judge.kept(&opened);
-        assert!(judge.unanswered(T0 + 5 * MINUTE).is_empty());
+        assert!(judge.unanswered(T0 + (ASKS + 2) * ASK).is_empty());
     }
 
     /// An answer that does not decode is an answer: it ends the silence's
@@ -1155,10 +1244,13 @@ mod tests {
     #[test]
     fn an_answer_that_does_not_read_ends_the_silences_count() {
         let mut judge = Judge::default();
-        assert!(judge.unanswered(T0 + MINUTE).is_empty());
-        assert!(judge.unanswered(T0 + 2 * MINUTE).is_empty());
+        for n in 1..ASKS {
+            assert!(judge.unanswered(T0 + n * ASK).is_empty());
+        }
         judge.heard();
-        assert!(judge.unanswered(T0 + 3 * MINUTE).is_empty());
+        for n in ASKS..2 * ASKS - 1 {
+            assert!(judge.unanswered(T0 + n * ASK).is_empty(), "ask {n}");
+        }
     }
 
     #[test]

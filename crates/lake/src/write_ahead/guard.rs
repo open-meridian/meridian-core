@@ -242,8 +242,9 @@ impl Full {
 #[derive(Debug)]
 pub struct Refused {
     after: Duration,
-    /// Since when every look was refused or not answered, and the wall
-    /// clock then, which names the spell for the dashboard's judge.
+    /// Since when every look was refused or not answered -- when the first
+    /// of them was sent -- and the wall clock then, which names the spell
+    /// for the dashboard's judge.
     since: Option<(tokio::time::Instant, i64)>,
     /// What was said of the last look refused, or not answered.
     why: String,
@@ -265,14 +266,30 @@ impl Refused {
         }
     }
 
-    /// A look the broker refused, or did not answer, at `at`, the wall
-    /// clock `now_ns`; `why` what was said of it. The words it is said with
-    /// once every look for the bound was; none before.
+    /// A look the broker refused at once, at `at`, the wall clock `now_ns`:
+    /// one sent and returned then ([`Self::refused_look`]).
     pub fn refused(&mut self, at: tokio::time::Instant, now_ns: i64, why: &str) -> Option<String> {
-        let (since, _) = *self.since.get_or_insert((at, now_ns));
+        self.refused_look(at, now_ns, at, why)
+    }
+
+    /// A look sent at `sent`, the wall clock `sent_ns` then, that the broker
+    /// had refused, or not answered, by `returned`; `why` what was said of
+    /// it. A spell is dated from when its first such look was sent, not
+    /// from when it returned (the consensus of 2026-11-28, part 2 (B)): the
+    /// broker had stopped answering by then, and an unanswered look returns
+    /// only at its request's timeout. The words it is said with once every
+    /// look from then for the bound was, as this one returns; none before.
+    pub fn refused_look(
+        &mut self,
+        sent: tokio::time::Instant,
+        sent_ns: i64,
+        returned: tokio::time::Instant,
+        why: &str,
+    ) -> Option<String> {
+        let (since, _) = *self.since.get_or_insert((sent, sent_ns));
         self.why = why.to_string();
-        self.said |= at.duration_since(since) >= self.after;
-        self.said.then(|| self.words(at, false))
+        self.said |= returned.duration_since(since) >= self.after;
+        self.said.then(|| self.words(returned, false))
     }
 
     /// A look answered at `at`, the stream's last write `last`. Before the

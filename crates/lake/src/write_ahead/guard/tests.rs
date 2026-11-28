@@ -492,3 +492,49 @@ fn stuck_full_and_refused_are_said_together_stuck_first() {
         Some(30 * S)
     );
 }
+
+/// A spell is dated from when its first refused or unanswered look was
+/// sent, not from when that look returned (the consensus of 2026-11-28,
+/// part 2 (B)): the broker stopped answering by then, and an unanswered
+/// look returns only at its request's 5 s timeout. Looks sent at 0, 10 and
+/// 20 s, each timing out 5 s on: at the third's return, 25 s, nothing; the
+/// fourth, sent at 30 s, is said at its return, 35 s after the first was
+/// sent, since then, in those words. A look returning 30 s after the first
+/// was sent says it then: dated from the first's return, a look later.
+#[tokio::test(start_paused = true)]
+async fn a_spell_is_dated_from_when_its_first_look_was_sent() {
+    let now = 1_700_000_000 * S;
+    let start = tokio::time::Instant::now();
+    let at = |s: u64| start + Duration::from_secs(s);
+    let timeout = 5;
+    let mut refused = Refused::new(REFUSED_AFTER);
+    for sent in [0, 10, 20] {
+        assert_eq!(
+            refused.refused_look(
+                at(sent),
+                now + sent as i64 * S,
+                at(sent + timeout),
+                "timed out"
+            ),
+            None,
+            "the look sent at {sent} s"
+        );
+    }
+    let said = refused
+        .refused_look(at(30), now + 30 * S, at(30 + timeout), "timed out")
+        .expect("every look for 30 s unanswered, from the first one sent");
+    assert_eq!(
+        meridian_bus::write_ahead::refused_since(&said),
+        Some(now),
+        "since the first look was sent: {said}"
+    );
+    assert!(said.contains("for 35s"), "{said}");
+
+    // A look that returns 30 s after the first was sent says it then: an
+    // unanswered look 25 s on, timing out at 30 s.
+    let mut slow = Refused::new(REFUSED_AFTER);
+    assert_eq!(slow.refused_look(at(0), now, at(5), "timed out"), None);
+    assert!(slow
+        .refused_look(at(25), now + 25 * S, at(30), "timed out")
+        .is_some_and(|said| said.contains("for 30s")));
+}

@@ -89,16 +89,8 @@ pub fn about(gap: &DatasetGap) -> String {
 /// has signed in, and each login a user group names -- so an admin who has
 /// not signed in since finds it in their inbox.
 pub fn told(records: &AccessRecords) -> BTreeSet<String> {
-    records
-        .people
-        .iter()
-        .map(|person| person.subject.clone())
-        .chain(
-            records
-                .user_groups
-                .iter()
-                .flat_map(|group| group.logins.iter().cloned()),
-        )
+    crate::prepared::subjects_named(records)
+        .into_iter()
         .filter(|subject| crate::prepared::access_of(records, subject).deployment_admin)
         .collect()
 }
