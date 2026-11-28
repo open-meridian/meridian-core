@@ -748,6 +748,17 @@ fn refusal_of(failed: crate::store::StoreError, field: &str, keys: &[(i16, Strin
     failed.on_the_bus()
 }
 
+/// One of the listing's counts refused: for load with its retry-after where
+/// one read of it was under way and this request's wait for it ended, or
+/// that read failed (the hot layer's `Count`), counted as a refusal for
+/// load; as the store said it otherwise.
+fn count_refused(failed: crate::store::StoreError) -> String {
+    if matches!(failed, crate::store::StoreError::Held(_)) {
+        meridian_budget::count_refusal();
+    }
+    failed.on_the_bus()
+}
+
 pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
     let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut superseded = BTreeSet::new();
@@ -6409,24 +6420,15 @@ impl Lake {
         // 816: one listing took 1,068 ms on dev counting a chain's rows), and
         // each of the rows in force, as the quality counts are (ruling 1006
         // (c)).
-        let unconverted = self
-            .store
-            .unconverted_counts()
-            .map_err(|failed| failed.to_string())?;
+        let unconverted = self.store.unconverted_counts().map_err(count_refused)?;
         let misses = self
             .store
             .miss_counts()
             .map_err(|failed| failed.to_string())?;
-        let flagged = self
-            .store
-            .closed_day_counts()
-            .map_err(|failed| failed.to_string())?;
+        let flagged = self.store.closed_day_counts().map_err(count_refused)?;
         // Contract v29 (W10.9; ruling 619 (2)): the rows in force by
         // effective state.
-        let quality = self
-            .store
-            .quality_counts()
-            .map_err(|failed| failed.to_string())?;
+        let quality = self.store.quality_counts().map_err(count_refused)?;
         let mut reply = ListDatasetsReply::default();
         for (dataset, held) in &config.datasets {
             // A data plugin learns its own datasets' licences (contract v20,

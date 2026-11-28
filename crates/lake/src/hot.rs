@@ -11,7 +11,11 @@
 //! - **Listings**: a chain's series per underlying and dataset, as of now.
 //! - **The catalogue's counts**, which `list-datasets` answers beside the
 //!   configuration the lake already holds: from memory while no batch has
-//!   changed a dataset since they were read, from the record otherwise.
+//!   changed a dataset since they were read. Once one has, they are read
+//!   from the record again, one read of each count at a time ([`Count`]):
+//!   whoever else asks meanwhile is answered what is held, at most
+//!   [`COUNTS_BEHIND_AT_MOST`] behind the batch, and waits for that read
+//!   where nothing is held or what is held is further behind.
 //!
 //! **The writer holds the copy**, so it is never behind its own commit: every
 //! write passes through this store, and a batch's rows are applied to what
@@ -39,6 +43,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use meridian_changes::{ReadChangesReply, ReadError};
 use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
@@ -46,7 +51,7 @@ use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 use crate::row::{DataType, Observation};
 use crate::store::{
     invalid, Assessment, ClosedDayAmendment, Listed, Query, Recorded, Removal, Result, Served,
-    Stale, Store, WantChange, When,
+    Stale, Store, StoreError, WantChange, When,
 };
 
 /// The bounds of each layer, in bytes, from the chart's values.
@@ -247,11 +252,179 @@ struct Loading {
     spoiled: bool,
 }
 
-#[derive(Default)]
-struct Counts {
-    unconverted: Option<BTreeMap<String, u64>>,
-    closed_day: Option<BTreeMap<String, (u64, u64)>>,
-    quality: Option<BTreeMap<String, (u64, u64, u64)>>,
+/// How far behind a committed batch one of the listing's counts may be
+/// answered from memory while one read brings it up to date. A minute: the
+/// counts are figures for a page and for a plugin's read of its licences,
+/// never a record, and each data plugin asks about once a minute, so no
+/// asker is answered figures older than one of its own askings; and it is
+/// several times what one read took on the development deployment (seconds),
+/// so a read under way is nearly always answered around, not waited for.
+pub const COUNTS_BEHIND_AT_MOST: Duration = Duration::from_secs(60);
+
+/// One of the listing's counts, as the record last answered it, and the one
+/// read of it there is at a time (dev, 2026-11-28: a count's statement names
+/// no month, so it opens every month table, about 750 MB of the database's
+/// memory a copy; each asker read its own, 2 to 8 at once, since every
+/// committed batch let the held answer go and a failed read kept nothing).
+///
+/// A commit leaves what is held, behind. The first to ask then reads it
+/// again; whoever asks while it reads is answered what is held, while that
+/// is no further behind than it may be; and whoever finds nothing to be
+/// answered waits for that read's answer, to the end of its request's wait,
+/// then is refused for load with a retry-after, as it is where the read
+/// fails. Never a second read.
+struct Count<T> {
+    what: &'static str,
+    now: Mutex<Counted<T>>,
+    landed: Condvar,
+}
+
+struct Counted<T> {
+    held: Option<T>,
+    /// Since when a commit may have changed what is held; none while none
+    /// has.
+    behind_since: Option<Instant>,
+    /// The commits that may have changed it, counted: a read whose count
+    /// moved while it read brings an answer already behind.
+    changes: u64,
+    /// Whether one read of it is under way.
+    reading: bool,
+    /// The reads ended, and whether the last failed.
+    ended: u64,
+    failed: bool,
+}
+
+/// The one read of a count under way: ended as failed where it is dropped
+/// without an answer (a panic in the store), so no asker waits on for it.
+struct Reading<'a, T> {
+    of: &'a Count<T>,
+    changes: u64,
+    began: Instant,
+    ended: bool,
+}
+
+impl<T> Reading<'_, T> {
+    fn end(&mut self, read: Option<T>) {
+        self.ended = true;
+        let mut now = self.of.now.lock().expect("a count is poisoned");
+        now.reading = false;
+        now.ended += 1;
+        now.failed = read.is_none();
+        if let Some(read) = read {
+            // Behind already where a batch committed while it was read.
+            now.behind_since = (now.changes != self.changes).then_some(self.began);
+            now.held = Some(read);
+        }
+        self.of.landed.notify_all();
+    }
+}
+
+impl<T> Drop for Reading<'_, T> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.end(None);
+        }
+    }
+}
+
+impl<T: Clone> Count<T> {
+    fn new(what: &'static str) -> Self {
+        Count {
+            what,
+            now: Mutex::new(Counted {
+                held: None,
+                behind_since: None,
+                changes: 0,
+                reading: false,
+                ended: 0,
+                failed: false,
+            }),
+            landed: Condvar::new(),
+        }
+    }
+
+    /// A commit may have changed it: what is held is behind from now.
+    fn changed(&self) {
+        let mut now = self.now.lock().expect("a count is poisoned");
+        now.changes += 1;
+        if now.held.is_some() && now.behind_since.is_none() {
+            now.behind_since = Some(Instant::now());
+        }
+    }
+
+    /// Refused for load, to be asked again: the retry-after a write held
+    /// past its hold is answered with ([`StoreError::on_the_bus`]).
+    fn again(&self, why: &str) -> StoreError {
+        StoreError::Held(format!(
+            "overloaded: the datasets' listing's {} counts {why}",
+            self.what
+        ))
+    }
+
+    /// The count: what is held, or `read` from the record where this asker
+    /// is the one to read it. A wait for another's read ends at `until`,
+    /// where the asker's request has an end to its wait.
+    fn asked(
+        &self,
+        until: Option<Instant>,
+        behind_at_most: Duration,
+        read: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut now = self.now.lock().expect("a count is poisoned");
+        loop {
+            if let Some(held) = &now.held {
+                let answered = match now.behind_since {
+                    None => true,
+                    Some(since) => now.reading && since.elapsed() <= behind_at_most,
+                };
+                if answered {
+                    noted::memory("catalogue");
+                    return Ok(held.clone());
+                }
+            }
+            if !now.reading {
+                break;
+            }
+            // One read of it is under way: its answer, never a second read.
+            let ended = now.ended;
+            while now.ended == ended {
+                now = match until {
+                    None => self.landed.wait(now).expect("a count is poisoned"),
+                    Some(until) => {
+                        let left = until.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(self.again(
+                                "are being read, and this request waited its while for them",
+                            ));
+                        }
+                        self.landed
+                            .wait_timeout(now, left)
+                            .expect("a count is poisoned")
+                            .0
+                    }
+                };
+            }
+            if now.failed {
+                return Err(self.again("could not be read by the read this request waited for"));
+            }
+            if let Some(held) = &now.held {
+                noted::record();
+                return Ok(held.clone());
+            }
+        }
+        now.reading = true;
+        let mut reading = Reading {
+            of: self,
+            changes: now.changes,
+            began: Instant::now(),
+            ended: false,
+        };
+        drop(now);
+        noted::record();
+        let read = read();
+        reading.end(read.as_ref().ok().cloned());
+        read
+    }
 }
 
 struct Layer {
@@ -262,7 +435,6 @@ struct Layer {
     /// Keys asked and not held, waiting for the loader.
     wanted_latest: BTreeSet<LatestKey>,
     wanted_listings: BTreeSet<ListingKey>,
-    counts: Counts,
 }
 
 /// What a row costs held, roughly: its slot, its boxed message, and its
@@ -371,6 +543,12 @@ fn appendable(row: &Observation) -> bool {
     row.meta().version == 1 && row.data_type() != DataType::Rate
 }
 
+/// When the wait of the request this thread answers ends, where it answers
+/// one ([`meridian_budget::waiting`]): none for the lake's own work.
+fn waits_until() -> Option<Instant> {
+    meridian_budget::waiting().map(|waiting| waiting.until)
+}
+
 /// The lake's store, with its hot layer in front.
 pub struct HotStore {
     inner: Arc<dyn Store>,
@@ -384,6 +562,10 @@ pub struct HotStore {
     /// (step 3d): what it held of one is let go once its ranges changed
     /// group since, as another group may have written it meanwhile.
     held_at: Mutex<HashMap<String, u64>>,
+    /// The listing's counts, each read one at a time ([`Count`]).
+    unconverted: Count<BTreeMap<String, u64>>,
+    closed_day: Count<BTreeMap<String, (u64, u64)>>,
+    quality: Count<BTreeMap<String, (u64, u64, u64)>>,
 }
 
 impl HotStore {
@@ -435,11 +617,13 @@ impl HotStore {
                 loading_listings: HashMap::new(),
                 wanted_latest: BTreeSet::new(),
                 wanted_listings: BTreeSet::new(),
-                counts: Counts::default(),
             }),
             wake: Condvar::new(),
             groups: std::sync::RwLock::new(meridian_changes::groups::Groups::one()),
             held_at: Mutex::new(HashMap::new()),
+            unconverted: Count::new("unconverted"),
+            closed_day: Count::new("closed-day"),
+            quality: Count::new("quality"),
         });
         let held = Arc::downgrade(&hot);
         std::thread::Builder::new()
@@ -451,6 +635,27 @@ impl HotStore {
 
     fn layer(&self) -> std::sync::MutexGuard<'_, Layer> {
         self.layer.lock().expect("the hot layer is poisoned")
+    }
+
+    /// A commit may have changed the listing's counts: each is behind from
+    /// now, and kept to be answered while it is read again ([`Count`]).
+    fn counts_changed(&self) {
+        self.unconverted.changed();
+        self.closed_day.changed();
+        self.quality.changed();
+    }
+
+    /// The quality counts, a wait for another's read of them ending at
+    /// `until`, and what is held answered while no further behind than
+    /// `behind_at_most`: what a test of either bound asks.
+    #[cfg(test)]
+    pub(crate) fn quality_counts_within(
+        &self,
+        until: Option<Instant>,
+        behind_at_most: Duration,
+    ) -> Result<BTreeMap<String, (u64, u64, u64)>> {
+        self.quality
+            .asked(until, behind_at_most, || self.inner.quality_counts())
     }
 
     /// What each layer holds: keys and bytes, for the bench and the tests.
@@ -591,7 +796,7 @@ impl HotStore {
     fn committed(&self, dataset: &str, rows: &[Observation]) {
         let mut layer = self.layer();
         if !rows.is_empty() {
-            layer.counts = Counts::default();
+            self.counts_changed();
         }
         for row in rows {
             let code = row.data_type().code();
@@ -645,7 +850,7 @@ impl HotStore {
                 loading.spoiled = true;
             }
         }
-        layer.counts = Counts::default();
+        self.counts_changed();
     }
 
     /// A reader member's following (contract v30, stage B): changes the
@@ -702,7 +907,7 @@ impl HotStore {
         for loading in layer.loading_listings.values_mut() {
             loading.spoiled = true;
         }
-        layer.counts = Counts::default();
+        self.counts_changed();
     }
 
     /// The latest now, from memory where every key asked is held.
@@ -1013,14 +1218,10 @@ impl Store for HotStore {
     }
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
-        if let Some(held) = self.layer().counts.unconverted.clone() {
-            noted::memory("catalogue");
-            return Ok(held);
-        }
-        noted::record();
-        let read = self.inner.unconverted_counts()?;
-        self.layer().counts.unconverted = Some(read.clone());
-        Ok(read)
+        self.unconverted
+            .asked(waits_until(), COUNTS_BEHIND_AT_MOST, || {
+                self.inner.unconverted_counts()
+            })
     }
 
     fn remove_before(
@@ -1047,25 +1248,17 @@ impl Store for HotStore {
     }
 
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
-        if let Some(held) = self.layer().counts.closed_day.clone() {
-            noted::memory("catalogue");
-            return Ok(held);
-        }
-        noted::record();
-        let read = self.inner.closed_day_counts()?;
-        self.layer().counts.closed_day = Some(read.clone());
-        Ok(read)
+        self.closed_day
+            .asked(waits_until(), COUNTS_BEHIND_AT_MOST, || {
+                self.inner.closed_day_counts()
+            })
     }
 
     fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
-        if let Some(held) = self.layer().counts.quality.clone() {
-            noted::memory("catalogue");
-            return Ok(held);
-        }
-        noted::record();
-        let read = self.inner.quality_counts()?;
-        self.layer().counts.quality = Some(read.clone());
-        Ok(read)
+        self.quality
+            .asked(waits_until(), COUNTS_BEHIND_AT_MOST, || {
+                self.inner.quality_counts()
+            })
     }
 
     fn assess(&self, assessments: &[Assessment]) -> Result<()> {
