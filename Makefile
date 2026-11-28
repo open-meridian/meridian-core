@@ -1693,6 +1693,11 @@ test-broker: network runtime-image tests-image
 # write after it, naming its own, is answered. Under the tests credential,
 # which may publish anywhere, so the refusal proven is the lake's own and not
 # the broker's.
+#
+# Then the lake's other tests that need a real broker, each alone, as each
+# empties the broker of the lake's stream: its reader from a position, a
+# stream made again under its name, and a stream judged and kept at its own
+# bounds where the chart's differ.
 test-jetstream: network runtime-image tests-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
@@ -1727,7 +1732,21 @@ test-jetstream: network runtime-image tests-image
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the lake's lost-stream test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, the lake answers a write on its sender's inboxes alone, a write refused at the writer is never recorded later, and a stream deleted under the writer is made again after its bound with its loss marked"
+	@for t in \
+		write_ahead::tests::the_reader_delivers_a_real_stream_from_its_position_in_order \
+		tests::write_ahead::a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker \
+		tests::write_ahead::a_stream_with_room_under_its_own_bound_is_not_said_stuck_full_by_the_charts \
+		tests::write_ahead::a_byte_bound_under_what_the_stream_holds_is_not_applied_and_the_stream_takes_writes \
+		tests::write_ahead::a_lower_age_bound_is_refused_while_another_writer_group_has_not_recorded_the_streams_oldest; do \
+		name=$${t##*::}; \
+		$(COMPOSE_TEST) run --rm -T -e MERIDIAN_JUNIT_RUN=jetstream-$$name tests \
+			run-tests -p meridian-lake --lib -- --ignored --exact $$t >>.test-jetstream.log 2>&1 \
+			|| { echo "test-jetstream FAILED ($$name). The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
+			     tail -40 .test-jetstream.log >&2; exit 1; }; \
+		grep -q "$$name" .test-jetstream.log \
+			|| { echo "test-jetstream FAILED: the lake's test $$name did not run (.test-jetstream.log)" >&2; exit 1; }; \
+	done
+	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, the lake answers a write on its sender's inboxes alone, a write refused at the writer is never recorded later, and a stream deleted under the writer is made again after its bound with its loss marked, and the lake's reader, a stream made again, and a stream kept at its own bounds hold on a real broker"
 
 # Signing in against a real directory. Its own target rather than part of
 # `test`, for the reason `test-broker` is: it needs a server standing up, and
