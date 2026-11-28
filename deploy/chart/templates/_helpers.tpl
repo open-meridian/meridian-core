@@ -48,7 +48,7 @@ the operator the same thing far less clearly.
 {{- /* Ruling 1074: the HA profile's conductor has a standby, and a key the
        conductor generated into a volume is mounted on one node at a time. */ -}}
 {{- if and (eq (include "meridian-runtime.profile" .) "ha") (not .Values.key.existingSecret) -}}
-{{- fail "resilience.profile is ha and the deployment's key is generated into a volume, which one node mounts at a time, so the conductor's standby on another node could not start (ruling 1074). Put the key in a Kubernetes Secret and name it in key.existingSecret (from Vault or cert-manager where you keep keys there), then set resilience.profile: ha." -}}
+{{- fail "resilience.profile is ha and the deployment's key is generated into a volume, which one node mounts at a time, so the conductor's standby on another node could not start. Put the key in a Kubernetes Secret and name it in key.existingSecret (from Vault or cert-manager where you keep keys there), then set resilience.profile: ha." -}}
 {{- end -}}
 
 {{- end -}}
@@ -390,7 +390,7 @@ and-fails-over-by-configuration section 1), `<component>.standby`.
 {{- $count := 1 -}}
 {{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
 {{- if gt (int $count) 1 -}}
-{{- fail (printf "%s.replicaCount is %v; it takes 0 or 1. The %s writes as one member: a second replica is a second writer over the same partitions, which corrupts the order its change log keeps (ruling 1060). Add a warm standby with %s.standby: 1, which takes over when the writer's lease lapses, its epoch fencing the old writer (step 3b)." .component $count .what .component) -}}
+{{- fail (printf "%s.replicaCount is %v; it takes 0 or 1. The %s writes as one member: a second replica is a second writer over the same partitions, which corrupts the order its change log keeps. Add a warm standby with %s.standby: 1, which takes over when the writer's lease lapses, and the old writer is fenced off." .component $count .what .component) -}}
 {{- end -}}
 {{- $_ := include "meridian-runtime.standbys" . -}}
 {{- end -}}
