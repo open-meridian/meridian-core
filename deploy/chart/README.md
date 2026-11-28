@@ -248,9 +248,15 @@ the write and the lake has recorded it; the lake's writer records each batch
 with its place in the stream in one transaction, and after a database
 failover goes back to the place the promoted standby holds, so no
 acknowledged row is lost. `lake.writeAhead.maxAge` (10m) is how long the
-stream holds a write the lake has not recorded, and `lake.writeAhead.maxBytes`
-(256MB) how much it holds: full, it refuses a new write, the plugin refused
-for load with a retry-after, and drops none it holds. A writer gone longer
+stream holds a write, whether or not the lake has recorded it, and
+`lake.writeAhead.maxBytes` (256MB) how much it holds: full, it refuses a new
+write, the plugin refused for load with a retry-after, and drops none it
+holds. A write leaves the stream only at `maxAge`, so the two values together
+bound what the lake takes in `ha`: `maxBytes` every `maxAge`, which is 447 KB
+a second at the defaults (268,435,456 bytes every 600 seconds). Above that
+rate plugins are refused until writes the stream holds reach `maxAge`; a
+higher `maxBytes`, with a `broker.jetstream.size` to hold it, raises the
+rate. A writer gone longer
 than `maxAge` leaves a gap in each dataset whose writes the stream dropped,
 recorded, asked again of the data plugin where its dataset declares
 `backfill`, and marked unrecovered otherwise. Each server's JetStream store
