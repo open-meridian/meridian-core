@@ -12869,6 +12869,189 @@ fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline() {
     assert_eq!(again.adopt().unwrap(), epoch);
 }
 
+/// The writer-group raise, a known gap until v32 item 1 (merge-queue run
+/// 46082830508, "rollout-ha-groups-raised"; ruled 2026-11-27), the lake's
+/// side: the count raised from one group to two, group 1's writer has taken
+/// its ranges and records them. A member still at one group then starts --
+/// an old pod restarted, or its standby taking group 0's lease before the
+/// rollout has removed it -- and, at one group, takes over every range held
+/// at an epoch not the control partition's (`held_apart`, ruled 2026-11-18
+/// for a lowered count): group 1's writer is fenced, starts again and takes
+/// them back, twice over. Every write refused is tried once more on the
+/// other writer, as a caller's retry reaches whichever serves.
+///
+/// Two checks, in this order:
+/// - **no loss, no double** (the CTO's condition of 2026-11-27): every row
+///   acknowledged is recorded exactly once, nothing at an epoch no takeover
+///   recorded. Red here is harm, not this gap;
+/// - **the gap:** group 1's writer is never fenced by the member at the
+///   count before the raise. The store reads the same rows here as after a
+///   lowering (the test above), so nothing it holds today tells a stale
+///   member from the one writer left; v32's ownership record, the count
+///   recorded and ordered in it, answers a member at another count "not the
+///   owner". It turns this green, and the ignore is removed.
+#[test]
+#[ignore = "known gap until v32 item 1: writer-group raise"]
+fn a_member_at_the_count_before_a_raise_fences_no_writer_of_group_one_and_every_row_is_kept_once() {
+    use meridian_changes::groups::Groups;
+    let (url, dataset, subject, zero, mover) = lake_raised_to_two("lake-raise-stale");
+    let group_one = || {
+        let store = PostgresStore::connect(&url, 4)
+            .unwrap()
+            .with_groups(Groups::new(1, 2).unwrap());
+        let epoch = store.adopt();
+        (store, epoch)
+    };
+    let at_one_group = || {
+        let store = PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(0, 1).unwrap());
+        let epoch = store.adopt();
+        (store, epoch)
+    };
+    // The row `lake_raised_to_two` recorded at one group, acknowledged.
+    let mut acked = vec!["before".to_string()];
+    let mut refused: Vec<String> = Vec::new();
+    let mut fenced_one: Vec<String> = Vec::new();
+    let mut at = 2_000;
+    let (mut one, taken) = group_one();
+    let held = taken.unwrap();
+    mover.rebalance();
+    one.read_owners().unwrap();
+    // A write by `first`, tried once more on `then` if refused; what was
+    // acknowledged, and each refusal, noted.
+    let mut put = |key: String,
+                   first: (&PostgresStore, &str),
+                   then: (&PostgresStore, &str),
+                   acked: &mut Vec<String>,
+                   refused: &mut Vec<String>,
+                   fenced_one: &mut Vec<String>| {
+        for (store, who) in [first, then] {
+            at += 100;
+            match store.record(&dataset, vec![trade(&dataset, &key, &subject, at)], at) {
+                Ok(_) => {
+                    acked.push(key.clone());
+                    return;
+                }
+                Err(e) => {
+                    if who == "group 1" {
+                        fenced_one.push(format!("{key}: {e}"));
+                    }
+                    refused.push(format!("{key} by {who}: {e}"));
+                }
+            }
+        }
+    };
+    put(
+        "one-0".into(),
+        (&one, "group 1"),
+        (&one, "group 1"),
+        &mut acked,
+        &mut refused,
+        &mut fenced_one,
+    );
+    assert_eq!(acked.len(), 2, "group 1 records before the stale member: {refused:?}");
+    assert_eq!(
+        zero.range_tip(&dataset).unwrap().unwrap().writer_group,
+        Some(1)
+    );
+    let mut adopts = vec![format!("group 1 took epoch {held}")];
+    for round in 0..2 {
+        // A member at the count before the raise starts.
+        let (stale, taken) = at_one_group();
+        adopts.push(format!("round {round}: the member at one group {taken:?}"));
+        put(
+            format!("one-{round}-next"),
+            (&one, "group 1"),
+            (&stale, "stale"),
+            &mut acked,
+            &mut refused,
+            &mut fenced_one,
+        );
+        put(
+            format!("stale-{round}"),
+            (&stale, "stale"),
+            (&one, "group 1"),
+            &mut acked,
+            &mut refused,
+            &mut fenced_one,
+        );
+        // Group 1's writer, fenced, starts again and takes its ranges back.
+        drop(one);
+        let (back, taken) = group_one();
+        adopts.push(format!("round {round}: group 1 again {taken:?}"));
+        let _ = back.read_owners();
+        one = back;
+        put(
+            format!("stale-{round}-after"),
+            (&stale, "stale"),
+            (&one, "group 1"),
+            &mut acked,
+            &mut refused,
+            &mut fenced_one,
+        );
+        put(
+            format!("one-{round}-back"),
+            (&one, "group 1"),
+            (&stale, "stale"),
+            &mut acked,
+            &mut refused,
+            &mut fenced_one,
+        );
+        drop(stale);
+    }
+    drop((one, zero, mover));
+    // No loss, no double: each key acknowledged held by one row, none held
+    // that was not acknowledged.
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let rows: Vec<(String, i64)> = admin
+        .query(
+            "SELECT row_key, count(*) FROM lake_row WHERE dataset = $1 GROUP BY row_key",
+            &[&dataset],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let took_over: Vec<(i64, String, String)> = admin
+        .query(
+            "SELECT epoch, member, why FROM lake_writer_took_over ORDER BY epoch",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    let twice: Vec<&(String, i64)> = rows.iter().filter(|(_, n)| *n > 1).collect();
+    let held_keys: std::collections::BTreeSet<&String> = rows.iter().map(|(k, _)| k).collect();
+    let missed: Vec<&String> = acked.iter().filter(|k| !held_keys.contains(k)).collect();
+    let unasked: Vec<&String> = held_keys
+        .iter()
+        .copied()
+        .filter(|k| !acked.contains(*k))
+        .collect();
+    eprintln!(
+        "GROUP-RAISE lake: {} acknowledged, {} keys held ({} rows), twice {twice:?}, missed \
+         {missed:?}, held unacknowledged {unasked:?}; {} takeovers {took_over:?}; adopts \
+         {adopts:?}; refused {refused:?}",
+        acked.len(),
+        rows.len(),
+        rows.iter().map(|(_, n)| n).sum::<i64>(),
+        took_over.len(),
+    );
+    assert!(
+        twice.is_empty() && missed.is_empty(),
+        "LOSS OR DOUBLE across the raise's takeovers: twice {twice:?}, missed {missed:?}"
+    );
+    assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
+    // The gap.
+    assert!(
+        fenced_one.is_empty(),
+        "group 1's writer, at epoch {held}, was refused by a member at one group started after \
+         the raise: {fenced_one:?}; takeovers recorded: {took_over:?}"
+    );
+}
+
 /// A range's move by hand to a writer group whose writer has not taken
 /// over in its database waits at the gate, and aborts for lag past
 /// moves.switchSeconds with nothing held: the source still owns it, and
