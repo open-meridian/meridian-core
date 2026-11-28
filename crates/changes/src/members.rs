@@ -86,6 +86,10 @@ pub struct Said {
 ///
 /// A member that died is never said again, so it is never serving, however
 /// long its row is kept.
+///
+/// INTERIM(v32): a stop told by member rows, not by the ownership record;
+/// gone when v32 items 1 and 3 hand a group's partitions over through that
+/// record, the writer-group count recorded and ordered in it.
 #[derive(Debug)]
 pub struct Watch {
     writer_group: u32,
@@ -158,6 +162,10 @@ impl Watch {
 /// No clock is compared with another pod's, as in [`Watch`]: newer is a
 /// process this watch did not find at its first look, and there now is a
 /// row said again between two of this watch's own looks.
+///
+/// INTERIM(v32): "newer" inferred from unordered revisions and process
+/// starts, with holes at a raise (run 46082830508); gone when v32 items 1
+/// and 3 record the writer-group count, ordered, in the ownership record.
 #[derive(Debug)]
 pub struct Newer {
     writer_group: u32,
@@ -509,5 +517,55 @@ mod tests {
             "not serving yet"
         );
         assert!(watch.serves(&[said("zero", "r1", 20, 104, 0, "writer")]));
+    }
+
+    /// The writer-group raise, a known gap until v32 item 1 (merge-queue
+    /// run 46082830508; ruled 2026-11-27), hole 1 of [`Newer`]: a standby
+    /// at the count before a raise -- group 0 at one group, its container
+    /// started again or its first look come late -- whose first look
+    /// already finds its group's writer at the raised count never defers to
+    /// it, said again or not: a member there at the first look is never
+    /// newer. It takes group 0's lease at the old count, and its takeover
+    /// at one group fences group 1's writer. After a lowering the same rows
+    /// are the new member's, the higher count the old one's, so no rule on
+    /// these inputs tells the two apart; v32's ownership record, the count
+    /// recorded and ordered in it, does, and [`Newer`] goes. Asserted
+    /// otherwise, as ruled 2026-11-16, by the last lines of
+    /// `a_newer_member_is_one_of_its_group_at_another_revision_started_since_and_said_again`.
+    #[test]
+    #[ignore = "known gap until v32 item 1: writer-group raise"]
+    fn a_member_at_the_raised_count_there_at_the_first_look_is_newer() {
+        let mut stale = Newer::new(0, "v/db1/wg1");
+        let raised = |seen| said("lake-new-a", "v/db1/wg2", 50, seen, 0, "writer");
+        assert!(!stale.there(&[raised(60)]), "never at the first look");
+        assert!(
+            stale.there(&[raised(70)]),
+            "a standby at the count before the raise does not defer to its group's writer at \
+             the raised count, there at its first look and said again"
+        );
+    }
+
+    /// The same gap, hole 3: [`Newer`] counts only the watcher's own group.
+    /// Group 1's writer at the raised count has started since the old
+    /// standby's first look and serves, said again; group 0's member at the
+    /// new count has not registered yet. The standby defers to nobody, takes
+    /// the lease at one group, and fences group 1's writer. Asserted
+    /// otherwise, as ruled 2026-11-16 ("another group's ... is never
+    /// newer"), by that same test.
+    #[test]
+    #[ignore = "known gap until v32 item 1: writer-group raise"]
+    fn a_writer_of_another_group_at_the_raised_count_is_newer() {
+        let mut stale = Newer::new(0, "v/db1/wg1");
+        let old = said("lake-old-b", "v/db1/wg1", 1, 10, 0, "standby");
+        assert!(
+            !stale.there(std::slice::from_ref(&old)),
+            "never at the first look"
+        );
+        let one = said("lake-g1-a", "v/db1/wg2", 50, 60, 1, "writer");
+        assert!(
+            stale.there(&[old, one]),
+            "a standby at the count before the raise does not defer to group 1's writer at the \
+             raised count, started since its first look and serving"
+        );
     }
 }

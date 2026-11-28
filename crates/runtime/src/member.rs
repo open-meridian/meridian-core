@@ -650,6 +650,10 @@ impl Member {
     /// free lease, leaving it to the member a rollout brought at the new
     /// count, unless nobody takes it within one lease duration -- a writer
     /// at the old count is better than none.
+    ///
+    /// INTERIM(v32): a heuristic for a writer-group count no record holds
+    /// (the raise's known gap, run 46082830508); gone when v32 items 1 and 3
+    /// record the count, ordered, in the ownership record.
     pub fn deferring_to_newer<F>(mut self, look: F) -> Self
     where
         F: Fn() -> Result<bool, String> + Send + Sync + 'static,

@@ -2437,6 +2437,10 @@ impl PostgresStore {
             // does, so it writes them under its own epoch and the writer
             // that held them is fenced. Never at a store's first act: a
             // store a tool opens at one group takes nothing over.
+            // INTERIM(v32): it can't tell a lowered count from a raised one
+            // with this member the stale one (run 46082830508); gone when
+            // v32 items 1 and 3 record the count, ordered, in the ownership
+            // record.
             let _alone = starting.then(|| self.adopting.lock().expect("adopting poisoned"));
             if starting && self.fence.epoch() == 0 {
                 let held_apart: bool = conn
