@@ -50,8 +50,19 @@ pub const STREAM: &str = "LAKE_WRITE_AHEAD";
 pub const STUCK_FULL: &str = "the lake's write-ahead stream is stuck full";
 
 /// How the stuck-full words say since when, after [`STUCK_FULL`] and for
-/// how long: `, since 2026-11-24T10:00:00Z`.
+/// how long: `, since 2026-11-24T10:00:00Z`. The refused words say it the
+/// same way, after [`REFUSED`].
 const STUCK_SINCE: &str = ", since ";
+
+/// The words the lake's writer says the broker refuses its write-ahead
+/// stream with, or does not answer it -- every look its guard took at the
+/// stream for 30 s refused or unanswered -- in its member's report
+/// (`ComponentReport.detail`), after the stuck-full words where both are
+/// said: what the dashboard's judge files `component-write-ahead-refused`
+/// from, and `meridian status` shows (INTERIM(v32), the proposal of
+/// 2026-11-27, A1: v32 takes the stream off the lake's write path). Why
+/// the broker refuses is not inferred here.
+pub const REFUSED: &str = "the lake's write-ahead writes are refused or not answered by the broker";
 
 /// The words a stuck-full stream is said with open so: [`STUCK_FULL`], for
 /// how long, and the time it went stuck, to the second, UTC. That time
@@ -59,6 +70,19 @@ const STUCK_SINCE: &str = ", since ";
 /// from the same member, and files the spell's notices once
 /// ([`stuck_since`]).
 pub fn stuck_full_since(stuck_for_s: u64, since_ns: i64) -> String {
+    said_since(STUCK_FULL, stuck_for_s, since_ns)
+}
+
+/// The words a refused stream is said with open so: [`REFUSED`], for how
+/// long, and the time of the first refusal of the spell, to the second,
+/// UTC, which names the spell as the stuck-full time names its
+/// ([`refused_since`]). INTERIM(v32).
+pub fn refused_for(refused_for_s: u64, since_ns: i64) -> String {
+    said_since(REFUSED, refused_for_s, since_ns)
+}
+
+/// `said`, for how long and since when ([`stuck_full_since`]).
+fn said_since(said: &str, for_s: u64, since_ns: i64) -> String {
     let seconds = since_ns.div_euclid(1_000_000_000);
     let (days, of_day) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
     // Days since 1970 to a civil date (Howard Hinnant's civil-from-days).
@@ -76,7 +100,7 @@ pub fn stuck_full_since(stuck_for_s: u64, since_ns: i64) -> String {
     };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     format!(
-        "{STUCK_FULL} for {stuck_for_s}s{STUCK_SINCE}{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        "{said} for {for_s}s{STUCK_SINCE}{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         of_day / 3_600,
         of_day % 3_600 / 60,
         of_day % 60
@@ -87,7 +111,26 @@ pub fn stuck_full_since(stuck_for_s: u64, since_ns: i64) -> String {
 /// epoch ([`stuck_full_since`]): none where they do not say it stuck full,
 /// or say no time that reads.
 pub fn stuck_since(detail: &str) -> Option<i64> {
-    let said = detail.strip_prefix(STUCK_FULL)?;
+    since_of(detail.strip_prefix(STUCK_FULL)?)
+}
+
+/// Whether a member's words say the broker refuses its write-ahead stream,
+/// or does not answer it ([`REFUSED`]): first, or after the stuck-full
+/// words. INTERIM(v32).
+pub fn says_refused(detail: &str) -> bool {
+    detail.contains(REFUSED)
+}
+
+/// The time a member's words say the broker's refusals began, ns since the
+/// epoch ([`refused_for`]): none where they do not say it refused, or say
+/// no time that reads. INTERIM(v32).
+pub fn refused_since(detail: &str) -> Option<i64> {
+    let at = detail.find(REFUSED)?;
+    since_of(&detail[at + REFUSED.len()..])
+}
+
+/// The time said after `for <n>s` in `said`, the words after what was said.
+fn since_of(said: &str) -> Option<i64> {
     let at = said.split_once(STUCK_SINCE)?.1.get(..20)?;
     let digits = |from: usize, to: usize| at.get(from..to)?.parse::<i64>().ok();
     let marks = at.as_bytes();
@@ -1062,6 +1105,34 @@ mod tests {
             None
         );
         assert_eq!(stuck_since("ready, since 2026-10-26T07:33:20Z"), None);
+    }
+
+    /// The time the broker's refusals began is said as the stuck time is,
+    /// and read back first in a member's words or after its stuck-full
+    /// words; words not saying it refused give none (INTERIM(v32), A1).
+    #[test]
+    fn the_time_the_brokers_refusals_began_is_read_back_first_or_after_the_stuck_words() {
+        let words = refused_for(35, 1_793_000_000 * 1_000_000_000 + 7);
+        assert_eq!(
+            words,
+            format!("{REFUSED} for 35s, since 2026-10-26T07:33:20Z")
+        );
+        let alone = format!("{words}: every look at the stream refused or not answered");
+        let after = format!("{}: holds 1.0 MiB; {alone}", stuck_full_since(30, 0));
+        for detail in [&alone, &after] {
+            assert!(says_refused(detail), "{detail}");
+            assert_eq!(refused_since(detail), Some(1_793_000_000 * 1_000_000_000));
+        }
+        assert_eq!(
+            stuck_since(&after),
+            Some(0),
+            "the stuck time first, as ever"
+        );
+        assert_eq!(stuck_since(&alone), None);
+        let stuck = stuck_full_since(30, 0);
+        assert!(!says_refused(&stuck));
+        assert_eq!(refused_since(&stuck), None);
+        assert_eq!(refused_since(&format!("{REFUSED} for 35s: no time")), None);
     }
 
     #[test]
