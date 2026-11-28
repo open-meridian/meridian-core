@@ -9,7 +9,7 @@ COMPOSE := docker compose
 COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: bench-book ci-tier-check migrate test-broker test-jetstream nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
+.PHONY: check-structure check-structure-selftest check-interims check-pins check-licences check-size check-baselines bench-book ci-tier-check migrate test-broker test-jetstream nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
@@ -22,6 +22,7 @@ help:
 	@echo "  make ci-stage STAGE=<stage>  one CI stage, as its job runs it (reproduce a failing job before pushing again)"
 	@echo "  make codegen        regenerate the domain bindings from proto/"
 	@echo "  make check-codegen  fail if crates/domain/src/v1.rs or the book's transition table is stale"
+	@echo "  make check-structure  the code-structure rules: S3, S4, S5, S10, and S2 as a warning"
 	@echo "  make build          compile the workspace"
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
@@ -159,7 +160,7 @@ ifneq ($(filter ci-local ci-local-deep,$(MAKECMDGOALS)),)
 stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint: export IMAGES = built
 endif
 
-stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check ci-tier-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check e2e-harness-check
+stage-checks:     gate-begin-checks check-leftovers contract-diff check-structure ci-mirror-check ci-tier-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check e2e-harness-check
 	@$(GATE) end checks
 # The images at once (the CI images job is the run's critical path; step 3b
 # part 5): the release build beside the SDK's image and the harness's, which
@@ -275,7 +276,7 @@ pre-push-run: GATE_BUDGETS_COLD = $(PRE_PUSH_BUDGETS_COLD)
 pre-push-run: gate-start $(addprefix pre-push-,$(PRE_PUSH_STAGES))
 	@$(GATE) finish
 
-pre-push-checks:   gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage claims-check e2e-harness-check advisories
+pre-push-checks:   gate-begin-checks contract-diff check-structure ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage claims-check e2e-harness-check advisories
 	@$(GATE) end checks
 pre-push-rust:     gate-begin-rust fast-rust
 	@$(GATE) end rust
@@ -349,6 +350,47 @@ ci-mirror-check:
 # fake GitHub and no network.
 licence-check-test:
 	@$(PY) -m unittest discover -b -s .github/actions/licence-check -p 'test_*.py'
+
+# The code-structure rules (CLAUDE.md, "Code structure"), each red on a
+# planted violation in the self-test that runs first. Settings, baselines and
+# allowlists are in tools/code-structure.toml and the files it names:
+#   S3  generated is generated: check-codegen and check-nats-permissions
+#       regenerate and diff, check-reference-cases compares with the SDK's,
+#       and check-interims regenerates its register;
+#   S4  check-interims: every INTERIM(vNN): reason marker, in the register
+#       tools/interims.tsv, and none due at the roadmap version;
+#   S5  check-pins: Cargo, pyproject and workflow refs to another repository
+#       at a release or a full SHA, or listed in tools/pins-allowlist.txt;
+#   S10 check-licences: no GPL or AGPL text in, or AGPL crate under, a crate
+#       of another licence, and each published image ships its licence and
+#       notice files and those of what it bundles;
+#   S2  check-size: a warning until v31b, for a hand-written file over 1,500
+#       lines that is new or has grown past tools/size-baseline.tsv;
+#   and check-baselines: a baseline or allowlist changed only with a
+#       `Baseline-Change:` trailer, a ratchet only lowered, and an INTERIM
+#       marker moved to a later version only with a trailer naming it.
+# CI's checks job gives the pull request's or merge group's base as
+# CONTRACT_DIFF_BASE; a push compares with PRE_PUSH_BASE.
+# tools/code_structure.py is the same in every repository that runs it.
+check-structure: check-structure-selftest check-interims check-pins check-licences check-size check-baselines
+
+check-structure-selftest:
+	@$(PY) tools/code_structure.py --self-test
+
+check-interims:
+	@$(PY) tools/code_structure.py interims
+
+check-pins:
+	@$(PY) tools/code_structure.py pins
+
+check-licences:
+	@$(PY) tools/code_structure.py licences
+
+check-size:
+	@$(PY) tools/code_structure.py size
+
+check-baselines:
+	@$(PY) tools/code_structure.py baselines --base "$(or $(CONTRACT_DIFF_BASE),$(PRE_PUSH_BASE))"
 
 # Storage separation without API separation is decorative: two stores fuse into
 # one the moment a second component links against either, because from then on

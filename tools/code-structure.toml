@@ -1,0 +1,53 @@
+# The code-structure rules' settings (CLAUDE.md, "Code structure");
+# tools/code_structure.py reads them. A change to a baseline or an allowlist
+# named here carries a `Baseline-Change:` trailer saying why.
+repository = "open-meridian/meridian-core"
+
+# S4: the version this repository is building. A marker INTERIM(vNN) at or
+# before it fails.
+roadmap_version = "v31a"
+interims_register = "tools/interims.tsv"
+# A marker's place in the register is its file, not its line: many branches
+# edit the files that hold markers, and a line number would move with each.
+interims_register_lines = false
+
+# S5: exceptions, each with its INTERIM(vNN) marker.
+pins_allowlist = "tools/pins-allowlist.txt"
+
+# S2: files over 1,500 lines today, and what is generated or vendored: here
+# (make codegen, make nats-permissions) or from meridian-design, the SDK and
+# the platform (deploy/topics.tsv, deploy/roles.tsv, the sidecar's typed
+# operations, make prompt-attacks, make reference-cases, the oracle cases).
+size_baseline = "tools/size-baseline.tsv"
+size_exempt = [
+  "*.lock", "LICENSE", "tools/interims.tsv",
+  "crates/domain/src/v1.rs", "crates/bor/src/transitions.rs", "crates/dashboard/src/mcp/fields.json",
+  "deploy/nats/permissions.conf",
+  "crates/sidecar/src/operations.rs", "deploy/topics.tsv", "deploy/roles.tsv",
+  "deploy/prompt-attacks.json", "crates/dashboard/src/tickets/screen-rules.json",
+  "crates/analytics-engine/reference_cases/*", "crates/analytics-engine/oracle_cases/*",
+]
+
+# S10: core is AGPL-3.0-or-later, every crate of it; nothing here ships under
+# Apache-2.0 today, and a crate that comes to is held to its own licence
+# (crate_licences in tools/code_structure.py). NOTICE ships beside LICENSE.
+notice = true
+licence_scan = []
+
+# S5: a workflow ref taken from a step's output, and the file holding the pin
+# that output gives (tools/ci-sdk.sh reads tools/ci-sdk.txt).
+[pins_refs]
+"steps.sdk.outputs.ref" = "tools/ci-sdk.txt"
+"needs.images.outputs.sdk" = "tools/ci-sdk.txt"
+
+# S10: what each image core publishes ships beside its binaries: core's
+# LICENSE and NOTICE, and the bundled UI kit's own (meridian-ui, Apache-2.0).
+[[notices]]
+dockerfile = "Dockerfile"
+stage = "runtime"
+files = ["LICENSE", "NOTICE", "ui:/ui/LICENSE", "ui:/ui/NOTICE"]
+
+[[notices]]
+dockerfile = "Dockerfile"
+stage = "analytics"
+files = ["LICENSE", "NOTICE"]

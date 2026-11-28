@@ -43,6 +43,41 @@ raw external records, and rebuild from it; the launcher and the chart mount it
 for that instance alone, never delete it, and no plugin's storage is a channel
 to another (decisions/028).
 
+## Code structure
+
+Each rule is a check in `make check-structure`, which runs in the pre-push
+gate and in CI's checks job and is red on a planted violation
+(`make check-structure-selftest`). Settings, baselines and allowlists are in
+tools/code-structure.toml and the files it names.
+
+- **S3 generated is generated:** `make check-codegen` (the domain bindings,
+  the book's transition table and the dictionary; change them with
+  `make codegen`, never by hand), `make check-nats-permissions` (the broker's
+  permissions; `make nats-permissions`), `make check-reference-cases` (the
+  SDK's cases, byte for byte) and `make check-interims` (the register). A new
+  generator adds its drift check.
+- **S4 interims name their end:** every stop-gap carries `INTERIM(vNN): reason`.
+  `make check-interims` keeps tools/interims.tsv as the markers' register, by
+  file (run `python3 tools/code_structure.py interims --write` after adding,
+  removing or rewording one) and fails on one due at `roadmap_version`. A marker naming no reason is reported,
+  and their number only goes down. Moving a marker's version needs the product
+  owner's word and a `Baseline-Change:` trailer naming the marker.
+- **S5 pins are immutable:** `make check-pins`. Another repository by a release
+  or a full SHA, never a branch or a sibling checkout: in Cargo.toml, pyproject
+  and workflows, where a ref from a step's output is read from its pin file
+  (tools/ci-sdk.txt). An exception goes in tools/pins-allowlist.txt with its
+  marker.
+- **S10 licences by layer:** `make check-licences`. Core is AGPL-3.0-or-later;
+  a crate under another licence holds no GPL or AGPL text and depends on no
+  AGPL crate. Each published image ships core's LICENSE and NOTICE, and the
+  licence and notice of what it bundles (the UI kit's).
+- **S2 file size:** `make check-size` reports a hand-written file over 1,500
+  lines that is new, or has grown past tools/size-baseline.tsv (a warning now,
+  failing from v31b; growth then needs a `Size-Exception:` trailer). Generated
+  files are exempt.
+- A baseline or allowlist changes only in a commit with a `Baseline-Change:`
+  trailer saying why (`make check-baselines`); baselines only go down.
+
 ## Verification
 
     make pre-push

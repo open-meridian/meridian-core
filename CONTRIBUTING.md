@@ -27,6 +27,8 @@ so a plugin you write stays yours. Start with `meridian plugin new`; see
 
 ## For the team
 
+Run `make pre-push` before you push. Each check that fails says what to fix.
+
 `make install-hooks` makes every push run `make pre-push`, the fast gate:
 lint, the build, the unit tests of the crates a branch changed and of those
 depending on them, and the stages its paths select (the Makefile's
