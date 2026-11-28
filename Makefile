@@ -1699,28 +1699,28 @@ test-jetstream: network runtime-image tests-image
 	@$(COMPOSE_TEST) --profile tests up -d --force-recreate jetstream-a jetstream-b jetstream-c >/dev/null
 	@$(COMPOSE_TEST) --profile tests exec -T jetstream-b sh -c 'for i in $$(seq 1 60); do [ "$$(wget -qO- http://localhost:8222/routez 2>/dev/null | grep remote_name | sort -u | wc -l)" -ge 2 ] && exit 0; sleep 0.5; done; exit 1' \
 		|| { echo "test-jetstream FAILED: the three JetStream servers did not find each other" >&2; exit 1; }
-	@$(COMPOSE_TEST) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T -e MERIDIAN_JUNIT_RUN=jetstream-queue tests \
 		run-tests -p meridian-analytics --lib -- --ignored --exact queue::tests::the_queue_runs_end_to_end_under_the_analytics_credential \
 		>.test-jetstream.log 2>&1 \
 		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'the_queue_runs_end_to_end_under_the_analytics_credential' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the queue's test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@$(COMPOSE_TEST) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T -e MERIDIAN_JUNIT_RUN=jetstream-another-inbox tests \
 		run-tests -p meridian-lake --lib -- --ignored --exact tests::write_ahead::a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody \
 		>>.test-jetstream.log 2>&1 \
 		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the lake's write-ahead test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@$(COMPOSE_TEST) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T -e MERIDIAN_JUNIT_RUN=jetstream-refused-write tests \
 		run-tests -p meridian-lake --lib -- --ignored --exact tests::write_ahead::a_write_refused_at_the_writer_is_never_recorded_once_its_dataset_is_declared_or_the_writer_starts_again \
 		>>.test-jetstream.log 2>&1 \
 		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'a_write_refused_at_the_writer_is_never_recorded_once_its_dataset_is_declared_or_the_writer_starts_again' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the lake's refused-write test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@$(COMPOSE_TEST) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T -e MERIDIAN_JUNIT_RUN=jetstream-lost-stream tests \
 		run-tests -p meridian-lake --lib -- --ignored --exact tests::write_ahead::a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked \
 		>>.test-jetstream.log 2>&1 \
 		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \

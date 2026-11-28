@@ -29,7 +29,9 @@
 #       its status. Each binary under cargo-nextest (ruling 1104; step 3b part
 #       4), from the binaries' list the compile stage kept: each test its own
 #       process, from its package's directory; its results in JUnit, copied
-#       to $MERIDIAN_JUNIT_DIR where that is set; and under NEXTEST_PROFILE=ci
+#       to $MERIDIAN_JUNIT_DIR where that is set, as <package>.<kind>.<name>.xml
+#       or, where $MERIDIAN_JUNIT_RUN names the run, with that name before
+#       .xml; and under NEXTEST_PROFILE=ci
 #       (CI's) a failed test run once more, a test that fails and then passes
 #       named flaky there. <args> are libtest's: filters, --ignored,
 #       --include-ignored, --exact, --nocapture.
@@ -144,7 +146,11 @@ while IFS=$'\t' read -r -u 3 pkg kind name dir _; do
   if [ -n "${MERIDIAN_JUNIT_DIR:-}" ]; then
     junit=$(find "$DIR/target/nextest" /w/target/nextest -path "*/$profile/junit.xml" \
       -newer "$marker" 2>/dev/null | head -1 || true)
-    [ -z "$junit" ] || cp "$junit" "$MERIDIAN_JUNIT_DIR/$pkg.$kind.$name.xml" || true
+    # A run named by $MERIDIAN_JUNIT_RUN keeps its own file: a second run of
+    # one binary -- one ignored test of the lake's library, after its unit
+    # tests' run -- does not overwrite the first's.
+    [ -z "$junit" ] || cp "$junit" \
+      "$MERIDIAN_JUNIT_DIR/$pkg.$kind.$name${MERIDIAN_JUNIT_RUN:+.$MERIDIAN_JUNIT_RUN}.xml" || true
   fi
   rm -f "$marker"
   [ $status = 0 ] || exit $status
