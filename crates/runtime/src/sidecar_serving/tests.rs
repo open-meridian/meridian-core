@@ -336,6 +336,14 @@ fn a_serving_that_ends_unplanned_gives_its_lease_up() {
             "the fenced serving left its Lease to lapse: {:?}",
             pod.buses.takes()
         );
+        // The second serving's ports open before its Lease is taken from
+        // it: a take is answered before its surface is bound, so a surface
+        // found shut straight after the take is one not yet opened, and
+        // that serving binds it under the test's own bind below.
+        assert!(
+            within!(10.0, pod.serving().await),
+            "the second serving never served"
+        );
         // A surface that cannot be served: the pod ends, its Lease given up.
         let b = pod.b_holds();
         assert!(within!(5.0, !up(pod.surface).await));

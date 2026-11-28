@@ -71,6 +71,11 @@ pub struct MemoryStore {
     /// be reached refuses it.
     #[cfg(test)]
     write_ahead_refused: std::sync::atomic::AtomicBool,
+    /// What reading one of the listing's counts does first, told which: as
+    /// a store whose count is slow, or fails, does.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    counts_read: Mutex<Option<std::sync::Arc<dyn Fn(&'static str) -> Result<()> + Send + Sync>>>,
 }
 
 impl MemoryStore {
@@ -106,6 +111,23 @@ impl MemoryStore {
     pub(crate) fn refuse_write_ahead_for_test(&self, refused: bool) {
         self.write_ahead_refused
             .store(refused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `read` run first by each read of the listing's counts
+    /// (`unconverted`, `closed_day`, `quality`), which fails where it does:
+    /// a store whose counting is slow, or cannot be done.
+    #[cfg(test)]
+    pub(crate) fn on_counts_read(
+        &self,
+        read: impl Fn(&'static str) -> Result<()> + Send + Sync + 'static,
+    ) {
+        *self.counts_read.lock().unwrap() = Some(std::sync::Arc::new(read));
+    }
+
+    #[cfg(test)]
+    fn counts_read(&self, which: &'static str) -> Result<()> {
+        let read = self.counts_read.lock().unwrap().clone();
+        read.map_or(Ok(()), |read| read(which))
     }
 
     /// Hold this store's writer at `epoch`, as a deposed writer holds the
@@ -1091,6 +1113,8 @@ impl Store for MemoryStore {
     }
 
     fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
+        #[cfg(test)]
+        self.counts_read("quality")?;
         use meridian_domain::v1::QualityState;
         let held = self.lock();
         // The rows in force: each row key at its version in force, as a
@@ -1110,6 +1134,8 @@ impl Store for MemoryStore {
     }
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
+        #[cfg(test)]
+        self.counts_read("unconverted")?;
         // The rows in force (ruling 1006 (c)).
         let held = self.lock();
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -1122,6 +1148,8 @@ impl Store for MemoryStore {
     }
 
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
+        #[cfg(test)]
+        self.counts_read("closed_day")?;
         // The rows in force (ruling 1006 (c)), by the flag as known now.
         let held = self.lock();
         let mut rows = as_of(held.rows.iter().cloned(), 0);
