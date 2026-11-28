@@ -334,10 +334,7 @@ fn a_primary(in_recovery: bool) -> Result<(), Wait> {
 /// [`database_answers`], and on the database the chart brings, the server
 /// this release starts ([`as_released`]): one connection, made and closed.
 fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<(), Wait> {
-    let mut config: postgres::Config = url
-        .parse()
-        .map_err(|failed| Wait::Refused(format!("the database URL is unreadable: {failed}")))?;
-    config.connect_timeout(Duration::from_secs(5));
+    let (mut client, config) = connected(url)?;
     let hosts: Vec<String> = config
         .get_hosts()
         .iter()
@@ -346,15 +343,9 @@ fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<()
             _ => None,
         })
         .collect();
-    let (config, tls) =
-        meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
-            .map_err(|failed| Wait::Refused(format!("the database's TLS: {failed}")))?;
-    let mut client = config
-        .connect(tls)
-        .map_err(|failed| Wait::NotYet(failed.to_string()))?;
     let in_recovery: bool = client
         .query_one("select pg_is_in_recovery()", &[])
-        .map_err(|failed| Wait::NotYet(failed.to_string()))?
+        .map_err(|failed| Wait::NotYet(preflight::with_causes(&failed)))?
         .get(0);
     a_primary(in_recovery)?;
     if as_released(&hosts, brought, None).is_ok() {
@@ -362,7 +353,7 @@ fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<()
     }
     let allows: String = client
         .query_one("show max_connections", &[])
-        .map_err(|failed| Wait::NotYet(failed.to_string()))?
+        .map_err(|failed| Wait::NotYet(preflight::with_causes(&failed)))?
         .get(0);
     as_released(&hosts, brought, Some(&allows)).map_err(Wait::NotYet)
 }
@@ -432,17 +423,65 @@ fn cut_off(failed: &str) -> bool {
 /// as an error, and says only that it timed out. This fails in seconds and
 /// says why.
 pub fn database_answers(url: &str) -> Result<(), Wait> {
+    connected(url).map(drop)
+}
+
+/// One attempt at a connection is given this long, start to finish. The
+/// Postgres client's own connect timeout, set to the same, covers each
+/// address's TCP connect and nothing else: the lookup of the name before it
+/// and the server's first words after it are outside it, so a resolver that
+/// drops its packets, or a server that accepts and says nothing, held an
+/// attempt -- and the wait that makes one at a time -- for as long as it
+/// liked (LazyFS run 3's diagnosis, 2026-11-27).
+const CONNECT_WITHIN: Duration = Duration::from_secs(5);
+
+/// One connection to the database at `url`, made within [`CONNECT_WITHIN`],
+/// and the configuration it was made by; or why there is none yet, its cause
+/// kept ([`preflight::with_causes`]): the client's own words are only
+/// "error connecting to server", and the cause -- refused, no such host --
+/// is what the waiting line is read for.
+fn connected(url: &str) -> Result<(postgres::Client, postgres::Config), Wait> {
     let mut config: postgres::Config = url
         .parse()
         .map_err(|failed| Wait::Refused(format!("the database URL is unreadable: {failed}")))?;
-    config.connect_timeout(Duration::from_secs(5));
+    config.connect_timeout(CONNECT_WITHIN);
     let (config, tls) =
         meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
             .map_err(|failed| Wait::Refused(format!("the database's TLS: {failed}")))?;
-    config
-        .connect(tls)
-        .map(drop)
-        .map_err(|failed| Wait::NotYet(failed.to_string()))
+    let attempt = config.clone();
+    let client = within(CONNECT_WITHIN, move || attempt.connect(tls)).map_err(Wait::NotYet)?;
+    Ok((client, config))
+}
+
+/// `attempt`'s answer where it comes within `limit`, a failure said with its
+/// causes; and that there was none where it does not. The attempt is made on
+/// a thread of its own, the blocking client having no way to be stopped: one
+/// given up on runs to its own end there -- the resolver's, or the
+/// connection's -- and what it then made is dropped there, off any runtime.
+/// So a database that stays out of reach holds one such thread for each
+/// attempt still out, each ended by what it waits on.
+fn within<T, E>(
+    limit: Duration,
+    attempt: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    E: std::error::Error + Send + 'static,
+{
+    let (tell, told) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tell.send(attempt());
+    });
+    match told.recv_timeout(limit) {
+        Ok(Ok(made)) => Ok(made),
+        Ok(Err(failed)) => Err(preflight::with_causes(&failed)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "no connection within {limit:?}, the lookup of its name included"
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the attempt at a connection ended without an answer".into())
+        }
+    }
 }
 
 /// A store, once its database answers and holds the schema this binary
@@ -2299,6 +2338,96 @@ mod tests {
             "it did not say what it gave up on, or why: {said}"
         );
         assert!(tried.get() > 1, "it gave up without trying again");
+    }
+
+    /// LazyFS run 3 (2026-11-27): the cluster's DNS was down for six minutes
+    /// and every store said only "error connecting to server", the Postgres
+    /// client's kind, its cause dropped. A name that cannot be looked up is
+    /// said as that, by the wait and by the migration's.
+    #[test]
+    fn a_database_whose_name_cannot_be_looked_up_is_waited_for_saying_so() {
+        let url = "postgres://meridian@no-such-host.invalid:5432/meridian";
+        for (asked, waits) in [
+            ("database_answers", super::database_answers(url)),
+            (
+                "database_as_released",
+                super::database_as_released(url, None),
+            ),
+        ] {
+            match waits {
+                Err(Wait::NotYet(said)) => assert!(
+                    said.contains("failed to lookup address information"),
+                    "{asked} did not say why: {said}"
+                ),
+                other => {
+                    panic!("{asked}: a name that cannot be looked up is waited for: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// One attempt is given five seconds start to finish. The client's own
+    /// connect timeout covers each address's TCP connect and nothing else:
+    /// here a server accepts and never says a word, which held an attempt,
+    /// and the component's whole wait, for good.
+    #[test]
+    fn a_server_that_accepts_and_says_nothing_is_given_up_on_within_the_attempts_five_seconds() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Each connection kept open, unanswered, for the test's life.
+            let held: Vec<_> = silent.incoming().collect();
+            drop(held);
+        });
+        let (tell, told) = std::sync::mpsc::channel();
+        let began = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let url = format!("postgres://meridian@127.0.0.1:{port}/meridian?sslmode=disable");
+            let _ = tell.send(super::database_answers(&url));
+        });
+        let waits = told
+            .recv_timeout(Duration::from_secs(8))
+            .expect("the attempt was still out after 8 s: nothing bounds it but the TCP connect");
+        assert!(
+            began.elapsed() >= Duration::from_secs(4),
+            "{:?}",
+            began.elapsed()
+        );
+        match waits {
+            Err(Wait::NotYet(said)) => assert!(said.contains("no connection within 5s"), "{said}"),
+            other => panic!("a silent server is waited for: {other:?}"),
+        }
+    }
+
+    /// The bound is the whole attempt's, whatever step of it is slow. A slow
+    /// resolver is not something a unit test can bring (the lookup is the
+    /// system's own), so the slow step is given: one that would take a
+    /// minute is given up on within its limit, and one that answers in time
+    /// is answered as it was, a failure with its cause.
+    #[test]
+    fn an_attempt_slow_at_any_step_is_given_up_on_within_its_limit() {
+        let began = std::time::Instant::now();
+        let slow = super::within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(60));
+            Ok::<(), std::io::Error>(())
+        });
+        assert_eq!(
+            slow.unwrap_err(),
+            "no connection within 50ms, the lookup of its name included"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            super::within(AT_MOST, || Ok::<u8, std::io::Error>(7)),
+            Ok(7)
+        );
+        let failed = super::within(AT_MOST, || {
+            Err::<(), _>(std::io::Error::other(std::io::Error::other("no such host")))
+        });
+        assert!(failed.unwrap_err().ends_with("no such host"));
     }
 
     #[test]
