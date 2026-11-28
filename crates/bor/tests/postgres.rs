@@ -9,6 +9,26 @@
 //! it is missing rather than skipping. The database is shared by every run, so
 //! nothing here assumes a partition's numbers start anywhere: each test uses
 //! accounts of its own and reads its numbers relative to the head.
+//!
+//! One test a process: `make test-store` runs these under cargo-nextest
+//! (tools/run-tests.sh), this binary's tests one at a time
+//! (.config/nextest.toml). Two things hold only that way (roadmap v31a item
+//! 11; both shown on 2026-11-27, neither ended here):
+//!
+//! - In one libtest process the suite runs out of the database's
+//!   connections. `serve` gives each handler the bus it is served on, so a
+//!   served store is never dropped while its process lives and its pool's
+//!   connections stay open: one test at a time, 82 were open after eleven
+//!   tests, and the twelfth met "too many clients already". Under nextest
+//!   the whole suite, counted each second, never held more than 42. Ending
+//!   it needs a way to stop serving on a `Bus`, which the bus does not have.
+//! - A failed async test that drops a sync client, or a store no bus holds,
+//!   as it unwinds ends its process ("panic in a destructor during
+//!   cleanup": the client closes by a runtime of its own) before its
+//!   `Scratch` drops its schema. The lake's tests hold theirs in
+//!   `scratch::OffRuntime` and prove it
+//!   (`what_a_failed_async_test_made_is_dropped_as_it_unwinds`); these do
+//!   not yet, test by test.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
