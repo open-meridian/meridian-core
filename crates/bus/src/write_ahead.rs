@@ -64,6 +64,23 @@ const STUCK_SINCE: &str = ", since ";
 /// the broker refuses is not inferred here.
 pub const REFUSED: &str = "the lake's write-ahead writes are refused or not answered by the broker";
 
+/// The words the lake's writer says its stream is at its rate limit with,
+/// first in its member's report (`ComponentReport.detail`): the stream at
+/// its byte bound while the lake keeps up with it. A write the lake has
+/// recorded leaves the stream only at its age bound, so the stream takes
+/// no more than its byte bound every age bound, however fast the lake is.
+/// Never said with [`STUCK_FULL`]: stuck full is the stream at a bound with
+/// the lake behind. What the dashboard's judge files
+/// `component-write-ahead-rate-limited` from, and `meridian status` shows.
+/// The name is a candidate, adopted by consensus 2026-11-28.
+/// INTERIM(v32): this state and its notices go when v32 takes the stream off the lake's write path.
+pub const RATE_LIMITED: &str = "the lake's write-ahead stream is at its rate limit";
+
+/// A plugin's refusal where the stream has no room for its write
+/// (`full_words`).
+const FULL: &str = "overloaded: the lake's write-ahead stream is full and takes a new write \
+                        only as the oldest writes it holds reach its maximum age and leave";
+
 /// The words a stuck-full stream is said with open so: [`STUCK_FULL`], for
 /// how long, and the time it went stuck, to the second, UTC. That time
 /// names the stuck spell: every copy of the dashboard reads the same one
@@ -79,6 +96,14 @@ pub fn stuck_full_since(stuck_for_s: u64, since_ns: i64) -> String {
 /// ([`refused_since`]). INTERIM(v32).
 pub fn refused_for(refused_for_s: u64, since_ns: i64) -> String {
     said_since(REFUSED, refused_for_s, since_ns)
+}
+
+/// The words a stream at its rate limit is said with open so:
+/// [`RATE_LIMITED`], for how long, and the time of the first look that
+/// found it so, to the second, UTC, which names the spell as the stuck-full
+/// time names its ([`rate_limited_since`]).
+pub fn rate_limited_for(limited_for_s: u64, since_ns: i64) -> String {
+    said_since(RATE_LIMITED, limited_for_s, since_ns)
 }
 
 /// `said`, for how long and since when ([`stuck_full_since`]).
@@ -112,6 +137,19 @@ fn said_since(said: &str, for_s: u64, since_ns: i64) -> String {
 /// or say no time that reads.
 pub fn stuck_since(detail: &str) -> Option<i64> {
     since_of(detail.strip_prefix(STUCK_FULL)?)
+}
+
+/// Whether a member's words say its stream is at its rate limit
+/// ([`RATE_LIMITED`]), first in them as the stuck-full words are.
+pub fn says_rate_limited(detail: &str) -> bool {
+    detail.starts_with(RATE_LIMITED)
+}
+
+/// The time a member's words say its stream came to its rate limit, ns
+/// since the epoch ([`rate_limited_for`]): none where they do not say so,
+/// or say no time that reads.
+pub fn rate_limited_since(detail: &str) -> Option<i64> {
+    since_of(detail.strip_prefix(RATE_LIMITED)?)
 }
 
 /// Whether a member's words say the broker refuses its write-ahead stream,
@@ -755,7 +793,9 @@ fn refused(
 }
 
 /// Where the stream refused a write because it is full -- JetStream's store
-/// refusing it at a bound, `discard: new` -- the plugin's words.
+/// refusing it at a bound, `discard: new` -- the plugin's words. True
+/// whatever the lake has recorded: a recorded write leaves the stream only
+/// at its age bound, so recording frees no room.
 fn full_words(failed: &(dyn std::error::Error + 'static)) -> Option<String> {
     let mut said = failed.to_string();
     let mut cause = failed.source();
@@ -768,11 +808,7 @@ fn full_words(failed: &(dyn std::error::Error + 'static)) -> Option<String> {
         || said.contains("maximum messages exceeded")
         || said.contains("insufficient resources")
         || said.contains("resource limits exceeded");
-    full.then(|| {
-        "overloaded: the lake's write-ahead stream is full and holds no more writes until the \
-         lake records what it holds"
-            .to_string()
-    })
+    full.then(|| FULL.to_string())
 }
 
 /// The writer's answer, as the broker's request path reads one: a refusal
@@ -1133,6 +1169,47 @@ mod tests {
         assert!(!says_refused(&stuck));
         assert_eq!(refused_since(&stuck), None);
         assert_eq!(refused_since(&format!("{REFUSED} for 35s: no time")), None);
+    }
+
+    /// The time a stream came to its rate limit is said as the stuck time
+    /// is and read back; its words are never the stuck-full ones, nor the
+    /// stuck-full words its own.
+    #[test]
+    fn the_time_a_stream_came_to_its_rate_limit_is_read_back_and_is_not_the_stuck_time() {
+        let words = rate_limited_for(30, 1_793_000_000 * 1_000_000_000 + 7);
+        assert_eq!(
+            words,
+            format!("{RATE_LIMITED} for 30s, since 2026-10-26T07:33:20Z")
+        );
+        let detail = format!("{words}: holds 256.0 MiB of its 256.0 MiB bound");
+        assert!(says_rate_limited(&detail));
+        assert_eq!(
+            rate_limited_since(&detail),
+            Some(1_793_000_000 * 1_000_000_000)
+        );
+        assert_eq!(stuck_since(&detail), None);
+        let stuck = stuck_full_since(30, 0);
+        assert!(!says_rate_limited(&stuck));
+        assert_eq!(rate_limited_since(&stuck), None);
+    }
+
+    /// The refusal a plugin reads says what frees room in the stream: the
+    /// age of the writes it holds, never the lake recording them (a
+    /// recorded write stays until its age bound; seen on a real broker,
+    /// 2026-11-28).
+    #[test]
+    fn a_full_streams_refusal_does_not_say_the_lake_recording_frees_room() {
+        #[derive(Debug)]
+        struct Said;
+        impl std::fmt::Display for Said {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("maximum bytes exceeded")
+            }
+        }
+        impl std::error::Error for Said {}
+        let said = full_words(&Said).expect("full");
+        assert!(!said.contains("until the lake records"), "{said}");
+        assert!(said.contains("reach its maximum age"), "{said}");
     }
 
     #[test]
