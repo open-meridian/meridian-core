@@ -81,6 +81,8 @@ meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true
 meridian-domain.workspace = true
 postgres.workspace = true
+# An attempt at a database that can be stopped at its bound (reach.rs).
+tokio-postgres.workspace = true
 serde_json.workspace = true
 # A writer's lease, a Kubernetes Lease in its own namespace (step 3b), over
 # the in-cluster API with the pod's service account, as first run reaches it.

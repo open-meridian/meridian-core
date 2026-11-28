@@ -553,3 +553,30 @@ fn the_sidecars_read_as_the_chart_writes_them() {
         Some(Sidecars { running: vec![] })
     );
 }
+
+/// Review-within: each attempt at a store's database had its TCP connect
+/// bounded and nothing after it, so a server that accepted and said nothing
+/// held the preflight past its deadline, for good.
+#[test]
+fn a_database_that_accepts_and_says_nothing_is_given_up_on_by_the_deadline() {
+    let (port, _ended) = crate::reach::fakes::silent();
+    let url = format!("postgres://nobody@127.0.0.1:{port}/none?sslmode=disable");
+    let (tell, told) = std::sync::mpsc::channel();
+    let began = Instant::now();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let _ = tell.send(read_only("configuration store", &url, deadline).map(drop));
+    });
+    let read = told
+        .recv_timeout(Duration::from_secs(8))
+        .expect("the attempt was still out 7 s past the deadline: nothing bounds it");
+    assert!(
+        began.elapsed() >= Duration::from_secs(4),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(
+        read.unwrap_err(),
+        "no connection within 5s: the attempt was given up on"
+    );
+}
