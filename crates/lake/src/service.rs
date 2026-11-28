@@ -3096,6 +3096,79 @@ impl Lake {
         })
     }
 
+    /// A write-ahead stream lost under its writer, marked
+    /// ([`crate::write_ahead::Writer::lost`]; the consensus of 2026-11-28,
+    /// run 46090125342): what it held between `after_at_ns` and
+    /// `until_at_ns` that the lake had not recorded is lost, which rows and
+    /// whether any not known. A gap for each dataset of `valid_before` --
+    /// those the store keeps as written through the stream under `stream`,
+    /// the writer's key -- from the earlier of the window's start and the
+    /// dataset's latest valid time recorded, to the window's end, over
+    /// every subject (none named); or, where none is kept, the one gap
+    /// that names no dataset. Committed as one under the writer's place
+    /// `position`, which does not move; a writer with no place commits none
+    /// (the review's finding 7), each gap then its own record.
+    ///
+    /// Every one is unrecovered, a dataset's that declares `backfill` too:
+    /// a want asks for 1 to 500 subjects, and nobody can say whose rows the
+    /// stream held, so nothing can be asked again within the contract
+    /// (stopped for a proposal, 2026-11-28).
+    ///
+    /// INTERIM(v32): v32 takes the stream off the write path.
+    pub fn record_lost(
+        &self,
+        stream: &str,
+        position: Option<crate::store::WriteAheadPosition>,
+        after_at_ns: i64,
+        until_at_ns: i64,
+        valid_before: &BTreeMap<String, i64>,
+    ) -> Result<Vec<meridian_domain::v1::DatasetGap>, crate::store::StoreError> {
+        use meridian_domain::v1::{GapCause, GapState};
+        let now = self.clock.now_ns();
+        let gap = |dataset: &str, valid_from_ns: i64| meridian_domain::v1::DatasetGap {
+            gap_id: gap_id(now),
+            dataset: dataset.to_string(),
+            subjects: Vec::new(),
+            valid_from_ns: valid_from_ns.min(until_at_ns),
+            valid_until_ns: until_at_ns,
+            cause: GapCause::WriteAheadBound as i32,
+            state: GapState::Unrecovered as i32,
+            recorded_at_ns: now,
+            found_in_gap_id: String::new(),
+        };
+        let gaps: Vec<meridian_domain::v1::DatasetGap> = if valid_before.is_empty() {
+            vec![gap("", after_at_ns)]
+        } else {
+            valid_before
+                .iter()
+                .map(|(dataset, valid_ns)| gap(dataset, after_at_ns.min(*valid_ns)))
+                .collect()
+        };
+        match position {
+            Some(at) => {
+                self.store.record_write_ahead(
+                    crate::store::WriteAheadBatch {
+                        stream: stream.to_string(),
+                        after: Some(at),
+                        through: at,
+                        gaps: gaps.clone(),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+            }
+            None => {
+                for gap in &gaps {
+                    self.store.record_gap(gap)?;
+                }
+            }
+        }
+        for gap in gaps.clone() {
+            self.gap_recorded(gap);
+        }
+        Ok(gaps)
+    }
+
     /// A new gap's ID, at the lake's time.
     pub fn new_gap_id(&self) -> String {
         gap_id(self.clock.now_ns())

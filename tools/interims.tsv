@@ -30,19 +30,32 @@ v32	crates/dashboard/src/component_health.rs
 v32	crates/dashboard/src/component_health.rs	
 v32	crates/dashboard/src/component_health.rs	
 v32	crates/dashboard/src/component_health.rs	
+v32	crates/lake/src/memory.rs	the lost stream's test's, gone with the stream on the
 v32	crates/lake/src/postgres.rs	gone when v32's ownership record says where a range is
 v32	crates/lake/src/postgres/moves.rs	read before every read of a dataset over several
 v32	crates/lake/src/service.rs	sent by the instance's own credential -- the owner
+v32	crates/lake/src/service.rs	v32 takes the stream off the write path.
 v32	crates/lake/src/spread.rs	a stop-gap for a view of the owners read on a timer;
 v32	crates/lake/src/spread.rs	gone with [`Self::follow_owners`], when v32's
 v32	crates/lake/src/tests/shards.rs	deleted with the reply-inbox check.
+v32	crates/lake/src/tests/write_ahead.rs	v32 takes the stream off the write path.
+v32	crates/lake/src/tests/write_ahead.rs	v32 takes the stream off the write path.
+v32	crates/lake/src/tests/write_ahead.rs	v32 takes the stream off the write path.
+v32	crates/lake/src/tests/write_ahead.rs	v32 takes the stream off the write path.
 v32	crates/lake/src/write_ahead.rs	
+v32	crates/lake/src/write_ahead.rs	gone with the stream on the write path.
+v32	crates/lake/src/write_ahead.rs	gone with the stream on the write path.
+v32	crates/lake/src/write_ahead.rs	gone with the stream on the write path.
+v32	crates/lake/src/write_ahead.rs	v32 takes the stream off the write path, and the lake no
+v32	crates/lake/src/write_ahead.rs	v32 takes the stream off the write path.
+v32	crates/lake/src/write_ahead.rs	v32 takes the stream off the write path.
 v32	crates/lake/src/write_ahead/guard.rs	
 v32	crates/lake/src/write_ahead/guard.rs	
 v32	crates/lake/src/write_ahead/guard.rs	
 v32	crates/lake/src/write_ahead/guard.rs	
 v32	crates/lake/src/write_ahead/guard.rs	decision 3 removes the stream).
 v32	crates/lake/src/write_ahead/guard/tests.rs	
+v32	crates/lake/tests/postgres.rs	v32 takes the stream off the write path.
 v33	crates/runtime/src/preflight.rs	
 v33	crates/runtime/src/preflight.rs	gone once
 v33	deploy/chart/templates/_plugin.tpl	its sidecar asks on inboxes named for its credential,

@@ -1720,7 +1720,14 @@ test-jetstream: network runtime-image tests-image
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'a_write_refused_at_the_writer_is_never_recorded_once_its_dataset_is_declared_or_the_writer_starts_again' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the lake's refused-write test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, the lake answers a write on its sender's inboxes alone, and a write refused at the writer is never recorded later"
+	@$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-lake --lib -- --ignored --exact tests::write_ahead::a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked \
+		>>.test-jetstream.log 2>&1 \
+		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
+		     tail -40 .test-jetstream.log >&2; exit 1; }
+	@grep -q 'a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked' .test-jetstream.log \
+		|| { echo "test-jetstream FAILED: the lake's lost-stream test did not run (.test-jetstream.log)" >&2; exit 1; }
+	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, the lake answers a write on its sender's inboxes alone, a write refused at the writer is never recorded later, and a stream deleted under the writer is made again after its bound with its loss marked"
 
 # Signing in against a real directory. Its own target rather than part of
 # `test`, for the reason `test-broker` is: it needs a server standing up, and
