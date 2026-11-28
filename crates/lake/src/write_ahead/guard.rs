@@ -16,6 +16,18 @@
 //! at that look, never the chart's: a stream kept as it was made is judged
 //! as it was made.
 //!
+//! **Refused or not answered** (INTERIM(v32), the proposal of 2026-11-27,
+//! A1: v32 takes the stream off the lake's write path and this guard with
+//! it). A look the broker refuses, or does not answer, says nothing of the
+//! stream's bounds; but where every look for [`REFUSED_AFTER`] was refused
+//! or unanswered, the writer's member says so in its report, degraded, as
+//! its own state ([`REFUSED`]), apart from stuck full: the broker refuses
+//! the lake's write-ahead writes, or does not answer them, with its last
+//! words. Never on one refusal: a look answered within the bound ends the
+//! spell unsaid. Said, it stands until a write is accepted again -- a look
+//! finds the stream's last write past where the last answered look found
+//! it ([`Refused`]). Why the broker refuses is not inferred here.
+//!
 //! **Never made again over writes the lake has not recorded.** The writer
 //! makes the stream only where the broker says there is none, and brings it
 //! to this release's bounds only where that drops no write past the lake's
@@ -46,6 +58,16 @@ pub const STUCK_AFTER: Duration = Duration::from_secs(30);
 /// member's report (`ComponentReport.detail`): what the dashboard's judge
 /// reads to file its standing notice, and `meridian status` shows.
 pub use meridian_bus::write_ahead::STUCK_FULL;
+
+/// How long every look at the stream is refused or not answered before the
+/// writer's member says so ([`REFUSED`]): the stuck-full bound's
+/// ([`STUCK_AFTER`]). INTERIM(v32).
+pub const REFUSED_AFTER: Duration = Duration::from_secs(30);
+
+/// The words the broker's refusals are said with in the writer member's
+/// report: what the dashboard's judge files its standing notice from.
+/// INTERIM(v32).
+pub use meridian_bus::write_ahead::REFUSED;
 
 /// The stream as its leader says it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +232,81 @@ impl Full {
         let (since, since_ns) = *self.since.get_or_insert((at, now_ns));
         let stuck_for = at.duration_since(since);
         (stuck_for >= self.after).then(|| standing.words(bounds, next, now_ns, stuck_for, since_ns))
+    }
+}
+
+/// The guard's memory of the broker's answers to its looks (INTERIM(v32),
+/// the proposal of 2026-11-27, A1): since when every look was refused or
+/// not answered, and where the last answered look found the stream's last
+/// write -- what a write accepted since is told by.
+#[derive(Debug)]
+pub struct Refused {
+    after: Duration,
+    /// Since when every look was refused or not answered, and the wall
+    /// clock then, which names the spell for the dashboard's judge.
+    since: Option<(tokio::time::Instant, i64)>,
+    /// What was said of the last look refused, or not answered.
+    why: String,
+    /// Whether the spell is said: from the bound reached until a write is
+    /// accepted again.
+    said: bool,
+    /// The stream's last write as the last answered look found it.
+    last: Option<u64>,
+}
+
+impl Refused {
+    pub fn new(after: Duration) -> Self {
+        Self {
+            after,
+            since: None,
+            why: String::new(),
+            said: false,
+            last: None,
+        }
+    }
+
+    /// A look the broker refused, or did not answer, at `at`, the wall
+    /// clock `now_ns`; `why` what was said of it. The words it is said with
+    /// once every look for the bound was; none before.
+    pub fn refused(&mut self, at: tokio::time::Instant, now_ns: i64, why: &str) -> Option<String> {
+        let (since, _) = *self.since.get_or_insert((at, now_ns));
+        self.why = why.to_string();
+        self.said |= at.duration_since(since) >= self.after;
+        self.said.then(|| self.words(at, false))
+    }
+
+    /// A look answered at `at`, the stream's last write `last`. Before the
+    /// bound it ends the spell unsaid. Said, the spell stands until a write
+    /// is accepted: `last` past where the last answered look found it (a
+    /// stream made again under its name, its last lower, counted from its
+    /// own). The words it is still said with; none once it is not.
+    pub fn answered(&mut self, at: tokio::time::Instant, last: u64) -> Option<String> {
+        let accepted = self.last.is_some_and(|before| last > before);
+        self.last = Some(last);
+        if !self.said || accepted {
+            self.since = None;
+            self.said = false;
+            return None;
+        }
+        Some(self.words(at, true))
+    }
+
+    /// Its words at `at`: [`REFUSED`], for how long and since when, then
+    /// what the broker last said; `answering` where it answers again with
+    /// no write accepted since.
+    fn words(&self, at: tokio::time::Instant, answering: bool) -> String {
+        let (since, since_ns) = self.since.unwrap_or((at, 0));
+        let tail = if answering {
+            "; the broker answers again, no write accepted since"
+        } else {
+            ""
+        };
+        format!(
+            "{}: every look the lake's guard took at the stream was refused or not answered; \
+             the last: {}{tail}",
+            meridian_bus::write_ahead::refused_for(at.duration_since(since).as_secs(), since_ns),
+            self.why
+        )
     }
 }
 

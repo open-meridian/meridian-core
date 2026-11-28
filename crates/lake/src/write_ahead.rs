@@ -1640,6 +1640,10 @@ impl Drop for AbortOnDrop {
 /// which the stream does not hold where it was kept as it was (`kept`, the
 /// refusal [`bring_to_bounds`] gave, which the member says for as long as
 /// this writer runs). A look the broker does not answer changes nothing
+/// said of the stream's bounds. Every look for [`guard::REFUSED_AFTER`]
+/// refused or not answered, the member says that, its own state, until a
+/// look finds a write accepted again ([`guard::Refused`]; INTERIM(v32), the
+/// proposal of 2026-11-27, A1): after the stuck-full words where both are
 /// said.
 async fn guard_forever(
     context: jetstream::Context,
@@ -1651,7 +1655,9 @@ async fn guard_forever(
     waiting: impl Fn(Option<String>) + Send + Sync + 'static,
 ) {
     let mut full = guard::Full::new(guard::STUCK_AFTER, largest_write);
-    let mut said = false;
+    let mut refused = guard::Refused::new(guard::REFUSED_AFTER);
+    // What the member says of the stream: stuck full, and refused.
+    let (mut stuck, mut refusal) = (None::<String>, None::<String>);
     if kept.is_some() {
         waiting(kept.clone());
     }
@@ -1699,43 +1705,54 @@ async fn guard_forever(
             };
             Ok::<_, String>((standing, held))
         };
-        let (standing, held) = match looked.await {
-            Ok(looked) => looked,
+        let was = (stuck.is_some(), refusal.is_some());
+        match looked.await {
             Err(failed) => {
                 tracing::debug!(%failed, "the write-ahead stream's guard could not look at it");
-                continue;
-            }
-        };
-        let bounds = Bounds {
-            max_age: held.max_age,
-            max_bytes: held.max_bytes,
-            replicas: held.num_replicas,
-        };
-        match full.looked(
-            tokio::time::Instant::now(),
-            &standing,
-            next,
-            &bounds,
-            lake.now_ns(),
-        ) {
-            Some(words) => {
-                if !said {
+                refusal = refused.refused(tokio::time::Instant::now(), lake.now_ns(), &failed);
+                if let (Some(words), false) = (&refusal, was.1) {
                     tracing::warn!(stream = STREAM, "{words}");
                 }
-                waiting(guard::said(Some(words), kept.as_deref()));
-                said = true;
             }
-            None if said => {
-                tracing::info!(
-                    stream = STREAM,
-                    bytes = standing.bytes,
-                    past = standing.past(next),
-                    "the lake's write-ahead stream drained: no longer at a bound"
+            Ok((standing, held)) => {
+                refusal = refused.answered(tokio::time::Instant::now(), standing.last);
+                if refusal.is_none() && was.1 {
+                    tracing::info!(
+                        stream = STREAM,
+                        last = standing.last,
+                        "the lake's write-ahead stream takes writes again: a write accepted"
+                    );
+                }
+                let bounds = Bounds {
+                    max_age: held.max_age,
+                    max_bytes: held.max_bytes,
+                    replicas: held.num_replicas,
+                };
+                stuck = full.looked(
+                    tokio::time::Instant::now(),
+                    &standing,
+                    next,
+                    &bounds,
+                    lake.now_ns(),
                 );
-                waiting(guard::said(None, kept.as_deref()));
-                said = false;
+                match (&stuck, was.0) {
+                    (Some(words), false) => tracing::warn!(stream = STREAM, "{words}"),
+                    (None, true) => tracing::info!(
+                        stream = STREAM,
+                        bytes = standing.bytes,
+                        past = standing.past(next),
+                        "the lake's write-ahead stream drained: no longer at a bound"
+                    ),
+                    _ => {}
+                }
             }
-            None => {}
+        }
+        // Said while either stands, and once more as the last clears.
+        if stuck.is_some() || refusal.is_some() || was.0 || was.1 {
+            waiting(guard::said(
+                guard::said(stuck.clone(), refusal.as_deref()),
+                kept.as_deref(),
+            ));
         }
     }
 }
