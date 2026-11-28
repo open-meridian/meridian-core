@@ -1591,8 +1591,9 @@ async fn written_until_gone(
                 );
                 // The stream this writer held a place in is gone, whoever
                 // made this one: what it held past the place is unknown,
-                // and marked before the other is taken (INTERIM(v32), the
-                // consensus of 2026-11-28).
+                // and marked before the other is taken (the consensus of
+                // 2026-11-28).
+                // INTERIM(v32): gone with the stream on the write path.
                 // Then the start again, as on the gone path: the guard and
                 // this release's bounds are the new stream's (the review's
                 // finding 8).

@@ -99,6 +99,9 @@ impl MemoryStore {
 
     /// Refuse every write-ahead batch from now (`refused`), or take them
     /// again: what a store that cannot be reached does, and then can.
+    ///
+    /// INTERIM(v32): the lost stream's test's, gone with the stream on the
+    /// write path.
     #[cfg(test)]
     pub(crate) fn refuse_write_ahead_for_test(&self, refused: bool) {
         self.write_ahead_refused

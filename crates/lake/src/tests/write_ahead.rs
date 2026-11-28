@@ -1381,6 +1381,8 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
 /// recorded nothing from is marked by the one gap that names no dataset,
 /// from when the stream was made, its identity, and no place is committed
 /// in it.
+///
+/// INTERIM(v32): v32 takes the stream off the write path.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stream_lost_under_its_writer_is_marked_for_each_dataset_it_kept_by_time() {
     let h = harness();
@@ -1454,6 +1456,8 @@ async fn a_stream_lost_under_its_writer_is_marked_for_each_dataset_it_kept_by_ti
 /// window never ends before it starts, and where the stream was made again
 /// never before the new one's making, by the broker's clock, which every
 /// write of the old one precedes.
+///
+/// INTERIM(v32): v32 takes the stream off the write path.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_streams_gap_never_ends_before_its_start_or_before_the_stream_made_again() {
     let h = harness();
@@ -1490,6 +1494,8 @@ async fn a_lost_streams_gap_never_ends_before_its_start_or_before_the_stream_mad
 
 /// The review's finding 6: a fenced writer's mark of a lost stream is not
 /// tried again for ever; it ends as a fenced batch ends the writer.
+///
+/// INTERIM(v32): v32 takes the stream off the write path.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fenced_writer_marking_a_lost_stream_ends_saying_so() {
     let h = harness();
@@ -1560,6 +1566,8 @@ fn a_stream_is_gone_only_once_the_broker_has_said_so_for_the_whole_bound() {
 /// Run by `make test-jetstream`; by hand with `MERIDIAN_TEST_JETSTREAM_URL`
 /// set and `--ignored --exact
 /// tests::write_ahead::a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked`.
+///
+/// INTERIM(v32): v32 takes the stream off the write path.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
 async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked(
