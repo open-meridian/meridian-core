@@ -278,6 +278,16 @@ struct Turn {
 struct Taken<'a>(&'a Turn);
 
 impl Turn {
+    /// The turn, where no one has it now.
+    fn free(&self) -> Option<Taken<'_>> {
+        let mut taken = self.taken.lock().expect("the counts' turn is poisoned");
+        if *taken {
+            return None;
+        }
+        *taken = true;
+        Some(Taken(self))
+    }
+
     /// The turn, waited for to `until` where the asker's request has an end
     /// to its wait: none where it ended first.
     fn take(&self, until: Option<Instant>) -> Option<Taken<'_>> {
@@ -325,7 +335,9 @@ impl Drop for Taken<'_> {
 /// then is refused for load with a retry-after, as it is where the read
 /// fails. Never a second read. The one to read it waits its [`Turn`] behind
 /// a read of another count, to the end of its request's wait likewise: the
-/// count is being read meanwhile, to whoever else asks.
+/// count is being read meanwhile, to whoever else asks. Where another
+/// count's read has the turn and what is held is no further behind than it
+/// may be, the asker is answered that instead, and no one reads it yet.
 struct Count<T> {
     what: &'static str,
     now: Mutex<Counted<T>>,
@@ -467,6 +479,17 @@ impl<T: Clone> Count<T> {
                 return Ok(held.clone());
             }
         }
+        // Another count's read has the turn: what is held, while that may
+        // be answered, rather than a wait that may outlast the request's.
+        let free = turn.free();
+        if free.is_none() {
+            if let (Some(held), Some(since)) = (&now.held, now.behind_since) {
+                if since.elapsed() <= behind_at_most {
+                    noted::memory("catalogue");
+                    return Ok(held.clone());
+                }
+            }
+        }
         now.reading = true;
         let mut reading = Reading {
             of: self,
@@ -475,7 +498,7 @@ impl<T: Clone> Count<T> {
             ended: false,
         };
         drop(now);
-        let Some(_turn) = turn.take(until) else {
+        let Some(_turn) = free.or_else(|| turn.take(until)) else {
             // Ended as failed where `reading` drops: the next to ask reads.
             return Err(self.again(
                 "wait their turn behind another of its counts being read, and this request \

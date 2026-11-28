@@ -372,6 +372,68 @@ fn a_count_whose_turn_does_not_come_within_its_askers_wait_is_asked_again() {
     assert_eq!(reads.load(Ordering::SeqCst), 2);
 }
 
+/// A count held and behind, asked while another count is read, is answered
+/// what is held, while that is no further behind than it may be: its asker
+/// neither reads it beside the other nor waits its turn, to be refused
+/// where that outlasts its request's wait (a page then said the lake did
+/// not answer, over counts seconds old).
+#[test]
+fn a_count_held_and_behind_is_answered_while_another_count_is_read() {
+    use std::sync::atomic::Ordering;
+    let record = Arc::new(MemoryStore::new());
+    let hot = HotStore::new(record.clone() as Arc<dyn Store>, Bounds::DEFAULT);
+    hot.record("quotes", vec![quote_of(BTC, "a", NOW, "100")], NOW)
+        .unwrap();
+    hot.unconverted_counts().expect("held now");
+    assert_eq!(in_force(&hot.quality_counts().unwrap()), 1, "held now");
+    hot.record("quotes", vec![quote_of(BTC, "b", NOW + 1, "101")], NOW)
+        .unwrap();
+
+    let (reads, has_begun, go_on) = gated_reads(&record);
+    let reader = {
+        let hot = hot.clone();
+        std::thread::spawn(move || hot.unconverted_counts())
+    };
+    has_begun
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the read of the unconverted counts begins");
+
+    // The quality counts are behind, and no one reads them: answered as
+    // held, from memory, within a wait far shorter than the other's read.
+    let wait = std::time::Duration::from_millis(200);
+    noted::begin();
+    let answer = hot
+        .quality_counts_within(
+            Some(std::time::Instant::now() + wait),
+            crate::hot::COUNTS_BEHIND_AT_MOST,
+        )
+        .expect("answered what is held");
+    assert_eq!(in_force(&answer), 1, "the count as it was last read");
+    assert_eq!(noted::take(), (true, "catalogue"));
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "it read nothing");
+
+    // Held further behind than it may be answered, it waits its turn.
+    let refused = hot
+        .quality_counts_within(
+            Some(std::time::Instant::now() + wait),
+            std::time::Duration::ZERO,
+        )
+        .expect_err("not answered what is too far behind")
+        .on_the_bus();
+    assert!(
+        meridian_bus::refusal_retry_after(&refused).is_some_and(|seconds| seconds >= 1),
+        "{refused}"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "nor read anything");
+
+    go_on.send(()).unwrap();
+    reader.join().unwrap().expect("the one read answers");
+    // Its turn free, the next to ask reads them.
+    go_on.send(()).unwrap();
+    assert_eq!(in_force(&hot.quality_counts().unwrap()), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
 /// A read of a count that fails is not read again by each asker that
 /// waited for it: they are refused for load with a retry-after, and the
 /// one that read it says why it failed. Each read it, and failed, before.
