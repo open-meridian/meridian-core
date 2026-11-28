@@ -1363,6 +1363,184 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
     context.delete_stream(STREAM).await.unwrap();
 }
 
+/// The consensus of 2026-11-28 (run 46090125342), options 1 and 2 as one,
+/// against a real JetStream: the stream is deleted under a writer following
+/// it, as the broker's orphan cleanup deleted it in that run. The writer
+/// makes none for as long as the bound -- still none 45 s on -- then makes
+/// it again and takes and answers its writes. Each of the two writes the
+/// deleted stream took last is either answered, so recorded, or inside the
+/// one gap marked for the lost stream, which names no dataset: none is
+/// silently missing.
+///
+/// Run by `make test-jetstream`; by hand as
+/// `a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_stream_deleted_under_a_following_writer_is_made_again_after_the_bound_and_its_loss_marked(
+) {
+    use crate::write_ahead::{identity, stream_config, write_forever, Bounds};
+    use async_nats::jetstream;
+    use futures_util::StreamExt as _;
+    use meridian_bus::write_ahead::{subject, REPLY_HEADER, STREAM, TOPIC_HEADER};
+    use std::time::Duration;
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = meridian_bus::NatsBackend::client(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let bounds = Bounds {
+        max_age: Duration::from_secs(600),
+        max_bytes: 64 << 20,
+        replicas: 1,
+    };
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    // The lake's clock is the broker's day: the gap is over the stream's times.
+    let real = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+    };
+    h.clock.set(real());
+    let tag = std::process::id();
+    let mut answered = client
+        .subscribe(format!("_INBOX.coinbase-1.sls-{tag}.>"))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    // Each write's time at the broker lies between the two times returned.
+    let put = |round: &'static str, n: u64| {
+        let context = context.clone();
+        async move {
+            let price = at_valid(
+                close(
+                    "coinbase-1",
+                    &format!("{round}-{n}"),
+                    BTC,
+                    "2026-10-07",
+                    "1",
+                ),
+                NOW - 100_000 + n as i64,
+            );
+            let mut write = written(n, "coinbase-1", vec![price]);
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(TOPIC_HEADER, write.topic.as_str());
+            headers.insert(
+                REPLY_HEADER,
+                format!("_INBOX.coinbase-1.sls-{tag}.{round}.{n}").as_str(),
+            );
+            write.envelope.meta.as_mut().unwrap().published_at_ns = NOW;
+            let before = real();
+            context
+                .publish_with_headers(
+                    subject("coinbase-1", "daily"),
+                    headers,
+                    write.envelope.encode_to_vec().into(),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+            (before, real())
+        }
+    };
+    async fn heard(
+        answered: &mut async_nats::Subscriber,
+        round: &str,
+        want: usize,
+        within: Duration,
+    ) -> std::collections::BTreeSet<u64> {
+        let mut seen = std::collections::BTreeSet::new();
+        let until = tokio::time::Instant::now() + within;
+        while seen.len() < want {
+            match tokio::time::timeout_at(until, answered.next()).await {
+                Ok(Some(message)) => {
+                    let mut words = message.subject.as_str().rsplit('.');
+                    let n: u64 = words.next().unwrap().parse().unwrap();
+                    if words.next() == Some(round) && message.headers.is_none() {
+                        seen.insert(n);
+                    }
+                }
+                _ => break,
+            }
+        }
+        seen
+    }
+    let mut old = context.create_stream(stream_config(&bounds)).await.unwrap();
+    let old = identity(old.info().await.unwrap());
+    let writer = {
+        let (lake, client) = (h.lake.clone(), client.clone());
+        tokio::spawn(async move { write_forever(lake, client, bounds, |_| {}).await })
+    };
+    for n in 1..=3 {
+        put("old", n).await;
+    }
+    let first = heard(&mut answered, "old", 3, Duration::from_secs(30)).await;
+    assert_eq!(first, [1, 2, 3].into(), "the stream's first three");
+    // Two more, and the stream deleted under the writer at once.
+    let last_two = [(4, put("old", 4).await), (5, put("old", 5).await)];
+    context.delete_stream(STREAM).await.unwrap();
+    let deleted = tokio::time::Instant::now();
+    let taken = heard(&mut answered, "old", 2, Duration::from_secs(5)).await;
+    // Not made again before the bound: 45 s on, the broker holds none.
+    tokio::time::sleep_until(deleted + Duration::from_secs(45)).await;
+    assert!(
+        context.get_stream(STREAM).await.is_err(),
+        "the stream was made again before its loss had stood for the bound"
+    );
+    assert!(
+        gaps(&h, "", GapState::Unspecified).is_empty(),
+        "a gap marked before the broker's word had stood for the bound"
+    );
+    // Made again once it has, by the writer, as another stream.
+    let mut made = None;
+    while made.is_none() && deleted.elapsed() < Duration::from_secs(120) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(mut stream) = context.get_stream(STREAM).await {
+            made = stream.info().await.ok().map(|info| identity(info));
+        }
+    }
+    let made = made.expect(
+        "the stream deleted under the following writer was never made again: the lake takes \
+         no write until its writer is restarted",
+    );
+    assert_ne!(made, old, "another stream");
+    assert!(deleted.elapsed() >= Duration::from_secs(60));
+    // It records again.
+    for n in 1..=2 {
+        put("new", n).await;
+    }
+    let new = heard(&mut answered, "new", 2, Duration::from_secs(30)).await;
+    writer.abort();
+    let _ = writer.await;
+    assert_eq!(
+        new,
+        [1, 2].into(),
+        "the stream made again is taken and answered"
+    );
+    // One gap, no dataset, unrecovered; and each of the last two writes
+    // answered or inside it.
+    let marked = gaps(&h, "", GapState::Unspecified);
+    assert_eq!(marked.len(), 1, "the lost stream's gap alone: {marked:?}");
+    let gap = &marked[0];
+    assert!(gap.dataset.is_empty() && gap.found_in_gap_id.is_empty());
+    assert_eq!(gap.state, GapState::Unrecovered as i32);
+    assert_eq!(gap.cause, GapCause::WriteAheadBound as i32);
+    for (n, (before, after)) in last_two {
+        assert!(
+            taken.contains(&n) || (gap.valid_from_ns <= after && before <= gap.valid_until_ns),
+            "write {n}, held by the deleted stream between {before} and {after}, was neither \
+             recorded nor inside the gap marked ({} to {})",
+            gap.valid_from_ns,
+            gap.valid_until_ns
+        );
+    }
+    println!(
+        "of the deleted stream's last two writes, recorded: {taken:?}; the rest inside the gap"
+    );
+    context.delete_stream(STREAM).await.unwrap();
+}
+
 /// v31a item 5, the review of the stream guard, finding 1: the guard judges
 /// the stream by the stream's own bounds, not the chart's. A stream made at
 /// 256 MiB holds more than 128 MiB, every write of it past the lake's
